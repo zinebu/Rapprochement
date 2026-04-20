@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { requireAuth } from "../middleware/auth.middleware.js";
 import {
   createConnectSession,
   getAccounts,
@@ -9,10 +10,10 @@ import {
 
 const router = Router();
 
-router.post("/connect-session", createConnectSession);
-router.get("/accounts", getAccounts);
-router.get("/transactions", getTransactions);
-router.get("/items", getItems);
-router.get("/categories", getCategories);
+router.post("/connect-session", requireAuth, createConnectSession);
+router.get("/accounts", requireAuth, getAccounts);
+router.get("/transactions", requireAuth, getTransactions);
+router.get("/items", requireAuth, getItems);
+router.get("/categories", requireAuth, getCategories);
 
 export default router;

@@ -2,8 +2,9 @@ import { Toaster } from "@/components/ui/toaster";
 import { Toaster as Sonner } from "@/components/ui/sonner";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { BrowserRouter, Routes, Route } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Outlet } from "react-router-dom";
 import { Layout } from "@/components/Layout";
+
 import Dashboard from "./pages/Dashboard";
 import Rapprochement from "./pages/Rapprochement";
 import ImportPage from "./pages/Import";
@@ -15,7 +16,20 @@ import Parametres from "./pages/Parametres";
 import Connecteurs from "./pages/connecteurs";
 import NotFound from "./pages/NotFound";
 import BridgeCallback from "./pages/BridgeCallback";
+import Login from "./pages/login";
+import ProtectedRoute from "./components/ProtectedRoute";
+
 const queryClient = new QueryClient();
+
+function ProtectedLayout() {
+  return (
+    <ProtectedRoute>
+      <Layout>
+        <Outlet />
+      </Layout>
+    </ProtectedRoute>
+  );
+}
 
 const App = () => (
   <QueryClientProvider client={queryClient}>
@@ -23,8 +37,10 @@ const App = () => (
       <Toaster />
       <Sonner />
       <BrowserRouter>
-        <Layout>
-          <Routes>
+        <Routes>
+          <Route path="/login" element={<Login />} />
+
+          <Route element={<ProtectedLayout />}>
             <Route path="/" element={<Dashboard />} />
             <Route path="/rapprochement" element={<Rapprochement />} />
             <Route path="/import" element={<ImportPage />} />
@@ -34,10 +50,11 @@ const App = () => (
             <Route path="/tva" element={<TVA />} />
             <Route path="/parametres" element={<Parametres />} />
             <Route path="/connecteurs" element={<Connecteurs />} />
-            <Route path="*" element={<NotFound />} />
             <Route path="/bridge/callback" element={<BridgeCallback />} />
-          </Routes>
-        </Layout>
+          </Route>
+
+          <Route path="*" element={<NotFound />} />
+        </Routes>
       </BrowserRouter>
     </TooltipProvider>
   </QueryClientProvider>

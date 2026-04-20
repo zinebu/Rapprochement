@@ -60,7 +60,7 @@ type ImportedFileItem = {
   extractedFields?: ExtractedFields;
 };
 
-const API_BASE_URL = "http://localhost:8000";
+const API_BASE_URL = "";
 
 const FIELD_LABELS: Record<string, string> = {
   vendorCustomer: "Tiers",

@@ -1,6 +1,7 @@
 import { Router } from "express";
 import multer from "multer";
 import path from "path";
+import { requireAuth } from "../middleware/auth.middleware.js";
 
 import {
   uploadDocument,
@@ -50,9 +51,9 @@ const upload = multer({
   },
 });
 
-router.post("/import/upload", upload.single("file"), uploadDocument);
-router.post("/imports/:id/send", sendImportToFactures);
-router.get("/imports", listImports);
-router.get("/imports/:id", getImportById);
+router.post("/import/upload", requireAuth, upload.single("file"), uploadDocument);
+router.post("/imports/:id/send", requireAuth, sendImportToFactures);
+router.get("/imports", requireAuth, listImports);
+router.get("/imports/:id", requireAuth, getImportById);
 
 export default router;

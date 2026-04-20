@@ -1,3 +1,4 @@
+import { requireAuth } from "../middleware/auth.middleware.js";
 import { Router } from "express";
 import {
   listReviewQueue,
@@ -7,8 +8,8 @@ import {
 
 const router = Router();
 
-router.get("/review", listReviewQueue);
-router.post("/review/:id/classify", classifyReviewItem);
-router.delete("/review/:id", deleteReviewItem);
+router.get("/review", requireAuth, listReviewQueue);
+router.post("/review/:id/classify", requireAuth, classifyReviewItem);
+router.delete("/review/:id", requireAuth, deleteReviewItem);
 
 export default router;

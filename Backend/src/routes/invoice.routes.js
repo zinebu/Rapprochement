@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { requireAuth } from "../middleware/auth.middleware.js";
 import {
   listAllInvoices,
   listPurchaseInvoices,
@@ -8,9 +9,9 @@ import {
 
 const router = Router();
 
-router.get("/invoices", listAllInvoices);
-router.get("/invoices/purchases", listPurchaseInvoices);
-router.get("/invoices/sales", listSalesInvoices);
-router.delete("/invoices/:id", deleteInvoice);
+router.get("/invoices",requireAuth, listAllInvoices);
+router.get("/invoices/purchases", requireAuth, listPurchaseInvoices);
+router.get("/invoices/sales", requireAuth, listSalesInvoices);
+router.delete("/invoices/:id", requireAuth, deleteInvoice);
 
 export default router;

@@ -88,7 +88,7 @@ interface ReviewItem {
 type FacturesTab = "purchases" | "sales" | "review";
 type CurrencyCode = "EUR" | "MAD" | "USD";
 
-const API_BASE_URL = "http://localhost:8000";
+const API_BASE_URL = "";
 
 const monthLabels = [
   "Janvier",

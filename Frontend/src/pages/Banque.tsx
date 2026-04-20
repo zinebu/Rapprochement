@@ -220,7 +220,7 @@ export default function Banque() {
 
       const callbackUrl = `${window.location.origin}/bridge/callback`;
 
-      const res = await fetch("http://localhost:8000/api/bridge/connect-session", {
+      const res = await fetch("/api/bridge/connect-session", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
@@ -256,7 +256,7 @@ export default function Banque() {
       setBridgeLoadingCategories(true);
       setBridgeError("");
 
-      const res = await fetch("http://localhost:8000/api/bridge/categories");
+      const res = await fetch("/api/bridge/categories");
       const data = await res.json();
       console.log("categories =", data);
 
@@ -288,7 +288,7 @@ export default function Banque() {
 
       const effectiveItemId = itemId || currentBridgeItemId;
 
-      const url = new URL("http://localhost:8000/api/bridge/accounts");
+      const url = new URL("/api/bridge/accounts");
 
       if (effectiveItemId) {
         url.searchParams.set("item_id", effectiveItemId);
@@ -335,8 +335,8 @@ export default function Banque() {
 
       const effectiveAccountId = accountId || selectedBridgeAccountId;
       const url = effectiveAccountId
-        ? `http://localhost:8000/api/bridge/transactions?account_id=${encodeURIComponent(effectiveAccountId)}`
-        : "http://localhost:8000/api/bridge/transactions";
+        ? `/api/bridge/transactions?account_id=${encodeURIComponent(effectiveAccountId)}`
+        : "/api/bridge/transactions";
 
       const res = await fetch(url);
       const data = await res.json();
