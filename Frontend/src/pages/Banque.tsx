@@ -45,7 +45,7 @@ import {
   initialTransactions,
   localAccounts,
   localInvoices,
-  sepaBatchesByReference,
+  sepaBatchesByReference as defaultSepaBatchesByReference,
   unreconciledCategoryLabels
 } from "@/features/banque/data";
 
@@ -63,6 +63,7 @@ import type {
   SepaOperationDecision,
   SepaOperationDecisionStatus,
   UnreconciledCategory,
+  SepaBatchTemplate,
 } from "@/features/banque/types";
 
 import {
@@ -72,6 +73,7 @@ import {
   formatCompactAmount,
   formatDisplayDate,
   formatMoney,
+  formatOperationLabel,
   getAccountById,
   getAvailableInvoicesForSepaOperation,
   getAvailableInvoicesForTxn,
@@ -125,9 +127,43 @@ type BridgeCategory = {
   }[];
 };
 
+type ImportedBankOperation = {
+  id?: string;
+  txnDate?: string;
+  valueDate?: string;
+  label?: string;
+  reference?: string;
+  amount?: number;
+  currency?: string;
+  operationType?: OperationType;
+  paymentMethod?: PaymentMethod;
+  counterpartyName?: string | null;
+  source?: string;
+};
+
+type ImportedDocumentDto = {
+  _id?: string;
+  id?: string;
+  documentType?: string;
+  structuredData?: {
+    documentType?: string;
+    account?: {
+      iban?: string;
+      currency?: string;
+      closingBalance?: number;
+    };
+    operations?: ImportedBankOperation[];
+    sepaBatch?: SepaBatchTemplate;
+    summarizedOperation?: ImportedBankOperation;
+  };
+};
+
 export default function Banque() {
   const [accounts] = useState<LocalBankAccount[]>(localAccounts);
   const [transactions, setTransactions] = useState<LocalTransaction[]>(initialTransactions);
+  const [sepaBatchesByReference, setSepaBatchesByReference] = useState<Record<string, SepaBatchTemplate>>(
+    defaultSepaBatchesByReference
+  );
 
   const [bridgeCategories, setBridgeCategories] = useState<BridgeCategory[]>([]);
   const [bridgeLoadingCategories, setBridgeLoadingCategories] = useState(false);
@@ -188,6 +224,137 @@ export default function Banque() {
   const getBridgeTransactionCurrency = (tx: BridgeTransaction) =>
     tx.currency_code || tx.currency || "EUR";
 
+  const resolveBankAccountId = (
+    scannedIban: string | undefined,
+    scannedCurrency: string | undefined
+  ) => {
+    if (scannedIban) {
+      const byIban = accounts.find((a) => a.iban.replace(/\s/g, "") === scannedIban.replace(/\s/g, ""));
+      if (byIban) return byIban.id;
+    }
+    if (scannedCurrency) {
+      const byCurrency = accounts.find((a) => a.currency === scannedCurrency);
+      if (byCurrency) return byCurrency.id;
+    }
+    return "ba-eur";
+  };
+
+  const [autoload, setAutoload] = useState(true); // Ajouter un flag pour éviter le rechargement automatique après suppression
+
+  useEffect(() => {
+    if (autoload) {
+      const loadScannedBankOperations = async () => {
+        try {
+          const res = await fetch("/api/imports", {
+            credentials: "include",
+          });
+
+          const payload = await res.json();
+          if (!res.ok) return;
+
+          const importedDocs: ImportedDocumentDto[] = Array.isArray(payload?.documents) ? payload.documents : [];
+          const scannedTransactions: LocalTransaction[] = [];
+          const scannedSepaBatches: Record<string, SepaBatchTemplate> = {};
+
+          importedDocs.forEach((doc) => {
+            const docId = doc.id || doc._id || "";
+            const structured = doc.structuredData;
+            const docType = structured?.documentType || doc.documentType;
+            const accountIban = structured?.account?.iban;
+            const accountCurrency = structured?.account?.currency || "EUR";
+            const bankAccountId = resolveBankAccountId(accountIban, accountCurrency);
+            const fallbackBalance = Number(structured?.account?.closingBalance || 0);
+
+            structured.operations.forEach((op, index) => {
+              if (!op?.txnDate || typeof op.amount !== "number") return;
+              scannedTransactions.push({
+                id: op.id || `${docId}-op-${index + 1}`,
+                sourceDocumentId: docId,
+                bankAccountId,
+                txnDate: op.txnDate,
+                label: op.label || "Opération scannée",
+                rawLabel: (op as any).rawLabel,
+                reference: op.reference || `${docId}-${index + 1}`,
+                amount: op.amount,
+                balance: fallbackBalance,
+                reconciledStatus: "non_rapproché",
+                currency: (op.currency || accountCurrency || "EUR") as CurrencyCode,
+                operationType: op.operationType || (op.amount >= 0 ? "encaissement" : "decaissement"),
+                paymentMethod: op.paymentMethod || "AUTRE",
+                matchedInvoiceIds: [],
+                counterpartyName: op.counterpartyName || "Contrepartie scannée",
+                unreconciledComment: "Opération scannée depuis relevé bancaire",
+              });
+            });
+
+            const sum = structured?.summarizedOperation;
+            if (
+              scannedTransactions.filter((t) => t.reference === (sum?.reference || "")).length === 0 &&
+              sum?.txnDate
+            ) {
+              scannedTransactions.push({
+                id: sum.id || `${docId}-summary`,
+                sourceDocumentId: docId,
+                bankAccountId,
+                txnDate: sum.txnDate,
+                label: sum.label || "Relevé bancaire scanné",
+                reference: sum.reference || `${docId}-summary`,
+                amount: typeof sum.amount === "number" ? sum.amount : 0,
+                balance: fallbackBalance,
+                reconciledStatus: "non_rapproché",
+                currency: (sum.currency || accountCurrency || "EUR") as CurrencyCode,
+                operationType: (sum.operationType || "encaissement") as OperationType,
+                paymentMethod: (sum.paymentMethod || "AUTRE") as PaymentMethod,
+                matchedInvoiceIds: [],
+                counterpartyName: sum.counterpartyName || "Relevé bancaire",
+                unreconciledComment: "Relevé importé, opérations détaillées non détectées",
+              });
+            }
+          }
+
+          if (docType === "sepa_xml" && structured?.sepaBatch) {
+            const batch = structured.sepaBatch;
+            scannedSepaBatches[batch.id] = batch;
+            const sum = structured?.summarizedOperation;
+            if (sum?.txnDate && typeof sum.amount === "number") {
+              const bankAccountId = resolveBankAccountId(batch.debtorIban, batch.debtorCurrency);
+              scannedTransactions.push({
+                id: sum.id || `${docId}-sepa`,
+                sourceDocumentId: docId,
+                bankAccountId,
+                txnDate: sum.txnDate,
+                label: sum.label || `SEPA ${batch.id}`,
+                reference: sum.reference || batch.id,
+                amount: sum.amount,
+                balance: 0,
+                reconciledStatus: "non_rapproché",
+                currency: (sum.currency || batch.debtorCurrency || "EUR") as CurrencyCode,
+                operationType: "decaissement",
+                paymentMethod: "SEPA",
+                matchedInvoiceIds: [],
+                counterpartyName: sum.counterpartyName || batch.debtorName || "SEPA scanné",
+                unreconciledComment: "Opération SEPA scannée depuis import XML",
+              });
+            }
+          }
+        });
+
+          if (Object.keys(scannedSepaBatches).length > 0) {
+            setSepaBatchesByReference((prev) => ({ ...prev, ...scannedSepaBatches }));
+          }
+
+          if (scannedTransactions.length > 0) {
+            setTransactions(scannedTransactions);
+          }
+        } catch (error) {
+          console.error("Erreur chargement opérations scannées:", error);
+        }
+      };
+
+      void loadScannedBankOperations();
+    }
+  }, [accounts]);
+
   const getBridgeCategoryLabel = (tx: BridgeTransaction) => {
     const categoryId =
       tx.category_id ??
@@ -222,6 +389,7 @@ export default function Banque() {
 
       const res = await fetch("/api/bridge/connect-session", {
         method: "POST",
+        credentials: "include",
         headers: {
           "Content-Type": "application/json",
         },
@@ -256,7 +424,9 @@ export default function Banque() {
       setBridgeLoadingCategories(true);
       setBridgeError("");
 
-      const res = await fetch("/api/bridge/categories");
+      const res = await fetch("/api/bridge/categories", {
+        credentials: "include",
+      });
       const data = await res.json();
       console.log("categories =", data);
 
@@ -298,7 +468,9 @@ export default function Banque() {
 
       console.log("Frontend accounts URL =", url.toString());
 
-      const res = await fetch(url.toString());
+      const res = await fetch(url.toString(), {
+        credentials: "include",
+      });
       const data = await res.json();
 
       if (!res.ok) {
@@ -338,7 +510,9 @@ export default function Banque() {
         ? `/api/bridge/transactions?account_id=${encodeURIComponent(effectiveAccountId)}`
         : "/api/bridge/transactions";
 
-      const res = await fetch(url);
+      const res = await fetch(url, {
+        credentials: "include",
+      });
       const data = await res.json();
       console.log("transactions =", data);
 
@@ -358,7 +532,7 @@ export default function Banque() {
 
       setBridgeTransactions(txs);
     } catch (error) {
-      console.error("Erreur chargement transactions:", error);
+      console.error("Erreur chargement opérations scannées:", error);
       setBridgeError("Erreur lors du chargement des opérations Bridge.");
     } finally {
       setBridgeLoadingTransactions(false);
@@ -716,6 +890,54 @@ export default function Banque() {
     toast?.success?.("Rapprochement annulé.");
   };
 
+  const handleDeleteImportedDocument = async (txn: LocalTransaction) => {
+    if (!txn.sourceDocumentId) {
+      toast?.error?.("Cette ligne n'est pas liée à un import supprimable.");
+      return;
+    }
+
+    try {
+      const response = await fetch(`/dev-imports/${encodeURIComponent(txn.sourceDocumentId)}`, {
+        method: "DELETE",
+        credentials: "include",
+        headers: {
+          "Content-Type": "application/json",
+        },
+      });
+      const payload = await response.json().catch(() => ({}));
+
+      if (!response.ok && response.status !== 404) {
+        throw new Error(payload?.error || "Suppression impossible");
+      }
+
+      const removedRefs = transactions
+        .filter((t) => t.sourceDocumentId === txn.sourceDocumentId);
+
+      // Désactiver le rechargement automatique temporairement
+      setAutoload(false);
+      
+      // Supprimer localement sans recharger depuis le backend
+      setTransactions((prev) =>
+        prev.filter((t) => t.sourceDocumentId !== txn.sourceDocumentId)
+      );
+      setSepaBatchesByReference((prev) => {
+        const next = { ...prev };
+        removedRefs.forEach((ref) => {
+          delete next[ref]; 
+        });
+        return next;
+      });
+      if (detailsTxnId && detailsTxnId === txn.id) {
+        setDetailsTxnId(null);
+        setDetailsSepaReference(null);
+      }
+      toast?.success?.("Import supprimé depuis Banque.");
+    } catch (error) {
+      console.error("Erreur suppression import depuis Banque:", error);
+      toast?.error?.("Impossible de supprimer l'import.");
+    }
+  };
+
   const resetFilters = () => {
     setSearchText("");
     setStatusFilter("all");
@@ -731,6 +953,10 @@ export default function Banque() {
     setMaxAmount("");
     setSepaOnly(false);
     setPayrollOnly(false);
+  };
+
+  const toggleAutoload = () => {
+    setAutoload(prev => !prev);
   };
 
   const openInvoicePdf = (inv: LocalInvoice) => {
@@ -1193,8 +1419,8 @@ export default function Banque() {
                           <TableCell className="whitespace-nowrap">{formatDisplayDate(txn.txnDate)}</TableCell>
                           <TableCell className="align-top">
                             <div className="space-y-2 max-w-full overflow-hidden">
-                              <div className="truncate font-medium text-slate-900" title={txn.label}>
-                                {txn.label}
+                              <div className="truncate font-medium text-slate-900" title={txn.rawLabel || txn.label}>
+                                {formatOperationLabel(txn.label, txn.rawLabel)}
                               </div>
                               <div className="truncate text-xs text-slate-500" title={txn.reference}>
                                 {txn.reference}
@@ -1277,6 +1503,11 @@ export default function Banque() {
                                       Annuler le rapprochement
                                     </DropdownMenuItem>
                                   ) : null}
+                                  {txn.sourceDocumentId ? (
+                                    <DropdownMenuItem onClick={() => handleDeleteImportedDocument(txn)}>
+                                      Supprimer import
+                                    </DropdownMenuItem>
+                                  ) : null}
                                 </DropdownMenuContent>
                               </DropdownMenu>
                             </div>
@@ -1304,7 +1535,9 @@ export default function Banque() {
                   <div className="rounded-2xl bg-slate-50 p-4">
                     <div className="flex items-start justify-between gap-3">
                       <div>
-                        <p className="text-sm font-semibold text-slate-900">{selectedDetailsTxn.label}</p>
+                        <p className="text-sm font-semibold text-slate-900" title={selectedDetailsTxn.rawLabel || selectedDetailsTxn.label}>
+                        {formatOperationLabel(selectedDetailsTxn.label, selectedDetailsTxn.rawLabel)}
+                      </p>
                         <p className="mt-1 text-xs text-slate-500">{selectedDetailsTxn.reference}</p>
                       </div>
                       <StatusBadge status={selectedDetailsTxn.reconciledStatus} />

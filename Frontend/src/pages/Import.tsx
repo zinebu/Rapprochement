@@ -182,7 +182,10 @@ function formatFieldValue(
 
 function getDocumentStatusLabel(item: ImportedFileItem) {
   if (item.error) return "Erreur";
-  if (item.sent) return "Envoyé vers Factures";
+  if (item.sent) {
+    if (item.destination === "banque") return "Envoyé vers Banque";
+    return "Envoyé vers Factures";
+  }
   if (item.sending) return "Envoi en cours";
   if (item.analyzing) return "Importation en cours ...";
   if (item.analyzed) return "Analyse terminée";
@@ -246,12 +249,16 @@ export default function ImportPage() {
 
       const response = await fetch(`${API_BASE_URL}/api/import/upload`, {
         method: "POST",
+        credentials: "include",
         body: formData,
       });
 
       const data = await response.json();
 
       if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error("Session expirée. Reconnecte-toi puis réessaie.");
+        }
         throw new Error(data?.error || "Analyse échouée");
       }
 
@@ -271,6 +278,7 @@ export default function ImportPage() {
         ...current,
         analyzing: false,
         analyzed: true,
+        sent: (data?.document?.status ?? null) === "sent",
         error: null,
         serverDocumentId,
         backendStatus: data?.document?.status ?? null,
@@ -312,12 +320,16 @@ export default function ImportPage() {
         `${API_BASE_URL}/api/imports/${item.serverDocumentId}/send`,
         {
           method: "POST",
+          credentials: "include",
         }
       );
 
       const data = await response.json();
 
       if (!response.ok) {
+        if (response.status === 401) {
+          throw new Error("Session expirée. Reconnecte-toi puis réessaie.");
+        }
         throw new Error(data?.error || "Erreur pendant l'envoi");
       }
 
@@ -325,12 +337,16 @@ export default function ImportPage() {
         ...current,
         sending: false,
         sent: true,
-        destination: "factures",
+        destination: data?.document?.destination ?? "factures",
         backendStatus: data?.document?.status ?? "sent",
         error: null,
       }));
 
-      toast.success("Document envoyé dans Factures.");
+      toast.success(
+        data?.document?.destination === "banque"
+          ? "Document envoyé dans Banque."
+          : "Document envoyé dans Factures."
+      );
     } catch (error) {
       const message = error instanceof Error ? error.message : "Erreur pendant l'envoi";
 
@@ -402,12 +418,16 @@ export default function ImportPage() {
 
           const response = await fetch(`${API_BASE_URL}/api/import/upload`, {
             method: "POST",
+            credentials: "include",
             body: formData,
           });
 
           const data = await response.json();
 
           if (!response.ok) {
+            if (response.status === 401) {
+              throw new Error("Session expirée. Reconnecte-toi puis réessaie.");
+            }
             throw new Error(data?.error || "Analyse échouée");
           }
 
@@ -430,6 +450,7 @@ export default function ImportPage() {
                     ...current,
                     analyzing: false,
                     analyzed: true,
+                    sent: (data?.document?.status ?? null) === "sent",
                     error: null,
                     serverDocumentId,
                     backendStatus: data?.document?.status ?? null,
@@ -466,8 +487,32 @@ export default function ImportPage() {
     event.target.value = "";
   };
 
-  const handleRemove = (id: string) => {
+  const handleRemove = async (id: string) => {
+    const item = files.find((f) => f.id === id);
+
+    if (item?.serverDocumentId) {
+      try {
+        const response = await fetch(
+          `${API_BASE_URL}/api/imports/${item.serverDocumentId}`,
+          {
+            method: "DELETE",
+            credentials: "include",
+          }
+        );
+
+        const data = await response.json().catch(() => ({}));
+
+        if (!response.ok && response.status !== 404) {
+          throw new Error(data?.error || "Suppression serveur impossible");
+        }
+      } catch (error) {
+        toast.error("Impossible de supprimer cet import côté serveur.");
+        return;
+      }
+    }
+
     setFiles((prev) => prev.filter((f) => f.id !== id));
+    toast.success("Import supprimé.");
   };
 
   const handleReset = () => {
@@ -584,7 +629,11 @@ export default function ImportPage() {
                         {item.sent && (
                           <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800 flex gap-2">
                             <CheckCircle2 className="h-4 w-4 mt-0.5" />
-                            <p>Le document a été envoyé dans Factures.</p>
+                            <p>
+                              {item.destination === "banque"
+                                ? "Le document a été envoyé dans Banque."
+                                : "Le document a été envoyé dans Factures."}
+                            </p>
                           </div>
                         )}
                       </div>
@@ -596,7 +645,12 @@ export default function ImportPage() {
                   <div className="flex gap-2 flex-wrap md:justify-end md:max-w-[220px]">
                     <Button
                       onClick={() => handleSend(item.id)}
-                      disabled={!item.analyzed || item.sending || item.sent}
+                      disabled={
+                        !item.analyzed ||
+                        item.sending ||
+                        item.sent ||
+                        item.backendStatus === "sent"
+                      }
                     >
                       {item.sending ? "Envoi..." : item.sent ? "Envoyé" : "Envoyer"}
                     </Button>

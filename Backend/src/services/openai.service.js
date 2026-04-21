@@ -4,10 +4,6 @@ import { COMPANY_IDENTITY } from "../config/company-identity.js";
 
 console.log("LOADED openai.service.js VERSION VISION");
 
-const client = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
 function fileToDataUrl(filePath, mimeType = "image/png") {
   const buffer = fs.readFileSync(filePath);
   const base64 = buffer.toString("base64");
@@ -39,6 +35,10 @@ export async function classifyWithOpenAI({
   if (!process.env.OPENAI_API_KEY) {
     throw new Error("OPENAI_API_KEY manquante dans le .env");
   }
+
+  const client = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+  });
 
   const model = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 

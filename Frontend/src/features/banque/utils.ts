@@ -48,6 +48,34 @@ export function extractInvoiceNumberFromText(text: string): string | null {
   return m ? m.toUpperCase() : null;
 }
 
+export function formatOperationLabel(label: string, rawLabel?: string): string {
+  // If we have a clean label, use it
+  if (label && label.length > 0 && label !== rawLabel) {
+    return label;
+  }
+  
+  // If we only have the raw label, try to clean it
+  const text = rawLabel || label;
+  
+  // Remove common bank operation artifacts
+  let clean = text
+    .replace(/\s+(?:Mandat|RCUR|Infos|compl|Ultimate|Creditor|Debiteur|Beneficiaire).*$/gi, '')
+    .replace(/\s+[A-Z]{2}\d+[A-Z]*.*$/, '') // Remove references like NN753184902DDGFI
+    .replace(/\s+NN\d+.*$/, '') // Remove NN numbers
+    .replace(/\s+REF\s*:.*$/gi, '') // Remove REF fields
+    .replace(/\s+ID\s*:.*$/gi, '') // Remove ID fields
+    .replace(/\s+$/, '') // Remove trailing spaces
+    .trim();
+  
+  // If the cleaned version is too short, return the original truncated
+  if (clean.length < 3) {
+    return text.length > 50 ? text.substring(0, 47) + '...' : text;
+  }
+  
+  // Limit length and return
+  return clean.length > 50 ? clean.substring(0, 47) + '...' : clean;
+}
+
 export function getCurrencyBadgeClass(currency: CurrencyCode) {
   if (currency === "EUR") return "bg-blue-50 text-blue-700 ring-1 ring-blue-100";
   if (currency === "MAD") return "bg-amber-50 text-amber-700 ring-1 ring-amber-100";

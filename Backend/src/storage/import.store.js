@@ -29,3 +29,7 @@ export async function getImportedDocumentById(id) {
 export async function updateImportedDocument(id, patch) {
   return await ImportedDocument.findByIdAndUpdate(id, patch, { new: true });
 }
+
+export async function deleteImportedDocument(id) {
+  return await ImportedDocument.findByIdAndDelete(id);
+}

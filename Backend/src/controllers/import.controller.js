@@ -3,10 +3,13 @@ import {
   listImportedDocuments,
   getImportedDocumentById,
   updateImportedDocument,
+  deleteImportedDocument,
 } from "../storage/import.store.js";
+import fs from "fs";
 import { dispatchBusinessDocument } from "../services/business-dispatch.service.js";
 import { extractDocumentContent } from "../services/file-extractor.service.js";
 import { extractInvoiceFieldsFromText } from "../services/invoice-parser.service.js";
+import { extractBankOrSepaData } from "../services/bank-parser.service.js";
 import { inferInvoiceNatureHints } from "../services/invoice-nature.service.js";
 import { classifyWithOpenAI } from "../services/openai.service.js";
 import { resolveDestination } from "../services/dispatch.service.js";
@@ -44,7 +47,34 @@ export async function uploadDocument(req, res) {
     if (extracted.kind === "error") {
       status = "extraction_failed";
     } else {
+      const nameLooksLikeBankStatement = /relev|releve|extrait.*compte|statement/i.test(
+        req.file.originalname || ""
+      );
+      const looksLikeSepaXml =
+        req.file.mimetype === "application/xml" ||
+        req.file.mimetype === "text/xml" ||
+        /\.xml$/i.test(req.file.originalname || "");
+
       structuredData = extractInvoiceFieldsFromText(extracted.text);
+      const bankStructuredData = extractBankOrSepaData({
+        extractedText: extracted.text,
+        mimeType: req.file.mimetype,
+        originalName: req.file.originalname,
+        extractedStructuredData: extracted.structuredData,
+      });
+
+      if (bankStructuredData) {
+        structuredData = bankStructuredData;
+      } else if (nameLooksLikeBankStatement) {
+        structuredData = {
+          documentType: "bank_statement",
+          account: {
+            sourceName: req.file.originalname || null,
+            currency: "EUR",
+          },
+          operations: [],
+        };
+      }
 
       natureHints = inferInvoiceNatureHints({
         extractedText: extracted.text,
@@ -72,6 +102,38 @@ export async function uploadDocument(req, res) {
       } catch (classificationError) {
         console.error("OpenAI classification error:", classificationError);
         status = "classification_failed";
+      }
+
+      if (structuredData?.documentType === "bank_statement") {
+        classification.label = "bank_statement";
+        classification.confidence = Math.max(
+          Number(classification.confidence || 0),
+          0.9
+        );
+      }
+
+      if (structuredData?.documentType === "sepa_xml") {
+        classification.label = "sepa_xml";
+        classification.confidence = Math.max(
+          Number(classification.confidence || 0),
+          0.95
+        );
+      }
+
+      if (
+        structuredData?.documentType === "bank_statement" ||
+        structuredData?.documentType === "sepa_xml"
+      ) {
+        destination = "banque";
+        status = "sent";
+      } else if (nameLooksLikeBankStatement || looksLikeSepaXml) {
+        classification.label = looksLikeSepaXml ? "sepa_xml" : "bank_statement";
+        classification.confidence = Math.max(
+          Number(classification.confidence || 0),
+          0.9
+        );
+        destination = "banque";
+        status = "sent";
       }
     }
 
@@ -155,8 +217,10 @@ export async function sendImportToFactures(req, res) {
     }
 
     if (document.status === "sent") {
+      const destinationLabel =
+        document.destination === "banque" ? "Banque" : "Factures";
       return res.status(400).json({
-        error: "Ce document a déjà été envoyé dans Factures",
+        error: `Ce document a déjà été envoyé vers ${destinationLabel}`,
       });
     }
 
@@ -172,6 +236,38 @@ export async function sendImportToFactures(req, res) {
       extractedFields: document?.classification?.fields || {},
       fileUrl: document?.fileUrl || null,
     };
+
+    const originalName = String(document?.originalName || "").toLowerCase();
+    const mimeType = String(document?.mimeType || "").toLowerCase();
+    const fileLooksLikeBankStatement = /relev|releve|extrait.*compte|statement/.test(
+      originalName
+    );
+    const fileLooksLikeSepa =
+      mimeType.includes("xml") || originalName.endsWith(".xml");
+
+    if (
+      businessInput.detectedType === "bank_statement" ||
+      businessInput.detectedType === "sepa_xml" ||
+      fileLooksLikeBankStatement ||
+      fileLooksLikeSepa
+    ) {
+      await updateImportedDocument(id, {
+        destination: "banque",
+        status: "sent",
+      });
+
+      const refreshedBankDocument = await getImportedDocumentById(id);
+
+      return res.status(200).json({
+        success: true,
+        message: "Document envoyé vers Banque",
+        document: refreshedBankDocument,
+        business: {
+          target: "banque",
+          duplicated: false,
+        },
+      });
+    }
 
     const businessResult = await dispatchBusinessDocument(businessInput);
 
@@ -239,6 +335,40 @@ export async function getImportById(req, res) {
     console.error("getImportById error:", error);
     return res.status(500).json({
       error: "Erreur pendant la récupération du document",
+      details: String(error),
+    });
+  }
+}
+
+export async function deleteImportById(req, res) {
+  try {
+    const { id } = req.params;
+    const document = await getImportedDocumentById(id);
+
+    if (!document) {
+      return res.status(404).json({
+        error: "Document introuvable",
+      });
+    }
+
+    if (document.filePath && fs.existsSync(document.filePath)) {
+      try {
+        fs.unlinkSync(document.filePath);
+      } catch (fileError) {
+        console.warn("Suppression fichier import échouée:", fileError);
+      }
+    }
+
+    await deleteImportedDocument(id);
+
+    return res.json({
+      success: true,
+      message: "Import supprimé",
+    });
+  } catch (error) {
+    console.error("deleteImportById error:", error);
+    return res.status(500).json({
+      error: "Erreur pendant la suppression de l'import",
       details: String(error),
     });
   }

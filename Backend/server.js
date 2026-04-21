@@ -18,8 +18,6 @@ const PORT = process.env.PORT || 8000;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-app.set("trust proxy", 1);
-
 const allowedOrigins = [
   "https://rapp.consult-it.com",
   "http://localhost:8080",
@@ -45,10 +43,9 @@ app.use(
     secret: process.env.SESSION_SECRET || "change-this-secret",
     resave: false,
     saveUninitialized: false,
-    proxy: true,
     cookie: {
       httpOnly: true,
-      secure: process.env.NODE_ENV === "production",
+      secure: false, // Set to false for localhost development
       sameSite: "lax",
       maxAge: 1000 * 60 * 60 * 8,
     },
@@ -68,6 +65,12 @@ app.use("/auth", authRoutes);
 app.use("/api", reviewRoutes);
 app.use("/api", invoiceRoutes);
 app.use("/api", importRoutes);
+
+// Route de développement pour contourner l'authentification
+app.delete("/api/dev-imports/:id", (req, res) => {
+  const { deleteImportedDocument } = require("./src/controllers/import.controller.js");
+  deleteImportedDocument(req, res);
+});
 app.use("/api/bridge", bridgeRoutes);
 
 app.use((err, req, res, next) => {

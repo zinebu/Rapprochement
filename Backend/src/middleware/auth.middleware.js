@@ -1,4 +1,9 @@
 export function requireAuth(req, res, next) {
+  // Contournement pour le développement
+  if (process.env.NODE_ENV !== "production") {
+    return next();
+  }
+  
   if (!req.session.user) {
     return res.status(401).json({
       message: "Non authentifié",

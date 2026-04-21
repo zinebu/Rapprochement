@@ -44,9 +44,11 @@ export type LocalInvoice = {
 
 export type LocalTransaction = {
   id: string;
+  sourceDocumentId?: string;
   bankAccountId: string;
   txnDate: string;
   label: string;
+  rawLabel?: string;
   reference: string;
   amount: number;
   balance: number;
