@@ -21,6 +21,43 @@ import { resolveDestination } from "../services/dispatch.service.js";
 
 console.log("LOADED import.controller.js VERSION FINAL");
 
+function normalizeBankOperationAmount(op = {}) {
+  const rawAmount = Number(op.amount || 0);
+  const absAmount = Math.abs(rawAmount);
+  const opType = String(op.operationType || "").toLowerCase();
+  const hay = `${op.label || ""} ${op.reference || ""} ${op.bankOperationType || ""}`.toLowerCase();
+
+  if (rawAmount < 0) return rawAmount;
+  if (opType === "decaissement") return -absAmount;
+  if (opType === "encaissement") return absAmount;
+
+  if (/\bvir\.?\s*re[çc]u\b|\bencaissement\b|\bversement\b|\bcr[eé]dit\b/.test(hay)) {
+    return absAmount;
+  }
+  if (/\brem\s+vir\s+sepa\b|\bfourn\b|\bvir\.?\s*[eé]mis\b|\bpr[eé]l[eè]v|\bcb\b|\bcarte\b|\bd[eé]bit\b/.test(hay)) {
+    return -absAmount;
+  }
+  return -absAmount;
+}
+
+function normalizeBankStatementPayload(statementAgentData) {
+  if (!statementAgentData || !Array.isArray(statementAgentData.operations)) {
+    return statementAgentData;
+  }
+  const normalizedOps = statementAgentData.operations.map((op) => {
+    const amount = normalizeBankOperationAmount(op);
+    return {
+      ...op,
+      amount,
+      operationType: amount >= 0 ? "encaissement" : "decaissement",
+    };
+  });
+  return {
+    ...statementAgentData,
+    operations: normalizedOps,
+  };
+}
+
 export async function uploadDocument(req, res) {
   try {
     if (!req.file) {
@@ -117,7 +154,7 @@ export async function uploadDocument(req, res) {
           fileName: req.file.originalname,
         });
         if (statementAgentData?.documentType === "bank_statement") {
-          bankStructuredData = statementAgentData;
+          bankStructuredData = normalizeBankStatementPayload(statementAgentData);
         }
       }
 

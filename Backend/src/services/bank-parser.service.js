@@ -42,6 +42,41 @@ function inferPaymentMethod(label = "", opType = "") {
   return "AUTRE";
 }
 
+function inferSignedAmount(amount, bankOperationType = "", label = "", trailingDetails = "", rawAmountText = "") {
+  const absAmount = Math.abs(Number(amount) || 0);
+  const hay = normalize(`${bankOperationType} ${label} ${trailingDetails}`);
+  const raw = String(rawAmountText || "").replace(/\s/g, "");
+
+  // Explicit sign on extracted amount has highest priority.
+  if (/^-/.test(raw)) return -absAmount;
+  if (/^\+/.test(raw)) return absAmount;
+
+  // Strong outgoing markers (supplier transfer remittance, card/fees/debit/prelevement).
+  const outgoingStrong =
+    /\brem\s+vir\s+sepa\b/i.test(hay) ||
+    /\bfourn(?:isseur)?\b/i.test(hay) ||
+    /\bvir\.?\s*[eé]mis\b/i.test(hay) ||
+    /\bvirement\s+sortant\b/i.test(hay) ||
+    /\bpr[eé]l[eè]v/i.test(hay) ||
+    /\bcb\b|\bcarte\b|\bfrais\b|\bcommission\b|\bd[eé]bit\b|\bdebit\b|\bpaiement\b/i.test(hay) ||
+    /[Ee][ch][ée]ance\s*cr[ée]dits?/i.test(hay);
+
+  // Incoming markers.
+  const incomingStrong =
+    /\bvir\.?\s*re[çc]u\b/i.test(hay) ||
+    /\bvirement\s+entrant\b/i.test(hay) ||
+    /\bencaissement\b/i.test(hay) ||
+    /\bversement\b/i.test(hay) ||
+    /\bremise\b/i.test(hay) ||
+    /\bcr[ée]dit\b|\bcredit\b/i.test(hay);
+
+  if (outgoingStrong && !incomingStrong) return -absAmount;
+  if (incomingStrong && !outgoingStrong) return absAmount;
+
+  // Conservative default: outgoing for unknown transfer-like operations.
+  return -absAmount;
+}
+
 function isOwnCompanyName(name) {
   const n = normalize(name);
   const aliases = (COMPANY_IDENTITY?.aliases || []).map(normalize);
@@ -133,7 +168,7 @@ function parseBankStatementFromText(text, fallbackFileName = "") {
 
   const operations = [];
   const operationRegex =
-    /(\d{2}\/\d{2}\/\d{4})\s+([0-9A-Z]+)\s+([\s\S]*?)\s+(\d{2}\/\d{2}\/\d{4})\s+((?:05|06|62|72|B2)\s*-\s*[\s\S]*?)\s+([0-9]{1,3}(?:\s[0-9]{3})*,[0-9]{2})([\s\S]*?)(?=(?:\d{2}\/\d{2}\/\d{4}\s+[0-9A-Z]+)|TOTAL\b|$)/gi;
+    /(\d{2}\/\d{2}\/\d{4})\s+([0-9A-Z]+)\s+([\s\S]*?)\s+(\d{2}\/\d{2}\/\d{4})\s+((?:05|06|62|72|B2)\s*-\s*[\s\S]*?)\s+([+-]?\s*[0-9]{1,3}(?:\s[0-9]{3})*,[0-9]{2})([\s\S]*?)(?=(?:\d{2}\/\d{2}\/\d{4}\s+[0-9A-Z]+)|TOTAL\b|$)/gi;
 
   for (const match of normalized.matchAll(operationRegex)) {
     const txnDate = normalizeDateToIso(match[1]);
@@ -141,18 +176,21 @@ function parseBankStatementFromText(text, fallbackFileName = "") {
     const rawLabel = cleanText(match[3]);
     const valueDate = normalizeDateToIso(match[4]);
     const bankOperationType = cleanText(match[5]);
-    const amount = parseFrAmount(match[6]);
+    const rawAmountText = cleanText(match[6]);
+    const amount = parseFrAmount(rawAmountText);
     const trailingDetails = cleanText(match[7]);
 
     if (amount == null) continue;
     // Ignore header false-positives like "DU ... AU ..." matched as an operation.
     if (!/^\d{5,}$/.test(piece)) continue;
 
-    let signedAmount = -Math.abs(amount);
-    if (/Vir\.\s*re[çc]u/i.test(bankOperationType)) signedAmount = Math.abs(amount);
-    if (/[Ee][ch][ée]ance\s*cr[ée]dits?/i.test(bankOperationType)) {
-      signedAmount = -Math.abs(amount);
-    }
+    const signedAmount = inferSignedAmount(
+      amount,
+      bankOperationType,
+      rawLabel,
+      trailingDetails,
+      rawAmountText
+    );
 
     const operationType = signedAmount >= 0 ? "encaissement" : "decaissement";
     const paymentMethod = inferPaymentMethod(rawLabel, bankOperationType);
