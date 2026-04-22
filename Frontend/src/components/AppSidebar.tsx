@@ -3,7 +3,6 @@ import {
   LayoutDashboard,
   FileText,
   Landmark,
-  ArrowLeftRight,
   Receipt,
   Settings,
   HelpCircle,
@@ -31,7 +30,6 @@ import { useState } from "react";
 
 const mainNav = [
   { title: "Tableau de bord", url: "/", icon: LayoutDashboard },
-  { title: "Rapprochement", url: "/rapprochement", icon: ArrowLeftRight },
   { title: "Banque", url: "/banque", icon: Landmark },
   { title: "Factures", url: "/factures", icon: FileText },
   { title: "SEPA", url: "/sepa", icon: SendHorizontal },
