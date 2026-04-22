@@ -273,6 +273,21 @@ export default function Banque() {
 
             structured.operations.forEach((op, index) => {
               if (!op?.txnDate || typeof op.amount !== "number") return;
+              const opType = String(op.operationType || "").toLowerCase();
+              const hay = `${op.label || ""} ${op.reference || ""} ${op.bankOperationType || ""}`.toLowerCase();
+              const absAmount = Math.abs(Number(op.amount || 0));
+              let normalizedAmount = Number(op.amount || 0);
+              if (normalizedAmount >= 0) {
+                if (opType === "decaissement") normalizedAmount = -absAmount;
+                else if (opType === "encaissement") normalizedAmount = absAmount;
+                else if (/\bvir\.?\s*re[çc]u\b|\bencaissement\b|\bversement\b|\bcr[eé]dit\b/.test(hay)) {
+                  normalizedAmount = absAmount;
+                } else if (/\brem\s+vir\s+sepa\b|\bfourn\b|\bvir\.?\s*[eé]mis\b|\bpr[eé]l[eè]v|\bcb\b|\bcarte\b|\bd[eé]bit\b/.test(hay)) {
+                  normalizedAmount = -absAmount;
+                } else {
+                  normalizedAmount = -absAmount;
+                }
+              }
               const opId = op.id || `${docId}-op-${index + 1}`;
               const localPersisted = localCache[makeRecoCacheKey(docId, opId)] || {};
               const persisted = { ...(persistedOps[opId] || {}), ...localPersisted };
@@ -283,11 +298,11 @@ export default function Banque() {
                 txnDate: op.txnDate,
                 label: op.label || "Opération scannée",
                 reference: op.reference || `${docId}-${index + 1}`,
-                amount: op.amount,
+                amount: normalizedAmount,
                 balance: fallbackBalance,
                 reconciledStatus: persisted.reconciledStatus || "non_rapproché",
                 currency: (op.currency || accountCurrency || "EUR") as CurrencyCode,
-                operationType: op.operationType || (op.amount >= 0 ? "encaissement" : "decaissement"),
+                operationType: op.operationType || (normalizedAmount >= 0 ? "encaissement" : "decaissement"),
                 paymentMethod: op.paymentMethod || "AUTRE",
                 matchedInvoiceIds: Array.isArray(persisted.matchedInvoiceIds) ? persisted.matchedInvoiceIds : [],
                 pendingInvoiceIds: Array.isArray(persisted.pendingInvoiceIds) ? persisted.pendingInvoiceIds : [],
