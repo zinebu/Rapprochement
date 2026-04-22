@@ -1,10 +1,12 @@
 import {
   deletePurchaseInvoiceById,
   listPurchaseInvoices as listPurchaseInvoicesFromStore,
+  updatePurchaseInvoicesStatusByIds,
 } from "../modules/invoices/purchase.store.js";
 import {
   deleteSalesInvoiceById,
   listSalesInvoices as listSalesInvoicesFromStore,
+  updateSalesInvoicesStatusByIds,
 } from "../modules/invoices/sales.store.js";
 import { parseMoneyToNumber } from "../utils/amount.js";
 
@@ -142,6 +144,64 @@ export async function deleteInvoice(req, res) {
     console.error("deleteInvoice error:", error);
     return res.status(500).json({
       error: "Erreur pendant la suppression de la facture",
+      details: String(error),
+    });
+  }
+}
+
+export async function syncInvoiceReconciliationStatus(req, res) {
+  try {
+    const { toReconciled = [], toUnreconciled = [] } = req.body || {};
+
+    const recIds = Array.isArray(toReconciled)
+      ? Array.from(new Set(toReconciled.map((x) => String(x)).filter(Boolean)))
+      : [];
+    const unrecIds = Array.isArray(toUnreconciled)
+      ? Array.from(new Set(toUnreconciled.map((x) => String(x)).filter(Boolean)))
+      : [];
+
+    const purchaseRows = await listPurchaseInvoicesFromStore();
+    const salesRows = await listSalesInvoicesFromStore();
+
+    const purchaseIdSet = new Set(
+      purchaseRows.flatMap((inv) => [String(inv?._id || ""), String(inv?.id || "")]).filter(Boolean)
+    );
+    const salesIdSet = new Set(
+      salesRows.flatMap((inv) => [String(inv?._id || ""), String(inv?.id || "")]).filter(Boolean)
+    );
+
+    const recPurchaseIds = recIds.filter((id) => purchaseIdSet.has(id));
+    const recSalesIds = recIds.filter((id) => salesIdSet.has(id));
+    const unrecPurchaseIds = unrecIds.filter((id) => purchaseIdSet.has(id));
+    const unrecSalesIds = unrecIds.filter((id) => salesIdSet.has(id));
+
+    const recPurchase = await updatePurchaseInvoicesStatusByIds(recPurchaseIds, "rapprochée");
+    const recSales = await updateSalesInvoicesStatusByIds(recSalesIds, "rapprochée");
+    const unrecPurchase = await updatePurchaseInvoicesStatusByIds(unrecPurchaseIds, "non_rapprochée");
+    const unrecSales = await updateSalesInvoicesStatusByIds(unrecSalesIds, "non_rapprochée");
+
+    return res.json({
+      success: true,
+      message: "Statuts factures synchronisés",
+      stats: {
+        input: {
+          toReconciled: recIds.length,
+          toUnreconciled: unrecIds.length,
+        },
+        reconciled: {
+          purchase: recPurchase,
+          sales: recSales,
+        },
+        unreconciled: {
+          purchase: unrecPurchase,
+          sales: unrecSales,
+        },
+      },
+    });
+  } catch (error) {
+    console.error("syncInvoiceReconciliationStatus error:", error);
+    return res.status(500).json({
+      error: "Erreur synchronisation statuts factures",
       details: String(error),
     });
   }

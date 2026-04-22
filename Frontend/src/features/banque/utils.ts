@@ -25,10 +25,21 @@ export function formatMoney(amount: number, currency: CurrencyCode) {
   }
 }
 
-export function formatDisplayDate(value: string) {
-  if (typeof formatDate === "function") return formatDate(value);
-  const d = new Date(value);
-  if (Number.isNaN(d.getTime())) return value;
+export function formatDisplayDate(value?: string | null) {
+  const raw = String(value ?? "").trim();
+  if (!raw) return "—";
+
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return raw;
+
+  if (typeof formatDate === "function") {
+    try {
+      return formatDate(raw);
+    } catch {
+      return d.toLocaleDateString("fr-FR");
+    }
+  }
+
   return d.toLocaleDateString("fr-FR");
 }
 

@@ -10,6 +10,7 @@ import invoiceRoutes from "./src/routes/invoice.routes.js";
 import reviewRoutes from "./src/routes/review.routes.js";
 import bridgeRoutes from "./src/routes/bridge.routes.js";
 import importRoutes from "./src/routes/import.routes.js";
+import reconciliationRoutes from "./src/routes/reconciliation.routes.js";
 import { connectMongo } from "./src/lib/mongoose.js";
 
 const app = express();
@@ -17,6 +18,8 @@ const PORT = process.env.PORT || 8000;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+app.set("trust proxy", 1);
 
 const allowedOrigins = [
   "https://rapp.consult-it.com",
@@ -28,6 +31,7 @@ app.use(
     origin(origin, callback) {
       if (!origin) return callback(null, true);
       if (allowedOrigins.includes(origin)) return callback(null, true);
+      if (/^http:\/\/localhost:\d+$/i.test(origin)) return callback(null, true);
       return callback(new Error(`Origin non autorisée: ${origin}`));
     },
     credentials: true,
@@ -43,9 +47,11 @@ app.use(
     secret: process.env.SESSION_SECRET || "change-this-secret",
     resave: false,
     saveUninitialized: false,
+    proxy: true,
     cookie: {
       httpOnly: true,
-      secure: false, // Set to false for localhost development
+      // "auto" keeps cookies working on localhost (HTTP) and secures them on HTTPS.
+      secure: "auto",
       sameSite: "lax",
       maxAge: 1000 * 60 * 60 * 8,
     },
@@ -65,12 +71,7 @@ app.use("/auth", authRoutes);
 app.use("/api", reviewRoutes);
 app.use("/api", invoiceRoutes);
 app.use("/api", importRoutes);
-
-// Route de développement pour contourner l'authentification
-app.delete("/api/dev-imports/:id", (req, res) => {
-  const { deleteImportedDocument } = require("./src/controllers/import.controller.js");
-  deleteImportedDocument(req, res);
-});
+app.use("/api", reconciliationRoutes);
 app.use("/api/bridge", bridgeRoutes);
 
 app.use((err, req, res, next) => {

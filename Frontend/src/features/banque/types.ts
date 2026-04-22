@@ -48,7 +48,6 @@ export type LocalTransaction = {
   bankAccountId: string;
   txnDate: string;
   label: string;
-  rawLabel?: string;
   reference: string;
   amount: number;
   balance: number;
@@ -59,6 +58,17 @@ export type LocalTransaction = {
   matchedInvoiceIds?: string[];
   pendingInvoiceIds?: string[];
   counterpartyName?: string;
+  bankMeta?: {
+    debtor?: string | null;
+    beneficiary?: string | null;
+    ultimateCreditor?: string | null;
+    mandate?: string | null;
+    orgId?: string | null;
+    reference?: string | null;
+    remittanceRef?: string | null;
+    info?: string | null;
+    libelle?: string | null;
+  };
   unreconciledCategory?: UnreconciledCategory;
   unreconciledComment?: string;
   reviewFlag?: boolean;
@@ -110,9 +120,12 @@ export type SepaBatchOperation = {
 
 export type SepaBatchTemplate = {
   id: string;
+  sourceDocumentId?: string;
   type: SepaBatchType;
   label: string;
   executionDate: string;
+  totalAmount?: number;
+  numberOfTransactions?: number;
   debtorName: string;
   debtorIban: string;
   debtorCurrency: CurrencyCode;

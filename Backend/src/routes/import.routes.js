@@ -9,6 +9,7 @@ import {
   getImportById,
   sendImportToFactures,
   deleteImportById,
+  saveImportReconciliation,
 } from "../controllers/import.controller.js";
 
 const router = Router();
@@ -52,21 +53,11 @@ const upload = multer({
   },
 });
 
-// Désactiver l'authentification en développement
-const authMiddleware = process.env.NODE_ENV === "production" ? requireAuth : (req, res, next) => next();
-
-router.post("/import/upload", authMiddleware, upload.single("file"), uploadDocument);
-router.post("/imports/:id/send", authMiddleware, sendImportToFactures);
-router.get("/imports", authMiddleware, listImports);
-router.get("/imports/:id", authMiddleware, getImportById);
-router.delete("/imports/:id", authMiddleware, deleteImportById);
-
-// Route de développement pour contourner l'authentification
-router.delete("/dev-imports/:id", deleteImportById);
-
-// Route de test simple
-router.get("/test-delete", (req, res) => {
-  res.json({ message: "Route de test fonctionne", timestamp: new Date().toISOString() });
-});
+router.post("/import/upload", requireAuth, upload.single("file"), uploadDocument);
+router.post("/imports/:id/send", requireAuth, sendImportToFactures);
+router.get("/imports", requireAuth, listImports);
+router.get("/imports/:id", requireAuth, getImportById);
+router.delete("/imports/:id", requireAuth, deleteImportById);
+router.post("/imports/:id/reconciliation", requireAuth, saveImportReconciliation);
 
 export default router;

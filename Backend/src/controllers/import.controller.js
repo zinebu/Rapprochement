@@ -10,6 +10,11 @@ import { dispatchBusinessDocument } from "../services/business-dispatch.service.
 import { extractDocumentContent } from "../services/file-extractor.service.js";
 import { extractInvoiceFieldsFromText } from "../services/invoice-parser.service.js";
 import { extractBankOrSepaData } from "../services/bank-parser.service.js";
+import {
+  classifyImportDocumentAgent,
+  parseSepaWithAgent,
+  parseBankStatementWithAgent,
+} from "../services/openai-agents.service.js";
 import { inferInvoiceNatureHints } from "../services/invoice-nature.service.js";
 import { classifyWithOpenAI } from "../services/openai.service.js";
 import { resolveDestination } from "../services/dispatch.service.js";
@@ -55,13 +60,66 @@ export async function uploadDocument(req, res) {
         req.file.mimetype === "text/xml" ||
         /\.xml$/i.test(req.file.originalname || "");
 
+      const importAgentClassification =
+        (await classifyImportDocumentAgent({
+          fileName: req.file.originalname,
+          mimeType: req.file.mimetype,
+          extractedText: extracted.text || "",
+        })) || null;
+
+      if (importAgentClassification) {
+        classification.label = importAgentClassification.label;
+        classification.confidence = importAgentClassification.confidence;
+        classification.provider = importAgentClassification.provider;
+      }
+
       structuredData = extractInvoiceFieldsFromText(extracted.text);
-      const bankStructuredData = extractBankOrSepaData({
+      let bankStructuredData = extractBankOrSepaData({
         extractedText: extracted.text,
         mimeType: req.file.mimetype,
         originalName: req.file.originalname,
         extractedStructuredData: extracted.structuredData,
       });
+
+      if (classification.label === "sepa_xml") {
+        const sepaAgentData = await parseSepaWithAgent({
+          extractedText: extracted.text || "",
+          structuredXml: extracted.structuredData || {},
+        });
+        if (sepaAgentData?.documentType === "sepa_xml") {
+          const computedTotal = sepaAgentData.sepaBatch.operations.reduce(
+            (sum, op) => sum + Number(op.amount || 0),
+            0
+          );
+          const effectiveTotal =
+            typeof sepaAgentData.sepaBatch.totalAmount === "number"
+              ? sepaAgentData.sepaBatch.totalAmount
+              : computedTotal;
+          bankStructuredData = {
+            ...sepaAgentData,
+            summarizedOperation: {
+              id: `scanned-sepa-${sepaAgentData.sepaBatch.id}`,
+              txnDate: sepaAgentData.sepaBatch.executionDate || null,
+              label: `SEPA XML ${sepaAgentData.sepaBatch.id}`,
+              reference: sepaAgentData.sepaBatch.id,
+              amount: -Math.abs(effectiveTotal),
+              currency: sepaAgentData.sepaBatch.debtorCurrency || "EUR",
+              operationType: "decaissement",
+              paymentMethod: "SEPA",
+              counterpartyName: sepaAgentData.sepaBatch.debtorName || "SEPA",
+              source: "scanned",
+            },
+          };
+        }
+      } else if (classification.label === "bank_statement") {
+        const statementAgentData = await parseBankStatementWithAgent({
+          extractedText: extracted.text || "",
+          fileName: req.file.originalname,
+        });
+        if (statementAgentData?.documentType === "bank_statement") {
+          bankStructuredData = statementAgentData;
+        }
+      }
 
       if (bankStructuredData) {
         structuredData = bankStructuredData;
@@ -82,15 +140,17 @@ export async function uploadDocument(req, res) {
       });
 
       try {
-        classification = await classifyWithOpenAI({
-          fileName: req.file.originalname,
-          mimeType: req.file.mimetype,
-          extractedText: extracted.text,
-          structuredData,
-          natureHints,
-          filePath: req.file.path,
-          pageImages: extracted.pageImages || [],
-        });
+        if (!classification.label) {
+          classification = await classifyWithOpenAI({
+            fileName: req.file.originalname,
+            mimeType: req.file.mimetype,
+            extractedText: extracted.text,
+            structuredData,
+            natureHints,
+            filePath: req.file.path,
+            pageImages: extracted.pageImages || [],
+          });
+        }
 
         destination = resolveDestination(
           classification.label,
@@ -369,6 +429,62 @@ export async function deleteImportById(req, res) {
     console.error("deleteImportById error:", error);
     return res.status(500).json({
       error: "Erreur pendant la suppression de l'import",
+      details: String(error),
+    });
+  }
+}
+
+export async function saveImportReconciliation(req, res) {
+  try {
+    const { id } = req.params;
+    const { operationId, patch } = req.body || {};
+
+    if (!operationId || !patch || typeof patch !== "object") {
+      return res.status(400).json({
+        error: "operationId et patch sont requis",
+      });
+    }
+
+    const document = await getImportedDocumentById(id);
+    if (!document) {
+      return res.status(404).json({
+        error: "Document introuvable",
+      });
+    }
+
+    const structuredData = document.structuredData || {};
+    const reconciliation = structuredData.reconciliation || {};
+    const operations = reconciliation.operations || {};
+    const current = operations[operationId] || {};
+
+    const nextOperations = {
+      ...operations,
+      [operationId]: {
+        ...current,
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      },
+    };
+
+    const updated = await updateImportedDocument(id, {
+      structuredData: {
+        ...structuredData,
+        reconciliation: {
+          ...reconciliation,
+          operations: nextOperations,
+        },
+      },
+    });
+
+    return res.json({
+      success: true,
+      message: "Rapprochement sauvegardé",
+      document: updated,
+    });
+  } catch (error) {
+    console.error("saveImportReconciliation error:", error);
+    return res.status(500).json({
+      error: "Erreur pendant la sauvegarde du rapprochement",
       details: String(error),
     });
   }

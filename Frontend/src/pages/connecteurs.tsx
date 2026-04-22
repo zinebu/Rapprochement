@@ -1,442 +1,253 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import {
   Card,
   CardContent,
   CardHeader,
   CardTitle,
   Button,
+  Input,
   Table,
   TableBody,
   TableCell,
   TableHead,
   TableHeader,
   TableRow,
-  Badge,
   toast,
 } from "./imports";
-import {
-  Plug,
-  RefreshCcw,
-  Settings,
-  CheckCircle2,
-  AlertCircle,
-  Clock3,
-  Database,
-  Link2,
-  ShieldCheck,
-} from "lucide-react";
+import { Landmark, Link2, RefreshCcw } from "lucide-react";
 
-type ConnectorStatus = "connected" | "disconnected" | "error" | "syncing";
-
-interface ConnectorItem {
+type BridgeAccount = {
   id: string;
-  name: string;
-  type: string;
-  description: string;
-  status: ConnectorStatus;
-  lastSync: string | null;
-  syncedData: string[];
-}
+  name?: string;
+  display_name?: string;
+  iban?: string;
+  balance?: number;
+  currency_code?: string;
+  currency?: string;
+  data_access?: string;
+};
 
-const initialConnectors: ConnectorItem[] = [
-  {
-    id: "openclaw",
-    name: "OpenClaw",
-    type: "Plateforme métier",
-    description:
-      "Connexion à une plateforme métier pour récupérer des documents et opérations.",
-    status: "connected",
-    lastSync: "12/03/2026 10:42",
-    syncedData: ["Documents", "Opérations", "Référentiels"],
-  },
-  {
-    id: "crm-jupiter",
-    name: "CRM Jupiter",
-    type: "CRM",
-    description:
-      "Synchronisation des clients, ventes et informations commerciales.",
-    status: "disconnected",
-    lastSync: null,
-    syncedData: ["Clients", "Ventes", "Contacts"],
-  },
-  {
-    id: "bank-api",
-    name: "Banque",
-    type: "API bancaire",
-    description:
-      "Récupération des mouvements bancaires pour faciliter le suivi comptable.",
-    status: "error",
-    lastSync: "11/03/2026 16:05",
-    syncedData: ["Transactions", "Paiements", "Soldes"],
-  },
-];
-
-const syncHistory = [
-  {
-    id: 1,
-    connector: "OpenClaw",
-    date: "12/03/2026 10:42",
-    result: "Succès",
-    detail: "24 documents synchronisés",
-  },
-  {
-    id: 2,
-    connector: "Banque",
-    date: "11/03/2026 16:05",
-    result: "Échec",
-    detail: "Authentification expirée",
-  },
-  {
-    id: 3,
-    connector: "OpenClaw",
-    date: "10/03/2026 09:20",
-    result: "Succès",
-    detail: "12 opérations importées",
-  },
-];
-
-function getStatusLabel(status: ConnectorStatus) {
-  switch (status) {
-    case "connected":
-      return "Connecté";
-    case "disconnected":
-      return "Non connecté";
-    case "error":
-      return "Erreur";
-    case "syncing":
-      return "Synchronisation";
-    default:
-      return "Inconnu";
-  }
-}
-
-function getStatusBadgeClass(status: ConnectorStatus) {
-  switch (status) {
-    case "connected":
-      return "bg-success/10 text-success border-success/20";
-    case "disconnected":
-      return "bg-muted text-muted-foreground border-border";
-    case "error":
-      return "bg-destructive/10 text-destructive border-destructive/20";
-    case "syncing":
-      return "bg-info/10 text-info border-info/20";
-    default:
-      return "bg-muted text-muted-foreground border-border";
-  }
-}
-
-function getStatusIcon(status: ConnectorStatus) {
-  switch (status) {
-    case "connected":
-      return <CheckCircle2 className="h-4 w-4" />;
-    case "disconnected":
-      return <Clock3 className="h-4 w-4" />;
-    case "error":
-      return <AlertCircle className="h-4 w-4" />;
-    case "syncing":
-      return <RefreshCcw className="h-4 w-4" />;
-    default:
-      return <Plug className="h-4 w-4" />;
-  }
-}
+type BridgeTransaction = {
+  id: string;
+  account_id?: string;
+  amount?: number;
+  currency_code?: string;
+  currency?: string;
+  clean_description?: string;
+  label?: string;
+  description?: string;
+  date?: string;
+  booking_date?: string;
+  transaction_date?: string;
+};
 
 export default function Connecteurs() {
-  const [connectors, setConnectors] = useState<ConnectorItem[]>(initialConnectors);
+  const [bridgeAccounts, setBridgeAccounts] = useState<BridgeAccount[]>([]);
+  const [bridgeTransactions, setBridgeTransactions] = useState<BridgeTransaction[]>([]);
+  const [selectedBridgeAccountId, setSelectedBridgeAccountId] = useState<string>("");
+  const [bridgeError, setBridgeError] = useState("");
+  const [bridgeLoading, setBridgeLoading] = useState(false);
 
-  const stats = useMemo(() => {
-    return {
-      total: connectors.length,
-      connected: connectors.filter((c) => c.status === "connected").length,
-      disconnected: connectors.filter((c) => c.status === "disconnected").length,
-      error: connectors.filter((c) => c.status === "error").length,
-    };
-  }, [connectors]);
+  const [jupiterApiUrl, setJupiterApiUrl] = useState("");
+  const [jupiterApiKey, setJupiterApiKey] = useState("");
+  const [jupiterConnected, setJupiterConnected] = useState(false);
 
-  const handleConnect = (id: string) => {
-    setConnectors((prev) =>
-      prev.map((connector) =>
-        connector.id === id
-          ? {
-              ...connector,
-              status: "connected",
-              lastSync: new Date().toLocaleString("fr-FR"),
-            }
-          : connector
-      )
-    );
-    toast.success("Connecteur activé avec succès.");
+  const handleConnectBank = async () => {
+    try {
+      setBridgeError("");
+      const callbackUrl = `${window.location.origin}/connecteurs`;
+      const res = await fetch("/api/bridge/connect-session", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          callbackUrl,
+          account_types: "payment",
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data?.url) {
+        const detail =
+          typeof data?.details === "string"
+            ? data.details
+            : data?.details?.message || data?.details?.error || "";
+        setBridgeError(
+          detail
+            ? `${data?.error || "Échec d'initialisation de session d'agrégation"}: ${detail}`
+            : (data?.error || "Échec d'initialisation de session d'agrégation")
+        );
+        return;
+      }
+      window.location.href = data.url;
+    } catch {
+      setBridgeError("Erreur inattendue lors de l'initialisation de session.");
+    }
   };
 
-  const handleSync = (id: string) => {
-    setConnectors((prev) =>
-      prev.map((connector) =>
-        connector.id === id
-          ? {
-              ...connector,
-              status: "syncing",
-            }
-          : connector
-      )
-    );
-
-    setTimeout(() => {
-      setConnectors((prev) =>
-        prev.map((connector) =>
-          connector.id === id
-            ? {
-                ...connector,
-                status: "connected",
-                lastSync: new Date().toLocaleString("fr-FR"),
-              }
-            : connector
-        )
-      );
-      toast.success("Synchronisation terminée.");
-    }, 1200);
+  const loadBridgeAccounts = async () => {
+    try {
+      setBridgeLoading(true);
+      setBridgeError("");
+      const res = await fetch("/api/bridge/accounts", { credentials: "include" });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setBridgeError(data?.error || "Impossible de charger le référentiel de comptes");
+        setBridgeAccounts([]);
+        return;
+      }
+      const loaded = Array.isArray(data?.resources) ? data.resources : [];
+      setBridgeAccounts(loaded);
+      if (loaded[0]) setSelectedBridgeAccountId(String(loaded[0].id));
+    } catch {
+      setBridgeError("Erreur lors du chargement du référentiel de comptes.");
+    } finally {
+      setBridgeLoading(false);
+    }
   };
 
-  const handleConfigure = (name: string) => {
-    toast.info(`Ouverture de la configuration de ${name}.`);
+  const loadBridgeTransactions = async (accountId?: string) => {
+    try {
+      setBridgeLoading(true);
+      setBridgeError("");
+      const target = accountId || selectedBridgeAccountId;
+      if (!target) return;
+      const res = await fetch(`/api/bridge/transactions?account_id=${encodeURIComponent(target)}`, {
+        credentials: "include",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setBridgeError(data?.error || "Impossible d'extraire les écritures bancaires");
+        setBridgeTransactions([]);
+        return;
+      }
+      setBridgeTransactions(Array.isArray(data?.resources) ? data.resources : []);
+    } catch {
+      setBridgeError("Erreur lors de l'extraction des écritures bancaires.");
+    } finally {
+      setBridgeLoading(false);
+    }
+  };
+
+  const handleConnectJupiter = () => {
+    if (!jupiterApiUrl.trim() || !jupiterApiKey.trim()) {
+      toast.error("Renseigne l'URL API et la clé API Jupiter.");
+      return;
+    }
+    // Placeholder ready for real API integration.
+    setJupiterConnected(true);
+    toast.success("Jupiter prêt: configuration enregistrée.");
   };
 
   return (
     <div className="space-y-6">
-      {/* Header */}
-      <div className="flex flex-col gap-2">
-        <h1 className="text-2xl font-bold tracking-tight">Connecteurs</h1>
-        <p className="text-muted-foreground">
-          Gérez les connexions avec vos systèmes externes pour synchroniser
-          automatiquement vos clients, documents, ventes, paiements et autres
-          données métier.
-        </p>
+      <div className="rounded-2xl border border-slate-200 bg-white p-6 shadow-sm">
+        <div className="flex flex-col gap-2">
+          <h1 className="text-2xl font-semibold tracking-tight text-slate-900">Connecteurs</h1>
+          <p className="text-sm text-slate-600">
+            Pilotage centralisé des flux financiers et des intégrations externes.
+          </p>
+        </div>
       </div>
 
-      {/* Summary cards */}
-      <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Card>
-          <CardContent className="p-5">
-            <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-primary/10">
-                <Plug className="h-5 w-5 text-primary" />
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Total connecteurs</p>
-                <p className="text-2xl font-bold">{stats.total}</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-5">
-            <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-success/10">
-                <CheckCircle2 className="h-5 w-5 text-success" />
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Connectés</p>
-                <p className="text-2xl font-bold">{stats.connected}</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-5">
-            <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-muted">
-                <Clock3 className="h-5 w-5 text-muted-foreground" />
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">Non connectés</p>
-                <p className="text-2xl font-bold">{stats.disconnected}</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-
-        <Card>
-          <CardContent className="p-5">
-            <div className="flex items-center gap-3">
-              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-destructive/10">
-                <AlertCircle className="h-5 w-5 text-destructive" />
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground">En erreur</p>
-                <p className="text-2xl font-bold">{stats.error}</p>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
-      </div>
-
-      {/* Connector cards */}
-      <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-3">
-        {connectors.map((connector) => (
-          <Card key={connector.id} className="h-full">
-            <CardHeader className="pb-3">
-              <div className="flex items-start justify-between gap-3">
-                <div>
-                  <CardTitle className="text-base">{connector.name}</CardTitle>
-                  <p className="mt-1 text-sm text-muted-foreground">
-                    {connector.type}
-                  </p>
-                </div>
-
-                <div
-                  className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium ${getStatusBadgeClass(
-                    connector.status
-                  )}`}
-                >
-                  {getStatusIcon(connector.status)}
-                  {getStatusLabel(connector.status)}
-                </div>
-              </div>
-            </CardHeader>
-
-            <CardContent className="space-y-4">
-              <p className="text-sm text-muted-foreground">
-                {connector.description}
-              </p>
-
-              <div className="space-y-2 rounded-lg border bg-muted/20 p-3">
-                <div className="flex items-center gap-2 text-sm">
-                  <Database className="h-4 w-4 text-muted-foreground" />
-                  <span className="font-medium">Données synchronisées</span>
-                </div>
-                <div className="flex flex-wrap gap-2">
-                  {connector.syncedData.map((item) => (
-                    <span
-                      key={item}
-                      className="rounded-md bg-background px-2 py-1 text-xs text-muted-foreground border"
-                    >
-                      {item}
-                    </span>
-                  ))}
-                </div>
-              </div>
-
-              <div className="rounded-lg border bg-muted/20 p-3 text-sm">
-                <div className="flex items-center gap-2 mb-1">
-                  <Link2 className="h-4 w-4 text-muted-foreground" />
-                  <span className="font-medium">Dernière synchronisation</span>
-                </div>
-                <p className="text-muted-foreground">
-                  {connector.lastSync ?? "Jamais synchronisé"}
-                </p>
-              </div>
-
-              <div className="flex flex-wrap gap-2 pt-1">
-                {connector.status === "disconnected" ? (
-                  <Button size="sm" onClick={() => handleConnect(connector.id)}>
-                    Connecter
-                  </Button>
-                ) : (
-                  <Button
-                    size="sm"
-                    variant="outline"
-                    onClick={() => handleSync(connector.id)}
-                  >
-                    <RefreshCcw className="mr-1.5 h-4 w-4" />
-                    Synchroniser
-                  </Button>
-                )}
-
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => handleConfigure(connector.name)}
-                >
-                  <Settings className="mr-1.5 h-4 w-4" />
-                  Configurer
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        ))}
-      </div>
-
-      {/* Why useful */}
-      <Card>
+      <Card className="border-slate-200 shadow-sm">
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">Utilité du module</CardTitle>
+          <CardTitle className="text-base">Pipeline d'Agrégation Financière</CardTitle>
         </CardHeader>
-        <CardContent>
-          <div className="grid gap-4 md:grid-cols-3">
-            <div className="rounded-lg border p-4">
-              <div className="mb-2 flex items-center gap-2">
-                <Plug className="h-4 w-4 text-primary" />
-                <p className="font-medium">Connexion aux outils externes</p>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                Relie l’application à des systèmes comme un CRM, une plateforme
-                métier ou une banque.
-              </p>
-            </div>
-
-            <div className="rounded-lg border p-4">
-              <div className="mb-2 flex items-center gap-2">
-                <RefreshCcw className="h-4 w-4 text-primary" />
-                <p className="font-medium">Synchronisation automatique</p>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                Évite les imports manuels répétés et garde les données à jour.
-              </p>
-            </div>
-
-            <div className="rounded-lg border p-4">
-              <div className="mb-2 flex items-center gap-2">
-                <ShieldCheck className="h-4 w-4 text-primary" />
-                <p className="font-medium">Fiabilité des données</p>
-              </div>
-              <p className="text-sm text-muted-foreground">
-                Réduit les doublons, les erreurs de ressaisie et améliore la
-                cohérence comptable.
-              </p>
-            </div>
+        <CardContent className="space-y-4">
+          {bridgeError ? (
+            <p className="rounded-md border border-destructive/20 bg-destructive/10 px-3 py-2 text-sm text-destructive">{bridgeError}</p>
+          ) : null}
+          <div className="grid gap-2 md:grid-cols-3">
+            <Button onClick={handleConnectBank}>Initialiser la session</Button>
+            <Button variant="outline" onClick={loadBridgeAccounts} disabled={bridgeLoading}>
+              Charger les comptes
+            </Button>
+            <Button
+              variant="outline"
+              onClick={() => loadBridgeTransactions()}
+              disabled={bridgeLoading || !selectedBridgeAccountId}
+            >
+              Charger les transactions
+            </Button>
           </div>
+          {bridgeAccounts.length > 0 ? (
+            <div className="flex flex-wrap gap-2 rounded-xl border border-slate-200 bg-slate-50 p-3">
+              {bridgeAccounts.map((acc) => (
+                <Button
+                  key={String(acc.id)}
+                  size="sm"
+                  variant={selectedBridgeAccountId === String(acc.id) ? "default" : "outline"}
+                  onClick={() => {
+                    const id = String(acc.id);
+                    setSelectedBridgeAccountId(id);
+                    void loadBridgeTransactions(id);
+                  }}
+                >{acc.display_name || acc.name || acc.iban || id}</Button>
+              ))}
+            </div>
+          ) : null}
+          {bridgeTransactions.length > 0 ? (
+            <div className="rounded-xl border border-slate-200">
+              <Table>
+                <TableHeader>
+                  <TableRow className="bg-slate-50">
+                    <TableHead>Date</TableHead>
+                    <TableHead>Libellé</TableHead>
+                    <TableHead className="text-right">Montant</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {bridgeTransactions.slice(0, 20).map((tx) => (
+                    <TableRow key={tx.id}>
+                      <TableCell>{tx.date || tx.booking_date || tx.transaction_date || "—"}</TableCell>
+                      <TableCell>{tx.clean_description || tx.label || tx.description || tx.id}</TableCell>
+                      <TableCell className="text-right">
+                        {tx.amount ?? "—"} {tx.currency_code || tx.currency || "EUR"}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          ) : null}
         </CardContent>
       </Card>
 
-      {/* Sync history */}
       <Card>
         <CardHeader className="pb-3">
-          <CardTitle className="text-base">
-            Historique des synchronisations
-          </CardTitle>
+          <CardTitle className="text-base">Connecteur Jupiter</CardTitle>
         </CardHeader>
-        <CardContent className="p-0">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Connecteur</TableHead>
-                <TableHead>Date</TableHead>
-                <TableHead>Résultat</TableHead>
-                <TableHead>Détail</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {syncHistory.map((item) => (
-                <TableRow key={item.id}>
-                  <TableCell className="font-medium">{item.connector}</TableCell>
-                  <TableCell>{item.date}</TableCell>
-                  <TableCell>
-                    <Badge
-                      variant="outline"
-                      className={
-                        item.result === "Succès"
-                          ? "border-success/20 bg-success/10 text-success"
-                          : "border-destructive/20 bg-destructive/10 text-destructive"
-                      }
-                    >
-                      {item.result}
-                    </Badge>
-                  </TableCell>
-                  <TableCell>{item.detail}</TableCell>
-                </TableRow>
-              ))}
-            </TableBody>
-          </Table>
+        <CardContent className="space-y-3">
+          <p className="text-sm text-muted-foreground">
+            Module prêt pour liaison API (endpoint + secret) et synchronisation pilotée.
+          </p>
+          <div className="grid gap-3 md:grid-cols-2">
+            <Input
+              value={jupiterApiUrl}
+              onChange={(e) => setJupiterApiUrl(e.target.value)}
+              placeholder="Endpoint API"
+            />
+            <Input
+              value={jupiterApiKey}
+              onChange={(e) => setJupiterApiKey(e.target.value)}
+              placeholder="Secret API"
+              type="password"
+            />
+          </div>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button onClick={handleConnectJupiter}>
+              <Landmark className="mr-1.5 h-4 w-4" />
+              Valider la configuration
+            </Button>
+            <Button variant="outline" disabled>
+              <RefreshCcw className="mr-1.5 h-4 w-4" />
+              Exécuter la synchronisation (à implémenter)
+            </Button>
+            <span className="text-xs text-muted-foreground inline-flex items-center gap-1">
+              <Link2 className="h-3.5 w-3.5" />
+              {jupiterConnected ? "Statut : configuré" : "Statut : en attente"}
+            </span>
+          </div>
         </CardContent>
       </Card>
     </div>

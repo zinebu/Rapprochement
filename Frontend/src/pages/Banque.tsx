@@ -1,5 +1,5 @@
 import {
-  useEffect, useMemo, useRef, useState, Card,
+  useEffect, useMemo, useState, Card,
   CardContent,
   CardHeader, CardTitle, Table,
   TableBody,
@@ -16,7 +16,6 @@ import {
   DialogTitle,
   ScrollArea,
   StatusBadge,
-  Landmark,
   Wallet,
   ChevronDown,
   ChevronUp,
@@ -26,7 +25,6 @@ import {
   Link2,
   MoreHorizontal,
   Building2,
-  Receipt,
   Check,
   Undo2,
   ArrowRight,
@@ -40,20 +38,17 @@ import {
   toast,
 } from "./imports";
 
-import { CurrencySummary, MetricCard, SectionCard } from "@/features/banque/components";
+import { MetricCard, SectionCard } from "@/features/banque/components";
 import {
   initialTransactions,
-  localAccounts,
   localInvoices,
   sepaBatchesByReference as defaultSepaBatchesByReference,
   unreconciledCategoryLabels
 } from "@/features/banque/data";
 
 import type {
-  BankViewMode,
   CurrencyCode,
   InvoiceFilter,
-  LocalBankAccount,
   LocalInvoice,
   LocalTransaction,
   OperationType,
@@ -69,12 +64,9 @@ import type {
 import {
   amountMatchesRange,
   buildCandidateReasons,
-  computeMatchScore,
   formatCompactAmount,
   formatDisplayDate,
   formatMoney,
-  formatOperationLabel,
-  getAccountById,
   getAvailableInvoicesForSepaOperation,
   getAvailableInvoicesForTxn,
   getCurrencyBadgeClass,
@@ -86,46 +78,8 @@ import {
   getSepaDecisionAmount,
   getTxnInvoiceIds,
   isPayrollCharge,
-  isSepaBatchTransaction,
   normalizeText,
 } from "@/features/banque/utils";
-
-type BridgeAccount = {
-  id: string;
-  name?: string;
-  display_name?: string;
-  iban?: string;
-  balance?: number;
-  currency_code?: string;
-  currency?: string;
-  data_access?: string;
-};
-
-type BridgeTransaction = {
-  id: string;
-  account_id?: string;
-  amount?: number;
-  currency_code?: string;
-  currency?: string;
-  clean_description?: string;
-  label?: string;
-  description?: string;
-  date?: string;
-  booking_date?: string;
-  transaction_date?: string;
-  updated_at?: string;
-  category?: string | number;
-  category_id?: number;
-};
-
-type BridgeCategory = {
-  id: number;
-  name?: string;
-  categories?: {
-    id: number;
-    name?: string;
-  }[];
-};
 
 type ImportedBankOperation = {
   id?: string;
@@ -138,12 +92,24 @@ type ImportedBankOperation = {
   operationType?: OperationType;
   paymentMethod?: PaymentMethod;
   counterpartyName?: string | null;
+  bankMeta?: {
+    debtor?: string | null;
+    beneficiary?: string | null;
+    ultimateCreditor?: string | null;
+    mandate?: string | null;
+    orgId?: string | null;
+    reference?: string | null;
+    remittanceRef?: string | null;
+    info?: string | null;
+  };
   source?: string;
 };
 
 type ImportedDocumentDto = {
   _id?: string;
   id?: string;
+  originalName?: string;
+  createdAt?: string;
   documentType?: string;
   structuredData?: {
     documentType?: string;
@@ -159,26 +125,14 @@ type ImportedDocumentDto = {
 };
 
 export default function Banque() {
-  const [accounts] = useState<LocalBankAccount[]>(localAccounts);
   const [transactions, setTransactions] = useState<LocalTransaction[]>(initialTransactions);
+  const [realInvoices, setRealInvoices] = useState<LocalInvoice[]>([]);
   const [sepaBatchesByReference, setSepaBatchesByReference] = useState<Record<string, SepaBatchTemplate>>(
     defaultSepaBatchesByReference
   );
-
-  const [bridgeCategories, setBridgeCategories] = useState<BridgeCategory[]>([]);
-  const [bridgeLoadingCategories, setBridgeLoadingCategories] = useState(false);
-
-  const [bridgeAccounts, setBridgeAccounts] = useState<BridgeAccount[]>([]);
-  const [bridgeTransactions, setBridgeTransactions] = useState<BridgeTransaction[]>([]);
-  const [bridgeLoadingAccounts, setBridgeLoadingAccounts] = useState(false);
-  const [bridgeLoadingTransactions, setBridgeLoadingTransactions] = useState(false);
-  const [bridgeError, setBridgeError] = useState<string>("");
-
-  const [selectedBridgeAccountId, setSelectedBridgeAccountId] = useState<string>("");
-  const [currentBridgeItemId, setCurrentBridgeItemId] = useState<string>("");
-
-  const [selectedAccount, setSelectedAccount] = useState<string>("ba-eur");
-  const [accountViewMode, setAccountViewMode] = useState<BankViewMode>("merged");
+  const [recentStatementImports, setRecentStatementImports] = useState<
+    Array<{ id: string; originalName: string; createdAt?: string }>
+  >([]);
 
   const [searchText, setSearchText] = useState("");
   const [statusFilter, setStatusFilter] = useState<ReconciliationFilter>("all");
@@ -186,7 +140,6 @@ export default function Banque() {
   const [operationTypeFilter, setOperationTypeFilter] = useState<"" | OperationType>("");
   const [paymentMethodFilter, setPaymentMethodFilter] = useState<"" | PaymentMethod>("");
   const [invoiceFilter, setInvoiceFilter] = useState<InvoiceFilter>("all");
-  const [accountFilter, setAccountFilter] = useState<string>("all");
   const [counterpartyFilter, setCounterpartyFilter] = useState("");
   const [dateFrom, setDateFrom] = useState("");
   const [dateTo, setDateTo] = useState("");
@@ -198,6 +151,7 @@ export default function Banque() {
 
   const [detailsSepaReference, setDetailsSepaReference] = useState<string | null>(null);
   const [detailsTxnId, setDetailsTxnId] = useState<string | null>(null);
+  const [detailsDialogOpen, setDetailsDialogOpen] = useState(false);
   const [previewPdfUrl, setPreviewPdfUrl] = useState<string | null>(null);
   const [previewPdfTitle, setPreviewPdfTitle] = useState("");
 
@@ -208,58 +162,110 @@ export default function Banque() {
   const [manualRejectAllSuggestions, setManualRejectAllSuggestions] = useState(false);
 
   const [sepaLineDecisions, setSepaLineDecisions] = useState<Record<string, SepaOperationDecision>>({});
+  const [sepaEditModeByOperation, setSepaEditModeByOperation] = useState<Record<string, boolean>>({});
   const [sepaCurrentOperationIndex, setSepaCurrentOperationIndex] = useState(0);
+  const [linkedSepaPopupRef, setLinkedSepaPopupRef] = useState<string | null>(null);
+  const [backendRecoPersistenceUnavailable, setBackendRecoPersistenceUnavailable] = useState(false);
 
-  const detailSectionRef = useRef<HTMLDivElement | null>(null);
-
-  const getBridgeAccountName = (account: BridgeAccount) =>
-    account.display_name || account.name || "Compte Bridge";
-
-  const getBridgeTransactionLabel = (tx: BridgeTransaction) =>
-    tx.clean_description || tx.label || tx.description || "Opération Bridge";
-
-  const getBridgeTransactionDate = (tx: BridgeTransaction) =>
-    tx.date || tx.transaction_date || tx.booking_date || tx.updated_at || "";
-
-  const getBridgeTransactionCurrency = (tx: BridgeTransaction) =>
-    tx.currency_code || tx.currency || "EUR";
-
-  const resolveBankAccountId = (
-    scannedIban: string | undefined,
-    scannedCurrency: string | undefined
-  ) => {
-    if (scannedIban) {
-      const byIban = accounts.find((a) => a.iban.replace(/\s/g, "") === scannedIban.replace(/\s/g, ""));
-      if (byIban) return byIban.id;
+  const RECONCILIATION_CACHE_KEY = "banque_reconciliation_cache_v1";
+  const readLocalReconciliationCache = (): Record<string, any> => {
+    try {
+      const raw = window.localStorage.getItem(RECONCILIATION_CACHE_KEY);
+      if (!raw) return {};
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch {
+      return {};
     }
-    if (scannedCurrency) {
-      const byCurrency = accounts.find((a) => a.currency === scannedCurrency);
-      if (byCurrency) return byCurrency.id;
+  };
+  const writeLocalReconciliationCache = (next: Record<string, any>) => {
+    try {
+      window.localStorage.setItem(RECONCILIATION_CACHE_KEY, JSON.stringify(next));
+    } catch {
+      // no-op
     }
-    return "ba-eur";
+  };
+  const makeRecoCacheKey = (sourceDocumentId: string, operationId: string) =>
+    `${sourceDocumentId}::${operationId}`;
+
+  const normalizeSepaRef = (value: string) =>
+    String(value || "")
+      .toUpperCase()
+      .replace(/[\s\-_./]+/g, "");
+
+  const findSepaBatchByReference = (reference?: string) => {
+    if (!reference) return null;
+    const wanted = normalizeSepaRef(reference);
+    for (const [key, batch] of Object.entries(sepaBatchesByReference)) {
+      if (normalizeSepaRef(key) === wanted || normalizeSepaRef(batch?.id || "") === wanted) {
+        return batch;
+      }
+    }
+    return null;
   };
 
-  const [autoload, setAutoload] = useState(true); // Ajouter un flag pour éviter le rechargement automatique après suppression
+  const ownCompanyAliases = [
+    "consult-it",
+    "consult it",
+    "consult it sas",
+  ];
+
+  const isOwnCompanyName = (name?: string | null) => {
+    const n = normalizeText(name || "");
+    return ownCompanyAliases.some((alias) => n.includes(alias));
+  };
+
+  const getCounterpartyDisplay = (txn: LocalTransaction) => {
+    const meta = txn.bankMeta;
+    const beneficiary =
+      meta?.beneficiary && !isOwnCompanyName(meta.beneficiary)
+        ? meta.beneficiary
+        : null;
+    const debtor =
+      meta?.debtor && !isOwnCompanyName(meta.debtor) ? meta.debtor : null;
+    const ultimate =
+      meta?.ultimateCreditor && !isOwnCompanyName(meta.ultimateCreditor)
+        ? meta.ultimateCreditor
+        : null;
+
+    if (txn.operationType === "decaissement") {
+      const value = beneficiary || ultimate || debtor || txn.counterpartyName || null;
+      return value ? { role: "Bénéficiaire", value } : null;
+    }
+
+    const value = debtor || ultimate || beneficiary || txn.counterpartyName || null;
+    return value ? { role: "Débiteur", value } : null;
+  };
+
+  const resolveBankAccountId = (
+    _scannedIban: string | undefined,
+    _scannedCurrency: string | undefined
+  ) => {
+    return "ba-import";
+  };
 
   useEffect(() => {
-    if (autoload) {
-      const loadScannedBankOperations = async () => {
-        try {
-          const res = await fetch("/api/imports", {
-            credentials: "include",
-          });
+    const loadScannedBankOperations = async () => {
+      try {
+        const res = await fetch("/api/imports", {
+          credentials: "include",
+        });
 
-          const payload = await res.json();
-          if (!res.ok) return;
+        const payload = await res.json();
+        if (!res.ok) return;
 
-          const importedDocs: ImportedDocumentDto[] = Array.isArray(payload?.documents) ? payload.documents : [];
-          const scannedTransactions: LocalTransaction[] = [];
-          const scannedSepaBatches: Record<string, SepaBatchTemplate> = {};
+        const importedDocs: ImportedDocumentDto[] = Array.isArray(payload?.documents) ? payload.documents : [];
+        const scannedTransactions: LocalTransaction[] = [];
+        const scannedSepaBatches: Record<string, SepaBatchTemplate> = {};
 
-          importedDocs.forEach((doc) => {
-            const docId = doc.id || doc._id || "";
-            const structured = doc.structuredData;
-            const docType = structured?.documentType || doc.documentType;
+        importedDocs.forEach((doc) => {
+          const docId = doc.id || doc._id || "";
+          const structured = doc.structuredData;
+          const docType = structured?.documentType || doc.documentType;
+          const persistedOps = structured?.reconciliation?.operations || {};
+          const localCache = readLocalReconciliationCache();
+
+          if (docType === "bank_statement" && Array.isArray(structured?.operations)) {
             const accountIban = structured?.account?.iban;
             const accountCurrency = structured?.account?.currency || "EUR";
             const bankAccountId = resolveBankAccountId(accountIban, accountCurrency);
@@ -267,23 +273,29 @@ export default function Banque() {
 
             structured.operations.forEach((op, index) => {
               if (!op?.txnDate || typeof op.amount !== "number") return;
+              const opId = op.id || `${docId}-op-${index + 1}`;
+              const localPersisted = localCache[makeRecoCacheKey(docId, opId)] || {};
+              const persisted = { ...(persistedOps[opId] || {}), ...localPersisted };
               scannedTransactions.push({
-                id: op.id || `${docId}-op-${index + 1}`,
+                id: opId,
                 sourceDocumentId: docId,
                 bankAccountId,
                 txnDate: op.txnDate,
                 label: op.label || "Opération scannée",
-                rawLabel: (op as any).rawLabel,
                 reference: op.reference || `${docId}-${index + 1}`,
                 amount: op.amount,
                 balance: fallbackBalance,
-                reconciledStatus: "non_rapproché",
+                reconciledStatus: persisted.reconciledStatus || "non_rapproché",
                 currency: (op.currency || accountCurrency || "EUR") as CurrencyCode,
                 operationType: op.operationType || (op.amount >= 0 ? "encaissement" : "decaissement"),
                 paymentMethod: op.paymentMethod || "AUTRE",
-                matchedInvoiceIds: [],
-                counterpartyName: op.counterpartyName || "Contrepartie scannée",
-                unreconciledComment: "Opération scannée depuis relevé bancaire",
+                matchedInvoiceIds: Array.isArray(persisted.matchedInvoiceIds) ? persisted.matchedInvoiceIds : [],
+                pendingInvoiceIds: Array.isArray(persisted.pendingInvoiceIds) ? persisted.pendingInvoiceIds : [],
+                counterpartyName: op.counterpartyName || undefined,
+                bankMeta: op.bankMeta,
+                unreconciledComment: persisted.unreconciledComment || "Opération scannée depuis relevé bancaire",
+                unreconciledCategory: persisted.unreconciledCategory,
+                reviewFlag: Boolean(persisted.reviewFlag),
               });
             });
 
@@ -314,263 +326,185 @@ export default function Banque() {
 
           if (docType === "sepa_xml" && structured?.sepaBatch) {
             const batch = structured.sepaBatch;
-            scannedSepaBatches[batch.id] = batch;
-            const sum = structured?.summarizedOperation;
-            if (sum?.txnDate && typeof sum.amount === "number") {
-              const bankAccountId = resolveBankAccountId(batch.debtorIban, batch.debtorCurrency);
-              scannedTransactions.push({
-                id: sum.id || `${docId}-sepa`,
-                sourceDocumentId: docId,
-                bankAccountId,
-                txnDate: sum.txnDate,
-                label: sum.label || `SEPA ${batch.id}`,
-                reference: sum.reference || batch.id,
-                amount: sum.amount,
-                balance: 0,
-                reconciledStatus: "non_rapproché",
-                currency: (sum.currency || batch.debtorCurrency || "EUR") as CurrencyCode,
-                operationType: "decaissement",
-                paymentMethod: "SEPA",
-                matchedInvoiceIds: [],
-                counterpartyName: sum.counterpartyName || batch.debtorName || "SEPA scanné",
-                unreconciledComment: "Opération SEPA scannée depuis import XML",
-              });
-            }
+            const seenIds = new Set<string>();
+            const normalizedOperations = (batch.operations || []).map((op, index) => {
+              const baseId = String(op?.id || op?.endToEndId || `sepa-op-${index + 1}`);
+              let uniqueId = baseId;
+              if (seenIds.has(uniqueId)) {
+                uniqueId = `${baseId}-${index + 1}`;
+              }
+              seenIds.add(uniqueId);
+              return {
+                ...op,
+                id: uniqueId,
+              };
+            });
+            scannedSepaBatches[batch.id] = {
+              ...batch,
+              operations: normalizedOperations,
+              sourceDocumentId: docId,
+            };
           }
         });
 
-          if (Object.keys(scannedSepaBatches).length > 0) {
-            setSepaBatchesByReference((prev) => ({ ...prev, ...scannedSepaBatches }));
-          }
+        setRecentStatementImports(
+          importedDocs
+            .filter((doc) => {
+              const structured = doc.structuredData;
+              const docType = structured?.documentType || doc.documentType;
+              return docType === "bank_statement";
+            })
+            .map((doc) => ({
+              id: doc.id || doc._id || "",
+              originalName: doc.originalName || "Relevé importé",
+              createdAt: doc.createdAt,
+            }))
+            .filter((x) => x.id)
+        );
 
-          if (scannedTransactions.length > 0) {
-            setTransactions(scannedTransactions);
-          }
-        } catch (error) {
-          console.error("Erreur chargement opérations scannées:", error);
+        if (Object.keys(scannedSepaBatches).length > 0) {
+          setSepaBatchesByReference((prev) => ({ ...prev, ...scannedSepaBatches }));
         }
-      };
 
-      void loadScannedBankOperations();
-    }
-  }, [accounts]);
+        // Load Bridge transactions from Connecteurs sync and merge them into Banque operations.
+        try {
+          const bridgeAccountsRes = await fetch("/api/bridge/accounts", {
+            credentials: "include",
+          });
+          const bridgeAccountsData = await bridgeAccountsRes.json().catch(() => ({}));
+          const bridgeAccounts = Array.isArray(bridgeAccountsData?.resources)
+            ? bridgeAccountsData.resources
+            : [];
 
-  const getBridgeCategoryLabel = (tx: BridgeTransaction) => {
-    const categoryId =
-      tx.category_id ??
-      (typeof tx.category === "number" ? tx.category : null);
+          const bridgeTransactions: LocalTransaction[] = [];
 
-    if (!categoryId) return "—";
+          for (const account of bridgeAccounts) {
+            const accountId = String(account?.id || "");
+            if (!accountId) continue;
+            const bridgeAccountLabel = String(
+              account?.display_name || account?.name || account?.iban || `Compte ${accountId}`
+            );
+            const txRes = await fetch(
+              `/api/bridge/transactions?account_id=${encodeURIComponent(accountId)}`,
+              { credentials: "include" }
+            );
+            const txData = await txRes.json().catch(() => ({}));
+            const resources = Array.isArray(txData?.resources) ? txData.resources : [];
+            resources.forEach((tx: any, index: number) => {
+              const amount = Number(tx?.amount || 0);
+              const txnDate = String(
+                tx?.date || tx?.transaction_date || tx?.booking_date || new Date().toISOString().slice(0, 10)
+              );
+              const id = `bridge-${accountId}-${String(tx?.id || index + 1)}`;
+              bridgeTransactions.push({
+                id,
+                sourceDocumentId: `bridge-${accountId}`,
+                bankAccountId: "ba-import",
+                txnDate,
+                label: tx?.clean_description || tx?.label || tx?.description || "Opération Bridge",
+                reference: String(tx?.id || id),
+                amount,
+                balance: 0,
+                reconciledStatus: "non_rapproché",
+                currency: (tx?.currency_code || tx?.currency || "EUR") as CurrencyCode,
+                operationType: amount >= 0 ? "encaissement" : "decaissement",
+                paymentMethod: "AUTRE",
+                matchedInvoiceIds: [],
+                bankMeta: {
+                  libelle: bridgeAccountLabel,
+                },
+              });
+            });
+          }
 
-    for (const parent of bridgeCategories) {
-      const child = parent.categories?.find(
-        (sub) => Number(sub.id) === Number(categoryId)
-      );
+          if (bridgeTransactions.length > 0) {
+            const existingIds = new Set(scannedTransactions.map((t) => t.id));
+            bridgeTransactions.forEach((tx) => {
+              if (!existingIds.has(tx.id)) scannedTransactions.push(tx);
+            });
+          }
+        } catch (bridgeError) {
+          console.warn("Chargement Bridge ignoré dans Banque:", bridgeError);
+        }
 
-      if (child) {
-        return parent.name
-          ? `${parent.name} / ${child.name || `#${categoryId}`}`
-          : child.name || `Catégorie #${categoryId}`;
+        if (scannedTransactions.length > 0) {
+          setTransactions(scannedTransactions);
+        }
+      } catch (error) {
+        console.error("Erreur chargement opérations scannées:", error);
       }
+    };
 
-      if (Number(parent.id) === Number(categoryId)) {
-        return parent.name || `Catégorie #${categoryId}`;
-      }
-    }
-
-    return `Catégorie #${categoryId}`;
-  };
-
-  const handleConnectBank = async () => {
-    try {
-      setBridgeError("");
-
-      const callbackUrl = `${window.location.origin}/bridge/callback`;
-
-      const res = await fetch("/api/bridge/connect-session", {
-        method: "POST",
-        credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          userId: "user-123",
-          email: "test@gmail.com",
-          callbackUrl,
-        }),
-      });
-
-      const data = await res.json();
-      console.log("Bridge response:", data);
-
-      if (!res.ok) {
-        setBridgeError(data?.error || "Erreur lors de la création de la session Bridge.");
-        return;
-      }
-
-      if (data.url) {
-        window.location.href = data.url;
-      } else {
-        setBridgeError("Pas d'URL retournée par le backend.");
-      }
-    } catch (error) {
-      console.error("Erreur frontend:", error);
-      setBridgeError("Erreur inattendue côté frontend.");
-    }
-  };
-
-  const loadBridgeCategories = async () => {
-    try {
-      setBridgeLoadingCategories(true);
-      setBridgeError("");
-
-      const res = await fetch("/api/bridge/categories", {
-        credentials: "include",
-      });
-      const data = await res.json();
-      console.log("categories =", data);
-
-      if (!res.ok) {
-        setBridgeError(data?.error || "Impossible de charger les catégories Bridge.");
-        setBridgeCategories([]);
-        return;
-      }
-
-      setBridgeCategories(
-        Array.isArray(data?.resources)
-          ? data.resources
-          : Array.isArray(data?.categories)
-          ? data.categories
-          : []
-      );
-    } catch (error) {
-      console.error("Erreur chargement catégories:", error);
-      setBridgeError("Erreur lors du chargement des catégories Bridge.");
-    } finally {
-      setBridgeLoadingCategories(false);
-    }
-  };
-
-  const loadBridgeAccounts = async (itemId?: string) => {
-    try {
-      setBridgeLoadingAccounts(true);
-      setBridgeError("");
-
-      const effectiveItemId = itemId || currentBridgeItemId;
-
-      const url = new URL("/api/bridge/accounts");
-
-      if (effectiveItemId) {
-        url.searchParams.set("item_id", effectiveItemId);
-      }
-
-      url.searchParams.set("only_enabled", "true");
-
-      console.log("Frontend accounts URL =", url.toString());
-
-      const res = await fetch(url.toString(), {
-        credentials: "include",
-      });
-      const data = await res.json();
-
-      if (!res.ok) {
-        setBridgeError(data?.error || "Impossible de charger les comptes Bridge.");
-        return;
-      }
-
-      const loadedAccounts = Array.isArray(data?.resources)
-        ? data.resources.map((acc: any) => ({
-            ...acc,
-            id: String(acc.id),
-          }))
-        : [];
-
-      setBridgeAccounts(loadedAccounts);
-
-      if (loadedAccounts.length > 0) {
-        setSelectedBridgeAccountId(String(loadedAccounts[0].id));
-      } else {
-        setSelectedBridgeAccountId("");
-      }
-    } catch (error) {
-      console.error("Erreur chargement comptes Bridge:", error);
-      setBridgeError("Erreur lors du chargement des comptes Bridge.");
-    } finally {
-      setBridgeLoadingAccounts(false);
-    }
-  };
-
-  const loadBridgeTransactions = async (accountId?: string) => {
-    try {
-      setBridgeLoadingTransactions(true);
-      setBridgeError("");
-
-      const effectiveAccountId = accountId || selectedBridgeAccountId;
-      const url = effectiveAccountId
-        ? `/api/bridge/transactions?account_id=${encodeURIComponent(effectiveAccountId)}`
-        : "/api/bridge/transactions";
-
-      const res = await fetch(url, {
-        credentials: "include",
-      });
-      const data = await res.json();
-      console.log("transactions =", data);
-
-      if (!res.ok) {
-        setBridgeError(data?.error || "Impossible de charger les opérations Bridge.");
-        setBridgeTransactions([]);
-        return;
-      }
-
-      const txs = Array.isArray(data?.resources || data?.transactions)
-        ? (data?.resources || data?.transactions).map((tx: any) => ({
-            ...tx,
-            id: String(tx.id),
-            account_id: tx.account_id != null ? String(tx.account_id) : undefined,
-          }))
-        : [];
-
-      setBridgeTransactions(txs);
-    } catch (error) {
-      console.error("Erreur chargement opérations scannées:", error);
-      setBridgeError("Erreur lors du chargement des opérations Bridge.");
-    } finally {
-      setBridgeLoadingTransactions(false);
-    }
-  };
-
-  useEffect(() => {
-    const params = new URLSearchParams(window.location.search);
-    const itemId = params.get("item_id") || "";
-
-    console.log("Banque page item_id =", itemId);
-
-    setCurrentBridgeItemId(itemId);
-
-    if (itemId) {
-      void loadBridgeAccounts(itemId);
-    }
-
-    void loadBridgeCategories();
+    void loadScannedBankOperations();
   }, []);
 
-  const visibleAccounts = useMemo(() => {
-    if (accountViewMode === "merged") return accounts;
-    return accounts.filter((a) => a.currency === accountViewMode);
-  }, [accounts, accountViewMode]);
+  useEffect(() => {
+    const loadRealInvoices = async () => {
+      try {
+        const res = await fetch("/api/invoices", { credentials: "include" });
+        const data = await res.json();
+        if (!res.ok) return;
+        const fetched: LocalInvoice[] = Array.isArray(data?.invoices) ? data.invoices : [];
+        setRealInvoices(fetched);
+        localInvoices.splice(0, localInvoices.length, ...fetched);
+      } catch (error) {
+        console.error("Erreur chargement factures réelles:", error);
+      }
+    };
+    void loadRealInvoices();
+  }, []);
 
-  const selectedAccountData = accounts.find((a) => a.id === selectedAccount) ?? null;
-  const visibleAccountIds = visibleAccounts.map((a) => a.id);
+  const deleteStatementImport = async (importId: string) => {
+    try {
+      const response = await fetch(`/api/imports/${encodeURIComponent(importId)}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok && response.status !== 404) {
+        throw new Error(payload?.error || "Suppression impossible");
+      }
+      setRecentStatementImports((prev) => prev.filter((x) => x.id !== importId));
+      setTransactions((prev) => prev.filter((t) => t.sourceDocumentId !== importId));
+      toast?.success?.("Relevé supprimé.");
+    } catch (error) {
+      console.error("Suppression relevé impossible:", error);
+      toast?.error?.("Impossible de supprimer ce relevé.");
+    }
+  };
 
-  const selectedBridgeAccount =
-    bridgeAccounts.find((acc) => String(acc.id) === String(selectedBridgeAccountId)) ?? null;
+  const deleteSepaImportFromPopup = async () => {
+    const sourceDocumentId = linkedSepaPopupBatch?.sourceDocumentId;
+    if (!sourceDocumentId) return;
+    try {
+      const response = await fetch(`/api/imports/${encodeURIComponent(sourceDocumentId)}`, {
+        method: "DELETE",
+        credentials: "include",
+      });
+      const payload = await response.json().catch(() => ({}));
+      if (!response.ok && response.status !== 404) {
+        throw new Error(payload?.error || "Suppression impossible");
+      }
+      setSepaBatchesByReference((prev) => {
+        const next = { ...prev };
+        Object.entries(next).forEach(([key, batch]) => {
+          if (batch?.sourceDocumentId === sourceDocumentId) {
+            delete next[key];
+          }
+        });
+        return next;
+      });
+      setLinkedSepaPopupRef(null);
+      toast?.success?.("SEPA supprimée.");
+    } catch (error) {
+      console.error("Suppression SEPA impossible:", error);
+      toast?.error?.("Impossible de supprimer cette SEPA.");
+    }
+  };
 
   const baseTransactions = useMemo(() => {
-    if (accountViewMode === "merged") {
-      return transactions.filter((t) => visibleAccountIds.includes(t.bankAccountId));
-    }
-    return transactions.filter((t) => t.bankAccountId === selectedAccount);
-  }, [transactions, accountViewMode, visibleAccountIds, selectedAccount]);
+    return transactions;
+  }, [transactions]);
 
   const selectedDetailsTxn = useMemo(() => {
     if (!detailsTxnId) return null;
@@ -579,8 +513,32 @@ export default function Banque() {
 
   const selectedSepaBatch = useMemo(() => {
     if (!detailsSepaReference) return null;
-    return sepaBatchesByReference[detailsSepaReference] ?? null;
-  }, [detailsSepaReference]);
+    return findSepaBatchByReference(detailsSepaReference);
+  }, [detailsSepaReference, sepaBatchesByReference]);
+
+  const selectedTxnIsSepa = useMemo(() => {
+    if (!selectedDetailsTxn) return false;
+    return Boolean(findSepaBatchByReference(selectedDetailsTxn.reference));
+  }, [selectedDetailsTxn, sepaBatchesByReference]);
+
+  const linkedSepaPopupBatch = useMemo(() => {
+    if (!linkedSepaPopupRef) return null;
+    return findSepaBatchByReference(linkedSepaPopupRef);
+  }, [linkedSepaPopupRef, sepaBatchesByReference]);
+
+  const linkedSepaPopupTotal = useMemo(() => {
+    if (!linkedSepaPopupBatch) return null;
+    if (
+      typeof linkedSepaPopupBatch.totalAmount === "number" &&
+      !Number.isNaN(linkedSepaPopupBatch.totalAmount)
+    ) {
+      return linkedSepaPopupBatch.totalAmount;
+    }
+    return linkedSepaPopupBatch.operations.reduce(
+      (sum, op) => sum + Number(op.amount || 0),
+      0
+    );
+  }, [linkedSepaPopupBatch]);
 
   useEffect(() => {
     if (!selectedDetailsTxn) return;
@@ -593,19 +551,19 @@ export default function Banque() {
     );
     setSepaCurrentOperationIndex(0);
 
-    if (isSepaBatchTransaction(selectedDetailsTxn)) {
+    if (Boolean(findSepaBatchByReference(selectedDetailsTxn.reference))) {
       setDetailsSepaReference(selectedDetailsTxn.reference);
     } else {
       setDetailsSepaReference(null);
     }
   }, [selectedDetailsTxn]);
 
-  const openDetailsSection = (txn: LocalTransaction) => {
+  const openDetailsSection = (txn: LocalTransaction, mode: "panel" | "dialog" = "panel") => {
     setDetailsTxnId(txn.id);
-    setDetailsSepaReference(isSepaBatchTransaction(txn) ? txn.reference : null);
-    requestAnimationFrame(() => {
-      detailSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
+    setDetailsSepaReference(Boolean(findSepaBatchByReference(txn.reference)) ? txn.reference : null);
+    if (mode === "dialog") {
+      setDetailsDialogOpen(true);
+    }
   };
 
   const filteredTxns = useMemo(() => {
@@ -614,7 +572,6 @@ export default function Banque() {
         const query = normalizeText(searchText);
         if (!query) return true;
 
-        const account = getAccountById(accounts, txn.bankAccountId);
         const invoiceNumbers = getInvoicesByIds(getTxnInvoiceIds(txn))
           .map((inv) => inv.invoiceNumber)
           .join(" ")
@@ -628,8 +585,6 @@ export default function Banque() {
           txn.currency,
           txn.operationType,
           txn.reconciledStatus,
-          account?.name,
-          account?.bankName,
           invoiceNumbers,
         ]
           .filter(Boolean)
@@ -646,7 +601,6 @@ export default function Banque() {
       .filter((txn) => (currencyFilter ? txn.currency === currencyFilter : true))
       .filter((txn) => (operationTypeFilter ? txn.operationType === operationTypeFilter : true))
       .filter((txn) => (paymentMethodFilter ? txn.paymentMethod === paymentMethodFilter : true))
-      .filter((txn) => (accountFilter !== "all" ? txn.bankAccountId === accountFilter : true))
       .filter((txn) => {
         if (!counterpartyFilter.trim()) return true;
         return normalizeText(txn.counterpartyName).includes(normalizeText(counterpartyFilter));
@@ -682,7 +636,6 @@ export default function Banque() {
     currencyFilter,
     operationTypeFilter,
     paymentMethodFilter,
-    accountFilter,
     counterpartyFilter,
     dateFrom,
     dateTo,
@@ -691,7 +644,6 @@ export default function Banque() {
     invoiceFilter,
     sepaOnly,
     payrollOnly,
-    accounts,
   ]);
 
   const linkedInvoiceIdsAcrossDecisions = useMemo(() => {
@@ -700,25 +652,222 @@ export default function Banque() {
     );
   }, [sepaLineDecisions]);
 
-  const selectedDetailInvoices = useMemo(() => {
-    return getInvoicesByIds(getTxnInvoiceIds(selectedDetailsTxn));
-  }, [selectedDetailsTxn]);
+  const [manualSuggestions, setManualSuggestions] = useState<SepaOperationCandidate[]>([]);
+  const [dialogSepaSuggestions, setDialogSepaSuggestions] = useState<Record<string, SepaOperationCandidate[]>>({});
+  const [dialogSepaLoading, setDialogSepaLoading] = useState(false);
 
-  const manualSuggestions = useMemo(() => {
-    if (!selectedDetailsTxn) return [] as SepaOperationCandidate[];
-    return getAvailableInvoicesForTxn(selectedDetailsTxn)
-      .map((invoice) => {
-        const score = computeMatchScore(selectedDetailsTxn, invoice);
-        return {
-          invoice,
-          score,
-          details: getMatchDetails(selectedDetailsTxn, invoice),
-          reasons: buildCandidateReasons(selectedDetailsTxn, invoice, score),
-        };
-      })
-      .filter((item) => item.score >= 20)
-      .slice(0, 8);
-  }, [selectedDetailsTxn]);
+  useEffect(() => {
+    const loadReconciliationSuggestions = async () => {
+      if (!selectedDetailsTxn) {
+        setManualSuggestions([]);
+        return;
+      }
+
+      const candidates = getAvailableInvoicesForTxn(selectedDetailsTxn);
+      const aiCandidates =
+        candidates.length > 0
+          ? candidates
+          : realInvoices.filter(
+              (inv) => (inv.currency || selectedDetailsTxn.currency) === selectedDetailsTxn.currency
+            );
+      if (!aiCandidates.length) {
+        setManualSuggestions([]);
+        return;
+      }
+
+      try {
+        const res = await fetch("/api/reconciliation/score", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            transaction: selectedDetailsTxn,
+            invoices: aiCandidates,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data?.error || "Agent IA indisponible");
+
+        const raw = Array.isArray(data?.suggestions) ? data.suggestions : [];
+        const byInvId = new Map(aiCandidates.map((inv) => [inv.id, inv]));
+
+        const fromServer = raw
+          .map((s: any) => {
+            const invoice = byInvId.get(String(s.invoiceId));
+            if (!invoice) return null;
+            const score = Number(s.score ?? 0);
+            const parts: string[] = [];
+            if (Array.isArray(s.signals) && s.signals.length) parts.push(...s.signals);
+            if (s.reason) parts.push(String(s.reason));
+            if (typeof s.localScore === "number" && s.localScore !== score) {
+              parts.push(`Score local: ${s.localScore}%`);
+            }
+            return {
+              invoice,
+              score,
+              details: getMatchDetails(selectedDetailsTxn, invoice),
+              reasons: parts.length ? parts : buildCandidateReasons(selectedDetailsTxn, invoice, score),
+            };
+          })
+          .filter((row): row is SepaOperationCandidate => Boolean(row))
+          .filter((item) => item.score >= 24)
+          .slice(0, 8);
+
+        const enriched =
+          fromServer.length > 0
+            ? fromServer
+            : [];
+
+        setManualSuggestions(enriched);
+      } catch (error) {
+        console.error("Erreur scoring rapprochement IA:", error);
+        setManualSuggestions([]);
+        toast?.error?.("Rapprochement IA indisponible pour cette opération.");
+      }
+    };
+
+    void loadReconciliationSuggestions();
+  }, [selectedDetailsTxn, realInvoices]);
+
+  useEffect(() => {
+    const loadDialogSepaSuggestions = async () => {
+      if (!detailsDialogOpen || !selectedDetailsTxn || !selectedTxnIsSepa || !selectedSepaBatch) {
+        setDialogSepaSuggestions({});
+        return;
+      }
+      if (selectedDetailsTxn.reconciledStatus === "rapproché") {
+        setDialogSepaLoading(false);
+        setDialogSepaSuggestions({});
+        return;
+      }
+
+      if (!realInvoices.length) {
+        setDialogSepaSuggestions({});
+        return;
+      }
+
+      setDialogSepaLoading(true);
+      try {
+        setSepaLineDecisions((prev) => {
+          const next = { ...prev };
+          selectedSepaBatch.operations.forEach((op) => {
+            if (!next[op.id]) {
+              next[op.id] = { status: "pending", selectedInvoiceIds: [], rejectAllSuggestions: false };
+            }
+          });
+          return next;
+        });
+
+        const entries = await Promise.all(
+          selectedSepaBatch.operations.map(async (op) => {
+            const opAmountAbs = Math.abs(Number(op.amount || 0));
+            const pseudoTxn = {
+              id: `${selectedDetailsTxn.id}::${op.id}`,
+              sourceDocumentId: selectedDetailsTxn.sourceDocumentId,
+              bankAccountId: selectedDetailsTxn.bankAccountId,
+              txnDate: selectedDetailsTxn.txnDate,
+              label: `${op.creditorName} ${op.remittanceInfo || ""}`.trim(),
+              reference: op.endToEndId || selectedDetailsTxn.reference,
+              amount: -opAmountAbs,
+              balance: selectedDetailsTxn.balance,
+              currency: op.currency || selectedDetailsTxn.currency,
+              operationType: "decaissement",
+              paymentMethod: "SEPA",
+              counterpartyName: op.creditorName,
+              reconciledStatus: "non_rapproché",
+              matchedInvoiceIds: [],
+              pendingInvoiceIds: [],
+            };
+
+            const candidates = realInvoices.filter(
+              (inv) => (inv.currency || pseudoTxn.currency) === pseudoTxn.currency
+            );
+
+            if (!candidates.length) return [op.id, [] as SepaOperationCandidate[]] as const;
+
+            const res = await fetch("/api/reconciliation/score", {
+              method: "POST",
+              credentials: "include",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                transaction: pseudoTxn,
+                invoices: candidates,
+              }),
+            });
+            const data = await res.json().catch(() => ({}));
+            const scoreById = new Map<string, any>(
+              (Array.isArray(data?.suggestions) ? data.suggestions : []).map((s: any) => [String(s.invoiceId), s])
+            );
+
+            const enriched = candidates
+              .map((invoice) => {
+                const srv = scoreById.get(invoice.id);
+                if (!srv) return null;
+                const aiScore = Number(srv.score || 0);
+                const amountDiff = Math.abs(opAmountAbs - Number(invoice.amountGross || 0));
+                const amountRatio = opAmountAbs > 0 ? amountDiff / opAmountAbs : 1;
+                const labelRef = `${op.endToEndId || ""} ${op.remittanceInfo || ""}`.toLowerCase();
+                const invoiceNo = String(invoice.invoiceNumber || "").toLowerCase();
+                const vendor = String(invoice.vendorCustomer || "").toLowerCase();
+                const hasRefHit = invoiceNo.length >= 4 && labelRef.includes(invoiceNo);
+                const hasVendorHit =
+                  vendor.length >= 4 &&
+                  (labelRef.includes(vendor) ||
+                    vendor.split(/\s+/).some((w) => w.length >= 4 && labelRef.includes(w)));
+
+                // Guardrails: down-weight AI score when amount is not plausible.
+                let score = aiScore;
+                if (amountRatio > 0.8) score -= 70;
+                else if (amountRatio > 0.5) score -= 45;
+                else if (amountRatio > 0.25) score -= 25;
+                if (hasRefHit) score += 12;
+                if (hasVendorHit) score += 8;
+                score = Math.max(0, Math.min(100, Math.round(score)));
+
+                const reasons = [];
+                if (Array.isArray(srv?.signals)) reasons.push(...srv.signals);
+                if (srv?.reason) reasons.push(String(srv.reason));
+                reasons.unshift(`Écart montant ligne: ${formatMoney(amountDiff, invoice.currency ?? pseudoTxn.currency)}`);
+                if (hasRefHit) reasons.unshift("Référence exacte détectée");
+                if (hasVendorHit) reasons.unshift("Tiers cohérent");
+                return {
+                  invoice,
+                  score,
+                  details: getMatchDetails(pseudoTxn as any, invoice),
+                  reasons: reasons.length ? reasons : buildCandidateReasons(pseudoTxn as any, invoice, score),
+                } as SepaOperationCandidate;
+              })
+              .filter((x): x is SepaOperationCandidate => Boolean(x))
+              .filter((x) => x.score >= 45)
+              .sort((a, b) => b.score - a.score)
+              .slice(0, 5);
+
+            return [op.id, enriched] as const;
+          })
+        );
+
+        // Anti-duplicate between SEPA lines: an invoice should not be suggested as top choice on many lines.
+        const rawByOp = Object.fromEntries(entries) as Record<string, SepaOperationCandidate[]>;
+        const usedInvoiceIds = new Set<string>();
+        const opOrder = selectedSepaBatch.operations.map((op) => op.id);
+        const finalByOp: Record<string, SepaOperationCandidate[]> = {};
+
+        opOrder.forEach((opId) => {
+          const ranked = rawByOp[opId] || [];
+          const filtered = ranked.filter((c) => !usedInvoiceIds.has(c.invoice.id));
+          const keep = filtered.length > 0 ? filtered : ranked.slice(0, 1);
+          finalByOp[opId] = keep.slice(0, 3);
+          if (keep[0]?.invoice?.id) usedInvoiceIds.add(keep[0].invoice.id);
+        });
+
+        setDialogSepaSuggestions(finalByOp);
+      } finally {
+        setDialogSepaLoading(false);
+      }
+    };
+
+    void loadDialogSepaSuggestions();
+  }, [detailsDialogOpen, selectedDetailsTxn, selectedSepaBatch, realInvoices, selectedTxnIsSepa]);
 
   const sepaOperations = selectedSepaBatch?.operations ?? [];
   const sepaCurrentOperation = sepaOperations[sepaCurrentOperationIndex] ?? null;
@@ -729,16 +878,29 @@ export default function Banque() {
         rejectAllSuggestions: false,
       }
     : null;
+  const sepaCurrentIsLocked =
+    Boolean(sepaCurrentOperation?.id) &&
+    (sepaCurrentDecision?.status === "approved") &&
+    !sepaEditModeByOperation[sepaCurrentOperation.id];
 
   const sepaCurrentCandidates = useMemo(() => {
     if (!selectedDetailsTxn || !sepaCurrentOperation) return [] as SepaOperationCandidate[];
+    if (sepaCurrentDecision?.status === "approved" && !sepaEditModeByOperation[sepaCurrentOperation.id]) {
+      return [] as SepaOperationCandidate[];
+    }
     return getAvailableInvoicesForSepaOperation(
       selectedDetailsTxn,
       sepaCurrentOperation,
       sepaCurrentDecision?.selectedInvoiceIds ?? [],
       linkedInvoiceIdsAcrossDecisions,
     );
-  }, [selectedDetailsTxn, sepaCurrentOperation, sepaCurrentDecision, linkedInvoiceIdsAcrossDecisions]);
+  }, [
+    selectedDetailsTxn,
+    sepaCurrentOperation,
+    sepaCurrentDecision,
+    linkedInvoiceIdsAcrossDecisions,
+    sepaEditModeByOperation,
+  ]);
 
   const sepaSummary = useMemo(() => {
     const summary = { approved: 0, rejected: 0, review: 0, pending: 0 };
@@ -781,8 +943,91 @@ export default function Banque() {
     }));
   };
 
+  const persistTxnReconciliation = async (
+    txnId: string,
+    patch: Record<string, any>,
+  ) => {
+    const txn = transactions.find((t) => t.id === txnId);
+    if (!txn?.sourceDocumentId) return;
+    const cacheKey = makeRecoCacheKey(txn.sourceDocumentId, txn.id);
+    const currentCache = readLocalReconciliationCache();
+    writeLocalReconciliationCache({
+      ...currentCache,
+      [cacheKey]: {
+        ...(currentCache[cacheKey] || {}),
+        ...patch,
+        updatedAt: new Date().toISOString(),
+      },
+    });
+
+    try {
+      if (backendRecoPersistenceUnavailable) {
+        return;
+      }
+      const res = await fetch(`/api/imports/${encodeURIComponent(txn.sourceDocumentId)}/reconciliation`, {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          operationId: txn.id,
+          patch,
+        }),
+      });
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}));
+        if (res.status === 404) {
+          // Endpoint not available on current backend runtime: keep local-only persistence.
+          setBackendRecoPersistenceUnavailable(true);
+          console.warn("Backend reconciliation persistence endpoint not found (404). Using local cache only.");
+          return;
+        }
+        throw new Error(payload?.error || `HTTP ${res.status}`);
+      }
+    } catch (error) {
+      console.error("persistTxnReconciliation error:", error);
+      toast?.error?.("Sauvegarde backend échouée. Sauvegarde locale conservée.");
+    }
+  };
+
+  const syncInvoicesStatusFromTxn = async (
+    toReconciled: string[],
+    toUnreconciled: string[],
+  ) => {
+    try {
+      let res = await fetch("/api/reconciliation/invoices-status", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          toReconciled,
+          toUnreconciled,
+        }),
+      });
+      if (res.status === 404) {
+        // Backward compatibility if backend runtime doesn't yet expose reconciliation route
+        res = await fetch("/api/invoices/reconciliation-status", {
+          method: "POST",
+          credentials: "include",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            toReconciled,
+            toUnreconciled,
+          }),
+        });
+      }
+      if (!res.ok) {
+        const payload = await res.json().catch(() => ({}));
+        throw new Error(payload?.error || `HTTP ${res.status}`);
+      }
+    } catch (error) {
+      console.error("syncInvoicesStatusFromTxn error:", error);
+      toast?.error?.("Statut facture non synchronisé côté backend.");
+    }
+  };
+
   const applyManualReconciliation = () => {
     if (!selectedDetailsTxn) return;
+    const previousMatched = selectedDetailsTxn.matchedInvoiceIds ?? [];
 
     const noAiSuggestionAccepted = manualRejectAllSuggestions && manualInvoiceSelection.length === 0;
     const generatedComment = noAiSuggestionAccepted
@@ -805,6 +1050,19 @@ export default function Banque() {
       ),
     );
 
+    void persistTxnReconciliation(selectedDetailsTxn.id, {
+      reconciledStatus: manualInvoiceSelection.length > 0 ? "rapproché" : "non_rapproché",
+      matchedInvoiceIds: manualInvoiceSelection.length > 0 ? manualInvoiceSelection : [],
+      pendingInvoiceIds: manualInvoiceSelection.length > 0 ? [] : [],
+      unreconciledCategory: manualCategory || null,
+      unreconciledComment: generatedComment || null,
+      reviewFlag: manualReviewFlag || noAiSuggestionAccepted,
+    });
+    void syncInvoicesStatusFromTxn(
+      manualInvoiceSelection.length > 0 ? manualInvoiceSelection : [],
+      previousMatched.filter((id) => !manualInvoiceSelection.includes(id)),
+    );
+
     toast?.success?.("Opération mise à jour.");
   };
 
@@ -822,59 +1080,109 @@ export default function Banque() {
   const validateCurrentSepaOperation = (status: Exclude<SepaOperationDecisionStatus, "pending">) => {
     if (!sepaCurrentOperation) return;
     updateSepaDecision(sepaCurrentOperation.id, (current) => ({ ...current, status }));
+    setSepaEditModeByOperation((prev) => ({ ...prev, [sepaCurrentOperation.id]: false }));
     toast?.success?.("Sous-opération SEPA mise à jour.");
   };
 
   const validateWholeSepaBatch = () => {
-    if (!selectedDetailsTxn || !selectedSepaBatch) return;
+    try {
+      if (!selectedDetailsTxn || !selectedSepaBatch) return;
+      const previousMatched = selectedDetailsTxn.matchedInvoiceIds ?? [];
 
-    const selectedInvoiceIds = selectedSepaBatch.operations.flatMap(
-      (op) => sepaLineDecisions[op.id]?.selectedInvoiceIds ?? [],
-    );
+      const operations = Array.isArray(selectedSepaBatch.operations)
+        ? selectedSepaBatch.operations
+        : [];
 
-    const hasApproved = selectedSepaBatch.operations.some(
-      (op) => (sepaLineDecisions[op.id]?.status ?? "pending") === "approved",
-    );
+      const selectedInvoiceIds = Array.from(
+        new Set(
+          operations.flatMap(
+            (op) => sepaLineDecisions[op.id]?.selectedInvoiceIds ?? [],
+          ),
+        ),
+      );
 
-    const rejectedAllCount = selectedSepaBatch.operations.filter(
-      (op) => Boolean(sepaLineDecisions[op.id]?.rejectAllSuggestions),
-    ).length;
+      const statuses = operations.map(
+        (op) => sepaLineDecisions[op.id]?.status ?? "pending",
+      );
+      const approvedCount = statuses.filter((s) => s === "approved").length;
+      const pendingCount = statuses.filter((s) => s === "pending").length;
+      const allApproved = approvedCount === operations.length && approvedCount > 0;
 
-    setTransactions((prev) =>
-      prev.map((txn) =>
-        txn.id === selectedDetailsTxn.id
-          ? {
-              ...txn,
-              reconciledStatus: hasApproved ? "rapproché" : "non_rapproché",
-              matchedInvoiceIds: selectedInvoiceIds,
-              pendingInvoiceIds: hasApproved ? [] : selectedInvoiceIds,
-              reviewFlag:
-                selectedSepaBatch.operations.some(
-                  (op) => (sepaLineDecisions[op.id]?.status ?? "pending") === "review",
-                ) || rejectedAllCount > 0,
-              unreconciledComment:
-                [
-                  rejectedAllCount > 0 ? `${rejectedAllCount} sous-opération(s) : aucune proposition IA retenue` : "",
-                  selectedSepaBatch.operations
-                    .filter((op) => (sepaLineDecisions[op.id]?.status ?? "pending") !== "approved")
-                    .map((op) => {
-                      const decision = sepaLineDecisions[op.id];
-                      const suffix = decision?.rejectAllSuggestions ? " — aucune proposition IA retenue" : "";
-                      return `${op.creditorName}: ${getDecisionLabel(decision?.status ?? "pending")}${suffix}`;
-                    })
-                    .join(" | "),
-                ]
-                  .filter(Boolean)
-                  .join(" | ") || undefined,
-            }
-          : txn,
-      ),
-    );
+      if (pendingCount > 0) {
+        toast?.error?.("Il reste des lignes SEPA non traitées. Valide/Rejette/À revoir chaque ligne.");
+        return;
+      }
 
-    toast?.success?.("Lot SEPA appliqué dans Banque.");
+      const rejectedAllCount = operations.filter(
+        (op) => Boolean(sepaLineDecisions[op.id]?.rejectAllSuggestions),
+      ).length;
+
+      setTransactions((prev) =>
+        prev.map((txn) =>
+          txn.id === selectedDetailsTxn.id
+            ? {
+                ...txn,
+                // Mark transaction as fully reconciled only if every SEPA line is approved.
+                reconciledStatus: allApproved ? "rapproché" : "non_rapproché",
+                matchedInvoiceIds: allApproved ? selectedInvoiceIds : [],
+                pendingInvoiceIds: allApproved ? [] : selectedInvoiceIds,
+                reviewFlag:
+                  operations.some(
+                    (op) => (sepaLineDecisions[op.id]?.status ?? "pending") === "review",
+                  ) || rejectedAllCount > 0,
+                unreconciledComment:
+                  [
+                    rejectedAllCount > 0 ? `${rejectedAllCount} sous-opération(s) : aucune proposition IA retenue` : "",
+                    operations
+                      .filter((op) => (sepaLineDecisions[op.id]?.status ?? "pending") !== "approved")
+                      .map((op) => {
+                        const decision = sepaLineDecisions[op.id];
+                        const suffix = decision?.rejectAllSuggestions ? " — aucune proposition IA retenue" : "";
+                        return `${op.creditorName}: ${getDecisionLabel(decision?.status ?? "pending")}${suffix}`;
+                      })
+                      .join(" | "),
+                  ]
+                    .filter(Boolean)
+                    .join(" | ") || undefined,
+              }
+            : txn,
+        ),
+      );
+
+      void persistTxnReconciliation(selectedDetailsTxn.id, {
+        reconciledStatus: allApproved ? "rapproché" : "non_rapproché",
+        matchedInvoiceIds: allApproved ? selectedInvoiceIds : [],
+        pendingInvoiceIds: allApproved ? [] : selectedInvoiceIds,
+        reviewFlag:
+          operations.some(
+            (op) => (sepaLineDecisions[op.id]?.status ?? "pending") === "review",
+          ) || rejectedAllCount > 0,
+      });
+      void syncInvoicesStatusFromTxn(
+        allApproved ? selectedInvoiceIds : [],
+        previousMatched.filter((id) => !(allApproved ? selectedInvoiceIds : []).includes(id)),
+      );
+
+      if (allApproved) {
+        toast?.success?.("Lot SEPA entièrement rapproché.");
+      } else {
+        toast?.success?.("Lot SEPA enregistré en partiel (lignes non approuvées à traiter).");
+      }
+    } catch (error) {
+      console.error("Erreur validateWholeSepaBatch:", error);
+      toast?.error?.("Erreur pendant le rapprochement du lot SEPA.");
+    }
+  };
+
+  const handleFinalizeSepaClick = (e: any) => {
+    e?.preventDefault?.();
+    e?.stopPropagation?.();
+    validateWholeSepaBatch();
   };
 
   const handleUnreconcile = (txnId: string) => {
+    const current = transactions.find((t) => t.id === txnId);
+    const prevMatched = current?.matchedInvoiceIds ?? [];
     setTransactions((prev) =>
       prev.map((txn) =>
         txn.id === txnId
@@ -887,6 +1195,15 @@ export default function Banque() {
           : txn,
       ),
     );
+    void persistTxnReconciliation(txnId, {
+      reconciledStatus: "non_rapproché",
+      matchedInvoiceIds: [],
+      pendingInvoiceIds: [],
+      reviewFlag: false,
+      unreconciledComment: null,
+      unreconciledCategory: null,
+    });
+    void syncInvoicesStatusFromTxn([], prevMatched);
     toast?.success?.("Rapprochement annulé.");
   };
 
@@ -897,12 +1214,9 @@ export default function Banque() {
     }
 
     try {
-      const response = await fetch(`/dev-imports/${encodeURIComponent(txn.sourceDocumentId)}`, {
+      const response = await fetch(`/api/imports/${encodeURIComponent(txn.sourceDocumentId)}`, {
         method: "DELETE",
         credentials: "include",
-        headers: {
-          "Content-Type": "application/json",
-        },
       });
       const payload = await response.json().catch(() => ({}));
 
@@ -911,19 +1225,16 @@ export default function Banque() {
       }
 
       const removedRefs = transactions
-        .filter((t) => t.sourceDocumentId === txn.sourceDocumentId);
+        .filter((t) => t.sourceDocumentId === txn.sourceDocumentId)
+        .map((t) => t.reference);
 
-      // Désactiver le rechargement automatique temporairement
-      setAutoload(false);
-      
-      // Supprimer localement sans recharger depuis le backend
       setTransactions((prev) =>
         prev.filter((t) => t.sourceDocumentId !== txn.sourceDocumentId)
       );
       setSepaBatchesByReference((prev) => {
         const next = { ...prev };
         removedRefs.forEach((ref) => {
-          delete next[ref]; 
+          delete next[ref];
         });
         return next;
       });
@@ -945,7 +1256,6 @@ export default function Banque() {
     setOperationTypeFilter("");
     setPaymentMethodFilter("");
     setInvoiceFilter("all");
-    setAccountFilter("all");
     setCounterpartyFilter("");
     setDateFrom("");
     setDateTo("");
@@ -953,19 +1263,6 @@ export default function Banque() {
     setMaxAmount("");
     setSepaOnly(false);
     setPayrollOnly(false);
-  };
-
-  const toggleAutoload = () => {
-    setAutoload(prev => !prev);
-  };
-
-  const openInvoicePdf = (inv: LocalInvoice) => {
-    if (inv.pdfUrl) {
-      setPreviewPdfUrl(inv.pdfUrl);
-      setPreviewPdfTitle(`${inv.invoiceNumber} — ${inv.vendorCustomer}`);
-      return;
-    }
-    toast?.info?.("Visualisation PDF non disponible pour cette facture.");
   };
 
   const reconciledCount = filteredTxns.filter((t) => t.reconciledStatus === "rapproché").length;
@@ -984,61 +1281,11 @@ export default function Banque() {
               </p>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
-              <Button onClick={handleConnectBank}>
-                Ajouter un compte
-              </Button>
-
-              <Button
-                variant="outline"
-                onClick={async () => {
-                  await loadBridgeAccounts(currentBridgeItemId);
-                  await loadBridgeCategories();
-                }}
-              >
-                Charger les comptes Bridge
-              </Button>
-
-              <Button
-                variant="outline"
-                onClick={() => loadBridgeTransactions()}
-                disabled={!selectedBridgeAccountId && bridgeAccounts.length === 0}
-              >
-                Charger les opérations Bridge
-              </Button>
-            </div>
-
-            <div className="inline-flex items-center gap-1 rounded-2xl border border-slate-200 bg-white p-1 shadow-sm">
-              {(["merged", "EUR", "MAD", "USD"] as BankViewMode[]).map((mode) => (
-                <button
-                  key={mode}
-                  className={`rounded-xl px-4 py-2 text-sm transition ${
-                    accountViewMode === mode
-                      ? "bg-slate-900 font-semibold text-white shadow-sm"
-                      : "text-slate-500 hover:text-slate-900"
-                  }`}
-                  onClick={() => {
-                    setAccountViewMode(mode);
-                    if (mode !== "merged") {
-                      const firstAccount = accounts.find((a) => a.currency === mode);
-                      if (firstAccount) setSelectedAccount(firstAccount.id);
-                    }
-                  }}
-                >
-                  {mode === "merged" ? "Vue globale" : mode}
-                </button>
-              ))}
-            </div>
+            
           </div>
         </div>
 
         <div className="grid gap-4 lg:grid-cols-2 xl:grid-cols-4">
-          <MetricCard
-            label="Comptes visibles"
-            value={String(visibleAccounts.length)}
-            hint={accountViewMode === "merged" ? "Tous comptes confondus" : `Filtre ${accountViewMode}`}
-            icon={<Landmark className="h-4 w-4 text-slate-400" />}
-          />
           <MetricCard
             label="Opérations affichées"
             value={String(currentViewCount)}
@@ -1060,109 +1307,38 @@ export default function Banque() {
         </div>
 
         <SectionCard
-          title="Comptes connectés via Bridge"
-          subtitle="Comptes récupérés depuis Bridge après synchronisation"
+          title="Relevés récemment importés"
+          subtitle="Supprime un relevé entier sans supprimer chaque opération"
         >
-          <div className="space-y-4">
-            {bridgeError ? (
-              <div className="rounded-xl border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-                {bridgeError}
-              </div>
-            ) : null}
-
-            {bridgeLoadingAccounts ? (
-              <div className="rounded-xl border border-slate-200 bg-white px-4 py-6 text-sm text-slate-500">
-                Chargement des comptes Bridge...
-              </div>
-            ) : bridgeAccounts.length === 0 ? (
-              <div className="rounded-xl border border-dashed border-slate-300 px-4 py-6 text-sm text-slate-500">
-                Aucun compte Bridge chargé. Connecte une banque puis clique sur “Charger les comptes Bridge”.
-              </div>
-            ) : (
-              <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-                {bridgeAccounts.map((account) => (
-                  <div key={account.id} className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-semibold text-slate-900">{getBridgeAccountName(account)}</p>
-                        <p className="mt-1 text-xs text-slate-500">{account.iban || "IBAN non disponible"}</p>
-                      </div>
-                      <span className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">
-                        {account.currency_code || account.currency || "—"}
-                      </span>
-                    </div>
-
-                    <div className="mt-3 text-sm text-slate-600">
-                      <p>
-                        <span className="text-slate-500">Solde :</span>{" "}
-                        <span className="font-semibold text-slate-900">
-                          {typeof account.balance === "number"
-                            ? `${account.balance} ${account.currency_code || account.currency || ""}`
-                            : "—"}
-                        </span>
-                      </p>
-                      <p className="mt-1">
-                        <span className="text-slate-500">Accès :</span> {account.data_access || "—"}
-                      </p>
-                    </div>
-
-                    <div className="mt-4">
-                      <Button
-                        variant={String(selectedBridgeAccountId) === String(account.id) ? "default" : "outline"}
-                        onClick={() => {
-                          const normalizedId = String(account.id);
-                          setSelectedBridgeAccountId(normalizedId);
-                          loadBridgeTransactions(normalizedId);
-                        }}
-                      >
-                        Voir les opérations
-                      </Button>
-                    </div>
+          {recentStatementImports.length === 0 ? (
+            <p className="text-sm text-slate-500">Aucun relevé importé récemment.</p>
+          ) : (
+            <div className="space-y-2">
+              {recentStatementImports.map((item) => (
+                <div
+                  key={item.id}
+                  className="flex items-center justify-between rounded-xl border border-slate-200 bg-white px-3 py-2"
+                >
+                  <div>
+                    <p className="text-sm font-medium text-slate-900">{item.originalName}</p>
+                    <p className="text-xs text-slate-500">
+                      {item.createdAt ? new Date(item.createdAt).toLocaleString("fr-FR") : "Date inconnue"}
+                    </p>
                   </div>
-                ))}
-              </div>
-            )}
-          </div>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => deleteStatementImport(item.id)}
+                  >
+                    Supprimer relevé
+                  </Button>
+                </div>
+              ))}
+            </div>
+          )}
         </SectionCard>
 
-        {accountViewMode === "merged" ? (
-          <SectionCard
-            title="Synthèse multi-devises"
-            subtitle="Les devises sont séparées pour éviter tout affichage incohérent."
-          >
-            <CurrencySummary accounts={visibleAccounts} />
-          </SectionCard>
-        ) : selectedAccountData ? (
-          <SectionCard title={selectedAccountData.name} subtitle={selectedAccountData.bankName}>
-            <div className="grid gap-4 md:grid-cols-3">
-              <div className="rounded-2xl bg-slate-50 p-4">
-                <p className="text-xs uppercase tracking-wide text-slate-500">Solde actuel</p>
-                <p className="mt-2 text-2xl font-bold text-slate-900">
-                  {formatMoney(selectedAccountData.currentBalance, selectedAccountData.currency)}
-                </p>
-              </div>
-              <div className="rounded-2xl bg-slate-50 p-4">
-                <p className="text-xs uppercase tracking-wide text-slate-500">IBAN</p>
-                <p className="mt-2 break-all font-mono text-sm text-slate-800">
-                  {selectedAccountData.iban}
-                </p>
-              </div>
-              <div className="rounded-2xl bg-slate-50 p-4 text-sm text-slate-700">
-                <p>
-                  <span className="text-slate-500">Compte :</span>{" "}
-                  <span className="font-mono">{selectedAccountData.accountNumber ?? "—"}</span>
-                </p>
-                <p className="mt-1">
-                  <span className="text-slate-500">SWIFT :</span>{" "}
-                  <span className="font-mono">{selectedAccountData.swift ?? "—"}</span>
-                </p>
-                <p className="mt-1">
-                  <span className="text-slate-500">Agence :</span> {selectedAccountData.agency ?? "—"}
-                </p>
-              </div>
-            </div>
-          </SectionCard>
-        ) : null}
+
 
         <SectionCard
           title="Filtres"
@@ -1186,19 +1362,6 @@ export default function Banque() {
                 placeholder="Recherche libellé, référence, facture..."
                 className="bg-white"
               />
-
-              <select
-                className="h-10 rounded-md border border-slate-200 bg-white px-3 text-sm"
-                value={accountFilter}
-                onChange={(e) => setAccountFilter(e.target.value)}
-              >
-                <option value="all">Tous les comptes</option>
-                {accounts.map((account) => (
-                  <option key={account.id} value={account.id}>
-                    {account.name}
-                  </option>
-                ))}
-              </select>
 
               <select
                 className="h-10 rounded-md border border-slate-200 bg-white px-3 text-sm"
@@ -1300,89 +1463,7 @@ export default function Banque() {
           </div>
         </SectionCard>
 
-        <SectionCard
-          title="Opérations Bridge"
-          subtitle={
-            selectedBridgeAccount
-              ? `Compte sélectionné : ${getBridgeAccountName(selectedBridgeAccount)}`
-              : "Aucun compte Bridge sélectionné"
-          }
-        >
-          <div className="rounded-2xl border border-slate-200 overflow-hidden bg-white">
-            <Table className="table-fixed w-full">
-              <TableHeader>
-                <TableRow className="bg-slate-50">
-                  <TableHead className="w-[140px]">Date</TableHead>
-                  <TableHead>Libellé</TableHead>
-                  <TableHead className="w-[220px]">Catégorie</TableHead>
-                  <TableHead className="w-[180px]">Compte</TableHead>
-                  <TableHead className="w-[160px]">Montant</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {bridgeLoadingTransactions ? (
-                  <TableRow>
-                    <TableCell colSpan={5} className="py-8 text-center text-sm text-slate-500">
-                      Chargement des opérations Bridge...
-                    </TableCell>
-                  </TableRow>
-                ) : bridgeTransactions.length === 0 ? (
-                  <TableRow>
-                    <TableCell colSpan={5} className="py-8 text-center text-sm text-slate-500">
-                      Aucune opération Bridge chargée.
-                    </TableCell>
-                  </TableRow>
-                ) : (
-                  bridgeTransactions.map((tx) => {
-                    const account = bridgeAccounts.find(
-                      (acc) => String(acc.id) === String(tx.account_id)
-                    );
-
-                    return (
-                      <TableRow key={tx.id}>
-                        <TableCell className="whitespace-nowrap">
-                          {getBridgeTransactionDate(tx) || "—"}
-                        </TableCell>
-                        <TableCell>
-                          <div className="space-y-1">
-                            <div className="font-medium text-slate-900">
-                              {getBridgeTransactionLabel(tx)}
-                            </div>
-                            <div className="text-xs text-slate-500">
-                              ID: {tx.id}
-                            </div>
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          <span className="text-sm text-slate-700">
-                            {getBridgeCategoryLabel(tx)}
-                          </span>
-                        </TableCell>
-                        <TableCell>
-                          <div
-                            className="truncate"
-                            title={account ? getBridgeAccountName(account) : tx.account_id}
-                          >
-                            {account ? getBridgeAccountName(account) : tx.account_id || "—"}
-                          </div>
-                        </TableCell>
-                        <TableCell>
-                          <span
-                            className={`font-mono font-semibold ${
-                              (tx.amount || 0) < 0 ? "text-red-600" : "text-emerald-600"
-                            }`}
-                          >
-                            {tx.amount ?? "—"} {getBridgeTransactionCurrency(tx)}
-                          </span>
-                        </TableCell>
-                      </TableRow>
-                    );
-                  })
-                )}
-              </TableBody>
-            </Table>
-          </div>
-        </SectionCard>
+        
 
         <div className="grid gap-6 xl:grid-cols-[minmax(0,1.6fr)_460px]">
           <SectionCard title="Opérations bancaires" subtitle={`${filteredTxns.length} ligne(s) affichée(s)`}>
@@ -1392,7 +1473,6 @@ export default function Banque() {
                   <TableRow className="bg-slate-50">
                     <TableHead className="w-[110px]">Date</TableHead>
                     <TableHead className="w-[34%]">Opération</TableHead>
-                    <TableHead className="w-[18%]">Compte</TableHead>
                     <TableHead className="w-[140px]">Montant</TableHead>
                     <TableHead className="w-[18%]">Factures</TableHead>
                     <TableHead className="w-[120px]">Statut</TableHead>
@@ -1402,15 +1482,14 @@ export default function Banque() {
                 <TableBody>
                   {filteredTxns.length === 0 ? (
                     <TableRow>
-                      <TableCell colSpan={7} className="py-10 text-center text-sm text-slate-500">
+                      <TableCell colSpan={6} className="py-10 text-center text-sm text-slate-500">
                         Aucune opération trouvée.
                       </TableCell>
                     </TableRow>
                   ) : (
                     filteredTxns.map((txn) => {
-                      const account = getAccountById(accounts, txn.bankAccountId);
                       const invoiceIds = getTxnInvoiceIds(txn);
-                      const batch = sepaBatchesByReference[txn.reference];
+                      const batch = findSepaBatchByReference(txn.reference);
                       const sepaConfig = batch ? getSepaBadgeConfig(batch.type) : null;
                       const SepaIcon = sepaConfig?.icon;
 
@@ -1419,17 +1498,28 @@ export default function Banque() {
                           <TableCell className="whitespace-nowrap">{formatDisplayDate(txn.txnDate)}</TableCell>
                           <TableCell className="align-top">
                             <div className="space-y-2 max-w-full overflow-hidden">
-                              <div className="truncate font-medium text-slate-900" title={txn.rawLabel || txn.label}>
-                                {formatOperationLabel(txn.label, txn.rawLabel)}
+                              <div className="truncate font-medium text-slate-900" title={txn.label}>
+                                {txn.label}
                               </div>
                               <div className="truncate text-xs text-slate-500" title={txn.reference}>
                                 {txn.reference}
                               </div>
                               <div className="flex flex-wrap gap-2">
-                                {txn.counterpartyName ? (
-                                  <span className="inline-flex items-center gap-1 rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600">
+                                {txn.bankMeta?.libelle ? (
+                                  <span
+                                    className="inline-flex max-w-full items-center gap-1 truncate rounded-full bg-indigo-50 px-2 py-1 text-xs text-indigo-700 ring-1 ring-indigo-100"
+                                    title={`Compte: ${txn.bankMeta.libelle}`}
+                                  >
+                                    Compte: {txn.bankMeta.libelle}
+                                  </span>
+                                ) : null}
+                                {getCounterpartyDisplay(txn) ? (
+                                  <span
+                                    className="inline-flex max-w-full items-center gap-1 truncate rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-600"
+                                    title={`${getCounterpartyDisplay(txn)?.role}: ${getCounterpartyDisplay(txn)?.value}`}
+                                  >
                                     <Building2 className="h-3 w-3" />
-                                    {txn.counterpartyName}
+                                    {getCounterpartyDisplay(txn)?.role}: {getCounterpartyDisplay(txn)?.value}
                                   </span>
                                 ) : null}
                                 <span className={`rounded-full px-2 py-1 text-xs font-medium ${getCurrencyBadgeClass(txn.currency)}`}>
@@ -1441,12 +1531,18 @@ export default function Banque() {
                                     {sepaConfig.label}
                                   </span>
                                 ) : null}
+                                {batch ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => setLinkedSepaPopupRef(batch.id || txn.reference)}
+                                    className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-1 text-xs text-emerald-700 ring-1 ring-emerald-100 hover:bg-emerald-100"
+                                    title={`Voir le lot SEPA ${batch.id || txn.reference}`}
+                                  >
+                                    <Link2 className="h-3 w-3" />
+                                    SEPA lié
+                                  </button>
+                                ) : null}
                               </div>
-                            </div>
-                          </TableCell>
-                          <TableCell className="align-top">
-                            <div className="truncate" title={account?.name ?? "—"}>
-                              {account?.name ?? "—"}
                             </div>
                           </TableCell>
                           <TableCell>
@@ -1479,7 +1575,7 @@ export default function Banque() {
                           </TableCell>
                           <TableCell className="align-top text-right">
                             <div className="flex items-center justify-end gap-2">
-                              <Button variant="ghost" size="sm" onClick={() => openDetailsSection(txn)}>
+                              <Button variant="ghost" size="sm" onClick={() => openDetailsSection(txn, "dialog")}>
                                 Voir
                               </Button>
                               <DropdownMenu>
@@ -1489,14 +1585,21 @@ export default function Banque() {
                                   </Button>
                                 </DropdownMenuTrigger>
                                 <DropdownMenuContent align="end" className="w-64">
-                                  <DropdownMenuItem onClick={() => openDetailsSection(txn)}>
+                                  <DropdownMenuItem onClick={() => openDetailsSection(txn, "dialog")}>
                                     <Info className="mr-2 h-4 w-4" />
                                     Voir le détail
                                   </DropdownMenuItem>
-                                  <DropdownMenuItem onClick={() => openDetailsSection(txn)}>
+                                  <DropdownMenuItem onClick={() => openDetailsSection(txn, "dialog")}>
                                     <Link2 className="mr-2 h-4 w-4" />
                                     Ouvrir le rapprochement
                                   </DropdownMenuItem>
+                                  {batch ? (
+                                    <DropdownMenuItem
+                                      onClick={() => setLinkedSepaPopupRef(batch.id || txn.reference)}
+                                    >
+                                      Voir détail SEPA
+                                    </DropdownMenuItem>
+                                  ) : null}
                                   {txn.reconciledStatus === "rapproché" ? (
                                     <DropdownMenuItem onClick={() => handleUnreconcile(txn.id)}>
                                       <Undo2 className="mr-2 h-4 w-4" />
@@ -1521,106 +1624,16 @@ export default function Banque() {
             </div>
           </SectionCard>
 
-          <div ref={detailSectionRef} className="space-y-6 xl:sticky xl:top-6 xl:self-start">
-            <SectionCard
-              title="Panneau de détail"
-              subtitle={selectedDetailsTxn ? selectedDetailsTxn.reference : "Sélectionne une ligne du tableau"}
-            >
-              {!selectedDetailsTxn ? (
-                <div className="rounded-2xl border border-dashed border-slate-300 p-10 text-center text-sm text-slate-500">
-                  Aucun détail sélectionné.
-                </div>
-              ) : (
-                <div className="space-y-4">
-                  <div className="rounded-2xl bg-slate-50 p-4">
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="text-sm font-semibold text-slate-900" title={selectedDetailsTxn.rawLabel || selectedDetailsTxn.label}>
-                        {formatOperationLabel(selectedDetailsTxn.label, selectedDetailsTxn.rawLabel)}
-                      </p>
-                        <p className="mt-1 text-xs text-slate-500">{selectedDetailsTxn.reference}</p>
-                      </div>
-                      <StatusBadge status={selectedDetailsTxn.reconciledStatus} />
-                    </div>
-                    <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                      <div>
-                        <p className="text-xs text-slate-500">Date</p>
-                        <p className="text-sm font-medium text-slate-900">
-                          {formatDisplayDate(selectedDetailsTxn.txnDate)}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-xs text-slate-500">Montant</p>
-                        <p className={`text-sm font-semibold ${selectedDetailsTxn.amount < 0 ? "text-red-600" : "text-emerald-600"}`}>
-                          {formatCompactAmount(selectedDetailsTxn.amount, selectedDetailsTxn.currency)}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-xs text-slate-500">Compte</p>
-                        <p className="text-sm font-medium text-slate-900">
-                          {getAccountById(accounts, selectedDetailsTxn.bankAccountId)?.name ?? "—"}
-                        </p>
-                      </div>
-                      <div>
-                        <p className="text-xs text-slate-500">Contrepartie</p>
-                        <p className="text-sm font-medium text-slate-900">{selectedDetailsTxn.counterpartyName ?? "—"}</p>
-                      </div>
-                      <div>
-                        <p className="text-xs text-slate-500">Moyen de paiement</p>
-                        <p className="text-sm font-medium text-slate-900">{selectedDetailsTxn.paymentMethod ?? "—"}</p>
-                      </div>
-                      <div>
-                        <p className="text-xs text-slate-500">Solde après opération</p>
-                        <p className="text-sm font-medium text-slate-900">
-                          {formatMoney(selectedDetailsTxn.balance, selectedDetailsTxn.currency)}
-                        </p>
-                      </div>
-                    </div>
-                  </div>
+          <div className="space-y-6 xl:sticky xl:top-6 xl:self-start">
 
-                  <div className="rounded-2xl border border-slate-200 p-4">
-                    <p className="mb-3 text-sm font-semibold text-slate-900">Factures associées</p>
-                    {selectedDetailInvoices.length === 0 ? (
-                      <p className="text-sm text-slate-500">Aucune facture associée.</p>
-                    ) : (
-                      <div className="space-y-3">
-                        {selectedDetailInvoices.map((invoice) => (
-                          <div key={invoice.id} className="rounded-xl bg-slate-50 p-3">
-                            <div className="flex items-start justify-between gap-3">
-                              <div>
-                                <p className="text-sm font-medium text-slate-900">{invoice.invoiceNumber}</p>
-                                <p className="text-xs text-slate-500">{invoice.vendorCustomer}</p>
-                              </div>
-                              <span className="text-sm font-semibold text-slate-900">
-                                {formatMoney(invoice.amountGross, invoice.currency ?? selectedDetailsTxn.currency)}
-                              </span>
-                            </div>
-                            <div className="mt-2 flex flex-wrap gap-3 text-xs text-slate-500">
-                              <span>Émise : {formatDisplayDate(invoice.invoiceDate)}</span>
-                              <span>Échéance : {formatDisplayDate(invoice.dueDate)}</span>
-                              <span>{invoice.category ?? "—"}</span>
-                            </div>
-                            <div className="mt-2">
-                              <Button variant="ghost" size="sm" onClick={() => openInvoicePdf(invoice)}>
-                                <Receipt className="mr-1 h-4 w-4" />
-                                Voir la facture
-                              </Button>
-                            </div>
-                          </div>
-                        ))}
-                      </div>
-                    )}
-                  </div>
-                </div>
-              )}
-            </SectionCard>
-
-            {selectedDetailsTxn && !isSepaBatchTransaction(selectedDetailsTxn) ? (
+            {selectedDetailsTxn && !selectedTxnIsSepa ? (
               <SectionCard title="Rapprochement" subtitle="Sélection manuelle des factures proposées">
                 <div className="space-y-4">
                   {manualSuggestions.length === 0 ? (
                     <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500">
-                      Aucune suggestion disponible pour cette opération.
+                      {realInvoices.length === 0
+                        ? "Aucune facture réelle chargée pour proposer un rapprochement."
+                        : "Aucune suggestion disponible pour cette opération."}
                     </div>
                   ) : (
                     manualSuggestions.map((candidate) => {
@@ -1747,7 +1760,7 @@ export default function Banque() {
               </SectionCard>
             ) : null}
 
-            {selectedDetailsTxn && isSepaBatchTransaction(selectedDetailsTxn) && selectedSepaBatch ? (
+            {selectedDetailsTxn && selectedTxnIsSepa && selectedSepaBatch ? (
               <SectionCard title="Traitement SEPA" subtitle={selectedSepaBatch.label}>
                 <div className="space-y-4">
                   <div className="grid gap-3 sm:grid-cols-2">
@@ -1830,7 +1843,43 @@ export default function Banque() {
                       </div>
 
                       <div className="space-y-3">
-                        {sepaCurrentCandidates.length === 0 ? (
+                        {sepaCurrentIsLocked ? (
+                          <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
+                            <p className="text-sm font-medium text-emerald-800">
+                              Cette sous-opération est déjà rapprochée.
+                            </p>
+                            <p className="mt-1 text-xs text-emerald-700">
+                              Le système ne repropose pas de nouvelles factures tant que tu ne demandes pas une modification.
+                            </p>
+                            <div className="mt-3 flex flex-wrap gap-2">
+                              {(sepaCurrentDecision?.selectedInvoiceIds || []).map((invoiceId) => {
+                                const inv = getInvoicesByIds([invoiceId])[0];
+                                if (!inv) return null;
+                                return (
+                                  <span
+                                    key={invoiceId}
+                                    className="rounded-full bg-white px-2 py-1 text-xs text-emerald-800 ring-1 ring-emerald-200"
+                                  >
+                                    {inv.invoiceNumber}
+                                  </span>
+                                );
+                              })}
+                            </div>
+                            <div className="mt-3">
+                              <Button
+                                variant="outline"
+                                onClick={() =>
+                                  setSepaEditModeByOperation((prev) => ({
+                                    ...prev,
+                                    [sepaCurrentOperation.id]: true,
+                                  }))
+                                }
+                              >
+                                Modifier ce rapprochement
+                              </Button>
+                            </div>
+                          </div>
+                        ) : sepaCurrentCandidates.length === 0 ? (
                           <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500">
                             Aucune suggestion pour cette sous-opération.
                           </div>
@@ -1892,45 +1941,54 @@ export default function Banque() {
                         )}
                       </div>
 
-                      <label className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                        <input
-                          type="checkbox"
-                          checked={Boolean(sepaCurrentDecision?.rejectAllSuggestions)}
-                          onChange={(e) => {
-                            const checked = e.target.checked;
-                            updateSepaDecision(sepaCurrentOperation.id, (current) => ({
-                              ...current,
-                              rejectAllSuggestions: checked,
-                              selectedInvoiceIds: checked ? [] : current.selectedInvoiceIds,
-                              status: checked ? "review" : current.status,
-                            }));
-                          }}
-                        />
-                        Rejeter toutes les propositions IA pour cette sous-opération
-                      </label>
+                      {!sepaCurrentIsLocked ? (
+                        <>
+                          <label className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+                            <input
+                              type="checkbox"
+                              checked={Boolean(sepaCurrentDecision?.rejectAllSuggestions)}
+                              onChange={(e) => {
+                                const checked = e.target.checked;
+                                updateSepaDecision(sepaCurrentOperation.id, (current) => ({
+                                  ...current,
+                                  rejectAllSuggestions: checked,
+                                  selectedInvoiceIds: checked ? [] : current.selectedInvoiceIds,
+                                  status: checked ? "review" : current.status,
+                                }));
+                              }}
+                            />
+                            Rejeter toutes les propositions IA pour cette sous-opération
+                          </label>
 
-                      {sepaCurrentDecision?.rejectAllSuggestions ? (
-                        <p className="text-xs text-slate-500">
-                          Aucune suggestion automatique n'est retenue pour cette ligne. Le comptable pourra traiter le cas plus tard.
-                        </p>
+                          {sepaCurrentDecision?.rejectAllSuggestions ? (
+                            <p className="text-xs text-slate-500">
+                              Aucune suggestion automatique n'est retenue pour cette ligne. Le comptable pourra traiter le cas plus tard.
+                            </p>
+                          ) : null}
+
+                          <div className="flex flex-wrap gap-2">
+                            <Button onClick={() => validateCurrentSepaOperation("approved")}>
+                              <Check className="mr-1 h-4 w-4" />
+                              Rapprocher
+                            </Button>
+                            <Button variant="outline" onClick={() => validateCurrentSepaOperation("review")}>
+                              <AlertTriangle className="mr-1 h-4 w-4" />
+                              À revoir
+                            </Button>
+                            <Button variant="outline" onClick={() => validateCurrentSepaOperation("rejected")}>
+                              Rejeter
+                            </Button>
+                          </div>
+                        </>
                       ) : null}
 
-                      <div className="flex flex-wrap gap-2">
-                        <Button onClick={() => validateCurrentSepaOperation("approved")}>
-                          <Check className="mr-1 h-4 w-4" />
-                          Rapprocher
-                        </Button>
-                        <Button variant="outline" onClick={() => validateCurrentSepaOperation("review")}>
-                          <AlertTriangle className="mr-1 h-4 w-4" />
-                          À revoir
-                        </Button>
-                        <Button variant="outline" onClick={() => validateCurrentSepaOperation("rejected")}>
-                          Rejeter
-                        </Button>
-                      </div>
-
                       <div className="border-t border-slate-200 pt-4">
-                        <Button onClick={validateWholeSepaBatch}>Appliquer le lot SEPA</Button>
+                        <Button
+                          type="button"
+                          onClick={handleFinalizeSepaClick}
+                        >
+                          Appliquer le lot SEPA
+                        </Button>
                       </div>
                     </div>
                   ) : null}
@@ -1940,6 +1998,322 @@ export default function Banque() {
           </div>
         </div>
       </div>
+
+      <Dialog
+        open={detailsDialogOpen}
+        onOpenChange={(open) => {
+          setDetailsDialogOpen(open);
+        }}
+      >
+        <DialogContent className="max-w-5xl max-h-[88vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Détail opération</DialogTitle>
+            <DialogDescription>
+              {selectedDetailsTxn
+                ? `${formatDisplayDate(selectedDetailsTxn.txnDate)} · ${selectedDetailsTxn.reference}`
+                : "Aucune opération sélectionnée"}
+            </DialogDescription>
+          </DialogHeader>
+
+          {!selectedDetailsTxn ? (
+            <p className="text-sm text-slate-500">Aucun détail sélectionné.</p>
+          ) : (
+            <div className="space-y-4">
+              <div className="rounded-2xl bg-slate-50 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-slate-900">{selectedDetailsTxn.label}</p>
+                    <p className="mt-1 text-xs text-slate-500">{selectedDetailsTxn.reference}</p>
+                  </div>
+                  <StatusBadge status={selectedDetailsTxn.reconciledStatus} />
+                </div>
+                <div className="mt-3 grid gap-2 sm:grid-cols-2 text-sm">
+                  <p>Date: {formatDisplayDate(selectedDetailsTxn.txnDate)}</p>
+                  <p>Montant: {formatMoney(selectedDetailsTxn.amount, selectedDetailsTxn.currency)}</p>
+                  <p>
+                    Contrepartie:{" "}
+                    {getCounterpartyDisplay(selectedDetailsTxn)
+                      ? `${getCounterpartyDisplay(selectedDetailsTxn)?.role}: ${getCounterpartyDisplay(selectedDetailsTxn)?.value}`
+                      : "—"}
+                  </p>
+                </div>
+              </div>
+
+              {selectedTxnIsSepa ? (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                    <p className="text-sm text-slate-700">
+                      Cette opération est liée à un lot SEPA. Voici les lignes et leurs factures liées.
+                    </p>
+                    <Button
+                      variant="outline"
+                      onClick={() => setLinkedSepaPopupRef(selectedDetailsTxn.reference)}
+                    >
+                      Voir détail SEPA
+                    </Button>
+                  </div>
+
+                  {selectedSepaBatch ? (
+                    <div className="space-y-3">
+                      {selectedSepaBatch.operations.map((op) => {
+                        const currentDecision = sepaLineDecisions[op.id] ?? {
+                          status: "pending",
+                          selectedInvoiceIds: [],
+                          rejectAllSuggestions: false,
+                        };
+                        const linkedIds =
+                          currentDecision.selectedInvoiceIds.length > 0
+                            ? currentDecision.selectedInvoiceIds
+                            : (op.linkedInvoiceIds || []);
+                        const linkedInvoices = getInvoicesByIds(linkedIds);
+
+                        return (
+                          <div key={op.id} className="rounded-xl border border-slate-200 p-3">
+                            <div className="mb-3 flex items-center justify-between gap-2">
+                              <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">
+                                Opération SEPA
+                              </p>
+                              <span className={`rounded-full px-2 py-1 text-xs ${getDecisionBadgeClass(currentDecision.status)}`}>
+                                {getDecisionLabel(currentDecision.status)}
+                              </span>
+                            </div>
+
+                            <div className="mb-3 rounded-lg bg-slate-50 p-3">
+                              <p className="text-sm font-medium text-slate-900">{op.creditorName}</p>
+                              <div className="mt-1 flex flex-wrap gap-3 text-xs text-slate-500">
+                                <span>Réf: {op.endToEndId}</span>
+                                <span>Montant: {formatMoney(op.amount, op.currency)}</span>
+                                {op.remittanceInfo ? <span>Libellé: {op.remittanceInfo}</span> : null}
+                              </div>
+                            </div>
+
+                            {linkedInvoices.length === 0 ? (
+                              <p className="text-xs text-slate-500">Aucune facture liée pour cette ligne.</p>
+                            ) : (
+                              <div className="flex flex-wrap gap-2">
+                                {linkedInvoices.map((invoice) => (
+                                  <span
+                                    key={`${op.id}-${invoice.id}`}
+                                    className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-700"
+                                  >
+                                    {invoice.invoiceNumber} · {invoice.vendorCustomer}
+                                  </span>
+                                ))}
+                              </div>
+                            )}
+
+                            <div className="mt-2 flex justify-end">
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={() => {
+                                  const index = selectedSepaBatch.operations.findIndex((x) => x.id === op.id);
+                                  if (index >= 0) setSepaCurrentOperationIndex(index);
+                                  setSepaEditModeByOperation((prev) => ({ ...prev, [op.id]: true }));
+                                }}
+                              >
+                                Modifier cette sous-opération
+                              </Button>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ) : null}
+
+                  <div className="flex justify-end gap-2">
+                    <Button variant="outline" onClick={() => setDetailsDialogOpen(false)}>
+                      Fermer
+                    </Button>
+                    <Button
+                      variant="outline"
+                      type="button"
+                      onClick={() => {
+                        const ids = selectedSepaBatch?.operations?.map((op) => op.id) || [];
+                        setSepaEditModeByOperation((prev) => {
+                          const next = { ...prev };
+                          ids.forEach((id) => {
+                            next[id] = true;
+                          });
+                          return next;
+                        });
+                        setDetailsDialogOpen(false);
+                      }}
+                    >
+                      Modifier plusieurs sous-opérations
+                    </Button>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-3">
+                  <p className="text-sm font-medium text-slate-900">Suggestions de rapprochement</p>
+                  <p className="text-xs text-slate-500">
+                    Score et texte viennent du moteur serveur (montant, dates, références, sens achat/vente), avec complément IA seulement si cohérent.
+                  </p>
+                  {manualSuggestions.length === 0 ? (
+                    <div className="rounded-xl border border-dashed border-slate-300 p-6 text-sm text-slate-500">
+                      Aucune suggestion trouvée.
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {manualSuggestions.map((candidate) => {
+                        const checked = manualInvoiceSelection.includes(candidate.invoice.id);
+                        return (
+                          <div
+                            key={candidate.invoice.id}
+                            className={`rounded-2xl border p-4 ${
+                              checked ? "border-sky-300 bg-sky-50/50" : "border-slate-200 bg-white"
+                            }`}
+                          >
+                            <div className="flex flex-wrap items-start justify-between gap-3">
+                              <label className="flex flex-1 cursor-pointer items-start gap-2">
+                                <input
+                                  type="checkbox"
+                                  className="mt-1"
+                                  checked={checked}
+                                  onChange={() => toggleManualInvoice(candidate.invoice.id)}
+                                />
+                                <div className="space-y-2">
+                                  <div className="flex flex-wrap items-center gap-2">
+                                    <span className="text-sm font-semibold text-slate-900">
+                                      {candidate.invoice.invoiceNumber}
+                                    </span>
+                                    <span className="rounded-full bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-800 ring-1 ring-emerald-100">
+                                      {candidate.score}% score
+                                    </span>
+                                  </div>
+                                  <p className="text-sm text-slate-700">{candidate.invoice.vendorCustomer}</p>
+                                  <div className="flex flex-wrap gap-3 text-xs text-slate-500">
+                                    <span>
+                                      Montant facture :{" "}
+                                      {formatMoney(
+                                        candidate.invoice.amountGross,
+                                        candidate.invoice.currency ?? selectedDetailsTxn.currency,
+                                      )}
+                                    </span>
+                                    <span>
+                                      Écart opération :{" "}
+                                      {formatMoney(
+                                        candidate.details.amountDiff,
+                                        candidate.invoice.currency ?? selectedDetailsTxn.currency,
+                                      )}
+                                    </span>
+                                  </div>
+                                  <div className="flex flex-wrap gap-2">
+                                    {candidate.reasons.map((reason, idx) => (
+                                      <span
+                                        key={`${candidate.invoice.id}-r-${idx}`}
+                                        className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-700"
+                                      >
+                                        {reason}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+                              </label>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                  <div className="flex justify-end">
+                    <Button onClick={applyManualReconciliation}>Rapprocher</Button>
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={Boolean(linkedSepaPopupBatch)} onOpenChange={(open) => !open && setLinkedSepaPopupRef(null)}>
+        <DialogContent className="max-w-4xl">
+          <DialogHeader>
+            <div className="flex items-center justify-between gap-3">
+              <DialogTitle>
+                {linkedSepaPopupBatch?.label || linkedSepaPopupBatch?.id || "Détail SEPA"}
+              </DialogTitle>
+              {linkedSepaPopupBatch?.sourceDocumentId ? (
+                <Button variant="outline" size="sm" onClick={() => void deleteSepaImportFromPopup()}>
+                  Supprimer SEPA
+                </Button>
+              ) : null}
+            </div>
+            <DialogDescription>
+              Référence : {linkedSepaPopupBatch?.id || "—"}
+            </DialogDescription>
+          </DialogHeader>
+
+          {linkedSepaPopupBatch ? (
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 gap-3 md:grid-cols-3 text-sm">
+                <div>
+                  <p className="text-slate-500">Exécution</p>
+                  <p className="font-medium text-slate-900">
+                    {linkedSepaPopupBatch.executionDate
+                      ? formatDisplayDate(linkedSepaPopupBatch.executionDate)
+                      : "—"}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Débiteur</p>
+                  <p className="font-medium text-slate-900">{linkedSepaPopupBatch.debtorName || "—"}</p>
+                </div>
+                <div>
+                  <p className="text-slate-500">IBAN</p>
+                  <p className="font-medium text-slate-900 break-all">{linkedSepaPopupBatch.debtorIban || "—"}</p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Nb opérations</p>
+                  <p className="font-medium text-slate-900">
+                    {linkedSepaPopupBatch.numberOfTransactions ??
+                      linkedSepaPopupBatch.operations.length}
+                  </p>
+                </div>
+                <div>
+                  <p className="text-slate-500">Total</p>
+                  <p className="font-medium text-slate-900">
+                    {typeof linkedSepaPopupTotal === "number"
+                      ? formatMoney(
+                          linkedSepaPopupTotal,
+                          linkedSepaPopupBatch.debtorCurrency
+                        )
+                      : "—"}
+                  </p>
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-slate-200 overflow-hidden bg-white">
+                <Table className="table-fixed w-full">
+                  <TableHeader>
+                    <TableRow className="bg-slate-50">
+                      <TableHead>Créancier</TableHead>
+                      <TableHead>Référence</TableHead>
+                      <TableHead>IBAN</TableHead>
+                      <TableHead className="w-[160px]">Montant</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {linkedSepaPopupBatch.operations.map((op) => (
+                      <TableRow key={op.id}>
+                        <TableCell>{op.creditorName}</TableCell>
+                        <TableCell>{op.endToEndId}</TableCell>
+                        <TableCell className="truncate" title={op.creditorIban}>
+                          {op.creditorIban}
+                        </TableCell>
+                        <TableCell className="font-mono font-semibold text-slate-900">
+                          {formatMoney(op.amount, op.currency)}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            </div>
+          ) : null}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

@@ -1,7 +1,17 @@
+import { COMPANY_IDENTITY } from "../config/company-identity.js";
+
 function cleanText(value) {
   return String(value || "")
     .replace(/\u00A0/g, " ")
     .replace(/[ \t]+/g, " ")
+    .trim();
+}
+
+function normalize(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/\u00A0/g, " ")
+    .replace(/\s+/g, " ")
     .trim();
 }
 
@@ -32,87 +42,73 @@ function inferPaymentMethod(label = "", opType = "") {
   return "AUTRE";
 }
 
-function detectCounterpartyFromBlock(block) {
-  // First try to extract from specific fields - more aggressive patterns
-  const candidates = [
-    /Infos compl\. : Debiteur:\s*([A-Z][A-Za-z\s&\-\.]{2,}?)(?=\s+Infos|\.|\s*$)/i,
-    /Infos compl\. : Beneficiaire:\s*([A-Z][A-Za-z\s&\-\.]{2,}?)(?=\s+Infos|\.|\s*$)/i,
-    /Infos compl\. : Ultimate Creditor:\s*([A-Z][A-Za-z\s&\-\.]{2,}?)(?=\s+Infos|\.|\s*$)/i,
-  ];
-  
-  for (const rx of candidates) {
-    const m = block.match(rx);
-    if (m) return cleanText(m[1]);
+function isOwnCompanyName(name) {
+  const n = normalize(name);
+  const aliases = (COMPANY_IDENTITY?.aliases || []).map(normalize);
+  return aliases.some((a) => n.includes(a));
+}
+
+function trimAtKnownLabels(value) {
+  return cleanText(value).split(
+    /\b(?:Debiteur|Beneficiaire|Ultimate Creditor|Mandat|ORGID|Reference|Ref Remise|Info Compl|Libelle|Id Beneficiaire)\s*:/i
+  )[0];
+}
+
+function extractBankMeta(block) {
+  const meta = {
+    debtor: null,
+    beneficiary: null,
+    ultimateCreditor: null,
+    mandate: null,
+    orgId: null,
+    reference: null,
+    remittanceRef: null,
+    info: null,
+    libelle: null,
+  };
+
+  const parts = String(block || "")
+    .split(/Infos compl\.\s*:\s*/i)
+    .map((p) => cleanText(p))
+    .filter(Boolean);
+
+  for (const part of parts) {
+    const value = trimAtKnownLabels(part);
+    if (/^Debiteur\s*:/i.test(part)) meta.debtor = trimAtKnownLabels(part.replace(/^Debiteur\s*:/i, ""));
+    else if (/^Beneficiaire\s*:/i.test(part)) meta.beneficiary = trimAtKnownLabels(part.replace(/^Beneficiaire\s*:/i, ""));
+    else if (/^Ultimate Creditor\s*:/i.test(part)) meta.ultimateCreditor = trimAtKnownLabels(part.replace(/^Ultimate Creditor\s*:/i, ""));
+    else if (/^Mandat\s*:/i.test(part)) meta.mandate = trimAtKnownLabels(part.replace(/^Mandat\s*:/i, ""));
+    else if (/^ORGID\s*:/i.test(part)) meta.orgId = trimAtKnownLabels(part.replace(/^ORGID\s*:/i, ""));
+    else if (/^Reference\s*:/i.test(part)) meta.reference = trimAtKnownLabels(part.replace(/^Reference\s*:/i, ""));
+    else if (/^Ref Remise\s*:/i.test(part)) meta.remittanceRef = trimAtKnownLabels(part.replace(/^Ref Remise\s*:/i, ""));
+    else if (/^Info Compl\s*:/i.test(part)) meta.info = trimAtKnownLabels(part.replace(/^Info Compl\s*:/i, ""));
+    else if (/^Libelle\s*:/i.test(part)) meta.libelle = trimAtKnownLabels(part.replace(/^Libelle\s*:/i, ""));
+    else if (!meta.info && value) meta.info = value;
   }
-  
-  // Try to extract company name at the beginning of the block
-  const startPatterns = [
-    /^([A-Z][A-Za-z\s&\-\.]{3,}?)(?=\s+(?:NN|REF|ID|Mandat|RCUR|Infos|3\d))/i,
-    /^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})/i, // Multiple word company names
-    /^([A-Z][A-Z\s]+){2,}/i, // All caps company names
-  ];
-  
-  for (const pattern of startPatterns) {
-    const m = block.match(pattern);
-    if (m) return cleanText(m[1]);
-  }
-  
+
+  return meta;
+}
+
+function extractCounterpartyFromLabel(label) {
+  const cleaned = cleanText(label);
+  const slashMatch = cleaned.match(/\/\s*([A-Z0-9 ._-]{3,})$/i);
+  if (slashMatch) return cleanText(slashMatch[1]);
   return null;
 }
 
-function extractCleanLabel(rawLabel, bankOperationType, trailingDetails) {
-  const fullText = `${rawLabel} ${bankOperationType} ${trailingDetails}`.trim();
-  
-  // Try to extract meaningful information patterns
-  const patterns = [
-    // SEPA patterns
-    /(?:SEPA|PRLV|VIR)\s*[:\-]?\s*([A-Z][A-Za-z\s&\-\.]+?)(?:\s+(?:Mandat|Ref|ID|NN\d+)|$)/i,
-    /([A-Z][A-Za-z\s&\-\.]{3,}?)(?:\s+Mandat:|NN\d+|$)/i,
-    
-    // Company name patterns (usually followed by codes/refs)
-    /^([A-Z][A-Za-z\s&\-\.]{3,}?)(?:\s+[A-Z]{2}\d+|\s+NN\d+|\s+Mandat:|\s+RCUR|$)/i,
-    
-    // Clean patterns that look like company names
-    /^([A-Z][a-z]+(?:\s+[A-Z][a-z]+){1,3})/i,
-    
-    // Remove common prefixes
-    /^(?:VIR|PRLV|SEPA|CB|CARTE)\s*(?:[A-Z]{2}\d+\s*)?(.+?)\s*(?:Mandat|Ref|ID|NN\d+|$)/i,
-  ];
-  
-  for (const pattern of patterns) {
-    const match = fullText.match(pattern);
-    if (match && match[1]) {
-      let cleanName = cleanText(match[1]);
-      
-      // Clean up common artifacts
-      cleanName = cleanName
-        .replace(/\s+(?:Mandat|RCUR|Infos|compl|Ultimate|Creditor|Debiteur|Beneficiaire).*$/i, '')
-        .replace(/\s+[A-Z]{2}\d+[A-Z]*.*$/, '') // Remove references like NN753184902DDGFI
-        .replace(/\s+NN\d+.*$/, '') // Remove NN numbers
-        .replace(/\s+REF\s*:.*$/i, '') // Remove REF fields
-        .replace(/\s+ID\s*:.*$/i, '') // Remove ID fields
-        .replace(/\s+$/, '') // Remove trailing spaces
-        .trim();
-      
-      if (cleanName.length >= 3 && cleanName.length <= 50) {
-        return cleanName;
-      }
-    }
-  }
-  
-  // Fallback: extract first meaningful words
-  const words = fullText.split(/\s+/).filter(word => 
-    word.length > 2 && 
-    !/^(NN|REF|ID|Mandat|RCUR|Infos|compl|Ultimate|Creditor|Debiteur|Beneficiaire)$/i.test(word) &&
-    !/^[A-Z]{2}\d+[A-Z]*$/.test(word)
-  );
-  
-  if (words.length > 0) {
-    return words.slice(0, 3).join(' ').substring(0, 50);
-  }
-  
-  // Last resort: return a cleaned version but limit length
-  return cleanText(rawLabel.substring(0, 50));
+function resolveCounterpartyName(operationType, meta, label) {
+  const ordered =
+    operationType === "encaissement"
+      ? [meta?.debtor, meta?.ultimateCreditor, meta?.beneficiary]
+      : [meta?.beneficiary, meta?.ultimateCreditor, meta?.debtor];
+
+  const firstNonOwn = ordered.find((v) => v && !isOwnCompanyName(v));
+  const base = cleanText(firstNonOwn || ordered.find(Boolean) || "");
+  if (base && !isOwnCompanyName(base)) return base;
+  const fromLabel = extractCounterpartyFromLabel(label);
+  const resolved = cleanText(fromLabel || base || "");
+  if (!resolved || isOwnCompanyName(resolved)) return null;
+  return resolved;
 }
 
 function parseBankStatementFromText(text, fallbackFileName = "") {
@@ -162,23 +158,23 @@ function parseBankStatementFromText(text, fallbackFileName = "") {
     const paymentMethod = inferPaymentMethod(rawLabel, bankOperationType);
     const refMatch = rawLabel.match(/\/\s*([A-Z0-9._-]+)$/i);
     const detailBlock = `${rawLabel}\n${bankOperationType}\n${trailingDetails}`;
-    
-    // Extract clean label for better display
-    const cleanLabel = extractCleanLabel(rawLabel, bankOperationType, trailingDetails);
+    const bankMeta = extractBankMeta(detailBlock);
+    const counterpartyName =
+      resolveCounterpartyName(operationType, bankMeta, rawLabel) || null;
 
     operations.push({
       id: `scanned-${txnDate || "date"}-${piece}`,
       txnDate,
       valueDate,
-      label: cleanLabel,
-      rawLabel: rawLabel, // Keep original for reference
+      label: rawLabel,
       reference: refMatch ? cleanText(refMatch[1]) : piece,
       amount: signedAmount,
       currency: (currencyMatch?.[1] || "EUR").toUpperCase(),
       operationType,
       paymentMethod,
       bankOperationType,
-      counterpartyName: detectCounterpartyFromBlock(detailBlock),
+      counterpartyName,
+      bankMeta,
       source: "scanned",
     });
   }
@@ -251,6 +247,10 @@ function parseSepaXml(structuredXml, rawText = "", fallbackFileName = "") {
   const debtorIban = cleanText(pmtInf.DbtrAcct?.Id?.IBAN || "");
   const executionDate = cleanText(pmtInf.ReqdExctnDt || root.GrpHdr?.CreDtTm || "").slice(0, 10);
   const currency = cleanText(pmtInf.DbtrAcct?.Ccy || "EUR").toUpperCase() || "EUR";
+  const ctrlSumRaw = pmtInf.CtrlSum ?? root.GrpHdr?.CtrlSum ?? null;
+  const ctrlSum = Number(ctrlSumRaw);
+  const nbOfTxsRaw = pmtInf.NbOfTxs ?? root.GrpHdr?.NbOfTxs ?? txList.length;
+  const nbOfTxs = Number(nbOfTxsRaw);
 
   const operations = txList.map((tx, index) => {
     const amountNode = tx.Amt?.InstdAmt || {};
@@ -286,6 +286,8 @@ function parseSepaXml(structuredXml, rawText = "", fallbackFileName = "") {
       type: "invoice",
       label: `SEPA scanné — ${paymentInfoId}`,
       executionDate: executionDate || null,
+      totalAmount: Number.isNaN(ctrlSum) ? totalAmount : ctrlSum,
+      numberOfTransactions: Number.isNaN(nbOfTxs) ? operations.length : nbOfTxs,
       debtorName: debtorName || null,
       debtorIban: debtorIban || null,
       debtorCurrency: currency,

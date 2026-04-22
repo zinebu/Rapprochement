@@ -10,6 +10,7 @@ import Rapprochement from "./pages/Rapprochement";
 import ImportPage from "./pages/Import";
 import Factures from "./pages/Factures";
 import Banque from "./pages/Banque";
+import SepaPage from "./pages/Sepa";
 import Affacturage from "./pages/Affacturage";
 import TVA from "./pages/TVA";
 import Parametres from "./pages/Parametres";
@@ -46,6 +47,7 @@ const App = () => (
             <Route path="/import" element={<ImportPage />} />
             <Route path="/factures" element={<Factures />} />
             <Route path="/banque" element={<Banque />} />
+            <Route path="/sepa" element={<SepaPage />} />
             <Route path="/affacturage" element={<Affacturage />} />
             <Route path="/tva" element={<TVA />} />
             <Route path="/parametres" element={<Parametres />} />

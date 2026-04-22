@@ -27,6 +27,19 @@ export async function createPurchaseInvoice(data) {
 export async function listPurchaseInvoices() {
   return await PurchaseInvoice.find().sort({ createdAt: -1 });
 }
+
+export async function updatePurchaseInvoicesStatusByIds(ids, status) {
+  if (!Array.isArray(ids) || ids.length === 0) return { matchedCount: 0, modifiedCount: 0 };
+  const result = await PurchaseInvoice.updateMany(
+    { _id: { $in: ids } },
+    { $set: { status } }
+  );
+  return {
+    matchedCount: Number(result?.matchedCount || 0),
+    modifiedCount: Number(result?.modifiedCount || 0),
+  };
+}
+
 export async function deletePurchaseInvoiceById(id) {
   return await PurchaseInvoice.findByIdAndDelete(id);
 }
