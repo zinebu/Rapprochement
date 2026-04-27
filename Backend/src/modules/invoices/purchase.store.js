@@ -43,3 +43,12 @@ export async function updatePurchaseInvoicesStatusByIds(ids, status) {
 export async function deletePurchaseInvoiceById(id) {
   return await PurchaseInvoice.findByIdAndDelete(id);
 }
+
+export async function updatePurchaseInvoiceById(id, fields) {
+  if (!id || !fields || typeof fields !== "object") return null;
+  return await PurchaseInvoice.findByIdAndUpdate(
+    id,
+    { $set: fields },
+    { new: true }
+  );
+}

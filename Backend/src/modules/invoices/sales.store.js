@@ -43,3 +43,12 @@ export async function updateSalesInvoicesStatusByIds(ids, status) {
 export async function deleteSalesInvoiceById(id) {
   return await SalesInvoice.findByIdAndDelete(id);
 }
+
+export async function updateSalesInvoiceById(id, fields) {
+  if (!id || !fields || typeof fields !== "object") return null;
+  return await SalesInvoice.findByIdAndUpdate(
+    id,
+    { $set: fields },
+    { new: true }
+  );
+}

@@ -151,6 +151,9 @@ export {
   ArrowUpRight,
   Save,
   SlidersHorizontal,
+  Pencil,
+  CalendarPlus,
+  X,
 } from "lucide-react";
 
 // Charts

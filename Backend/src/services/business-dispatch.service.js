@@ -64,6 +64,49 @@ async function sendToReview(documentId, reason, extra = {}) {
   };
 }
 
+/**
+ * Determine invoice nature (purchase / sales) using SIRET matching against
+ * the company's own SIRET from env (COMPANY_SIRET).
+ *
+ * Rules (in priority order):
+ *   1. If recipient SIRET === company SIRET → purchase (we received the invoice) — high confidence
+ *   2. If issuer SIRET === company SIRET:
+ *        - OCR often picks up the company letterhead/stamp as issuer even on
+ *          purchase invoices. We therefore trust DEFAULT_INVOICE_NATURE here.
+ *        - Only return "sales" when DEFAULT_INVOICE_NATURE is explicitly "sales".
+ *   3. No SIRET match → fall back to DEFAULT_INVOICE_NATURE, then aiNature.
+ *
+ * DEFAULT_INVOICE_NATURE (env) lets operators configure the expected default
+ * for their workflow (e.g. "purchase" when all imports are supplier invoices).
+ */
+function resolveInvoiceNature(merged, local, aiNature) {
+  const companySiret = String(process.env.COMPANY_SIRET || "").trim().replace(/\s/g, "");
+  const defaultNature = String(process.env.DEFAULT_INVOICE_NATURE || "").trim().toLowerCase();
+  const fallback = defaultNature === "sales" || defaultNature === "purchase"
+    ? defaultNature
+    : (aiNature || "purchase");
+
+  if (companySiret) {
+    const issuerSiret    = String(merged.issuerSiret    || local?.issuer?.siret    || "").trim().replace(/\s/g, "");
+    const recipientSiret = String(merged.recipientSiret || local?.recipient?.siret || "").trim().replace(/\s/g, "");
+
+    const issuerIsCompany    = Boolean(issuerSiret    && issuerSiret    === companySiret);
+    const recipientIsCompany = Boolean(recipientSiret && recipientSiret === companySiret);
+
+    // High-confidence: recipient SIRET matches → we are the buyer
+    if (recipientIsCompany && !issuerIsCompany) return "purchase";
+
+    // Issuer SIRET matches company: OCR often confuses our letterhead/stamp
+    // with the issuer on received invoices — trust the configured default.
+    if (issuerIsCompany && !recipientIsCompany) return fallback;
+
+    // Both match (intra-group invoice): trust default
+    if (issuerIsCompany && recipientIsCompany) return fallback;
+  }
+
+  return fallback;
+}
+
 export async function dispatchBusinessDocument(document) {
   const {
     detectedType,
@@ -84,10 +127,14 @@ export async function dispatchBusinessDocument(document) {
     return await sendToReview(documentId, "Document non reconnu comme facture");
   }
 
-  const effectiveNature =
+  const localNature =
     local.invoiceNature && local.invoiceNature !== "unknown"
       ? local.invoiceNature
-      : invoiceNature;
+      : null;
+
+  const aiNature = invoiceNature && invoiceNature !== "unknown" ? invoiceNature : null;
+
+  const effectiveNature = resolveInvoiceNature(merged, local, localNature || aiNature);
 
   const resolvedCurrency = pickField(merged.currency, null, null);
 
@@ -153,18 +200,40 @@ export async function dispatchBusinessDocument(document) {
   }
 
   if (effectiveNature === "purchase") {
+    // When OCR confuses our own company name as the issuer, the real supplier
+    // is the OTHER party. Detect this by comparing extracted names against
+    // COMPANY_NAME (env). If issuerName looks like our own company, use the
+    // recipientName as the supplier instead (or vice-versa with SIRETs).
+    const companyName = String(process.env.COMPANY_NAME || "").trim().toLowerCase();
+    const companySiretEnv = String(process.env.COMPANY_SIRET || "").trim().replace(/\s/g, "");
+
+    const rawIssuerName   = String(merged.issuerName    || local?.issuer?.name    || "").trim();
+    const rawIssuerSiret  = String(merged.issuerSiret   || local?.issuer?.siret   || "").trim().replace(/\s/g, "");
+    const rawRecipName    = String(merged.recipientName || local?.recipient?.name || "").trim();
+    const rawRecipSiret   = String(merged.recipientSiret || local?.recipient?.siret || "").trim().replace(/\s/g, "");
+
+    const issuerLooksLikeOurCompany =
+      (companyName && rawIssuerName.toLowerCase() === companyName) ||
+      (companySiretEnv && rawIssuerSiret === companySiretEnv);
+
+    const recipLooksLikeOurCompany =
+      (companyName && rawRecipName.toLowerCase() === companyName) ||
+      (companySiretEnv && rawRecipSiret === companySiretEnv);
+
+    // If issuer is our company but recipient is not → the parser swapped them.
+    // The real supplier is the "recipient" in the parsed data.
+    const resolvedSupplierName = issuerLooksLikeOurCompany && !recipLooksLikeOurCompany
+      ? rawRecipName || rawIssuerName || "Fournisseur inconnu"
+      : rawIssuerName || rawRecipName || "Fournisseur inconnu";
+
+    const resolvedSupplierSiret = issuerLooksLikeOurCompany && !recipLooksLikeOurCompany
+      ? (rawRecipSiret || rawIssuerSiret || null)
+      : (rawIssuerSiret || rawRecipSiret || null);
+
     const payload = {
       ...invoicePayload,
-      supplierName: pickField(
-        merged.issuerName,
-        local?.issuer?.name,
-        "Fournisseur inconnu"
-      ),
-      supplierSiret: pickField(
-        merged.issuerSiret,
-        local?.issuer?.siret,
-        null
-      ),
+      supplierName: resolvedSupplierName,
+      supplierSiret: resolvedSupplierSiret || null,
     };
 
     try {

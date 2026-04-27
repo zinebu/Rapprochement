@@ -42,6 +42,72 @@ type ExtractedFields = {
   currency?: string | null;
 };
 
+function mapStructuredInvoiceToFields(structured: any): ExtractedFields {
+  if (!structured || structured.documentType !== "invoice") return {};
+  return {
+    vendorCustomer: structured.vendorCustomer ?? null,
+    issuerName: structured.issuer?.name ?? null,
+    issuerSiret: structured.issuer?.siret ?? null,
+    recipientName: structured.recipient?.name ?? null,
+    recipientSiret: structured.recipient?.siret ?? null,
+    invoiceNumber: structured.invoiceNumber ?? null,
+    invoiceDate: structured.invoiceDate ?? null,
+    dueDate: structured.dueDate ?? null,
+    amountInclVat: structured.amountInclVat ?? null,
+    amountNet: structured.amountNet ?? null,
+    vatAmount: structured.vatAmount ?? null,
+    vatNumber: structured.vatNumber ?? null,
+    reasonOfPayment: structured.reasonOfPayment ?? null,
+    iban: structured.iban ?? null,
+    swift: structured.swift ?? null,
+    counterpartyRole: structured.counterpartyRole ?? null,
+    currency: structured.currency ?? null,
+  };
+}
+
+function sanitizePartyNameValue(value: unknown): string | null {
+  if (value === null || value === undefined) return null;
+  const str = String(value).trim();
+  if (!str) return null;
+  const cut = str
+    .split(
+      /\b(?:total|montant|tva|ht\b|ttc\b|siret|siren|iban|bic|swift|r[èe]glement|date|facture|n[°º]|t[ée]l|email|@|adresse|page|esplanade|rue|avenue|boulevard)\b/i
+    )[0]
+    .trim();
+  const cleaned = cut
+    .replace(/[^A-Za-zÀ-ÿ0-9&'().,\-\/ ]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!cleaned) return null;
+  if (cleaned.length > 90) return cleaned.slice(0, 90).trim();
+  return cleaned;
+}
+
+function mergeInvoiceFields(
+  structured: ExtractedFields,
+  classification: ExtractedFields
+): ExtractedFields {
+  const merged: ExtractedFields = { ...classification, ...structured };
+  const keysToStripIfEmpty: (keyof ExtractedFields)[] = [
+    "issuerName",
+    "recipientName",
+    "vendorCustomer",
+    "invoiceNumber",
+    "invoiceDate",
+    "iban",
+  ];
+  for (const key of keysToStripIfEmpty) {
+    if (!merged[key] && classification[key]) {
+      (merged as any)[key] = classification[key];
+    }
+  }
+  for (const key of ["issuerName", "recipientName", "vendorCustomer"] as const) {
+    const sanitized = sanitizePartyNameValue(merged[key]);
+    (merged as any)[key] = sanitized;
+  }
+  return merged;
+}
+
 type ImportedFileItem = {
   id: string;
   file: File;
@@ -267,7 +333,9 @@ export default function ImportPage() {
         data?.document?.documentType ??
         (item.detectedCategory === "Facture" ? "invoice" : null);
 
-      const fields: ExtractedFields = data?.classification?.fields ?? {};
+      const fieldsFromClassification: ExtractedFields = data?.classification?.fields ?? {};
+      const fieldsFromStructured: ExtractedFields = mapStructuredInvoiceToFields(data?.structuredData);
+      const fields: ExtractedFields = mergeInvoiceFields(fieldsFromStructured, fieldsFromClassification);
       const invoiceNature =
         data?.classification?.invoiceNature ?? data?.document?.invoiceNature ?? null;
 
@@ -436,7 +504,9 @@ export default function ImportPage() {
             data?.document?.documentType ??
             (category === "Facture" ? "invoice" : null);
 
-          const fields: ExtractedFields = data?.classification?.fields ?? {};
+          const fieldsFromClassification: ExtractedFields = data?.classification?.fields ?? {};
+          const fieldsFromStructured: ExtractedFields = mapStructuredInvoiceToFields(data?.structuredData);
+          const fields: ExtractedFields = mergeInvoiceFields(fieldsFromStructured, fieldsFromClassification);
           const invoiceNature =
             data?.classification?.invoiceNature ?? data?.document?.invoiceNature ?? null;
 

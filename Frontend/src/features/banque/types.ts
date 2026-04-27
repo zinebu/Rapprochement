@@ -72,6 +72,7 @@ export type LocalTransaction = {
   unreconciledCategory?: UnreconciledCategory;
   unreconciledComment?: string;
   reviewFlag?: boolean;
+  sepaLineDecisions?: Record<string, SepaOperationDecision>;
 };
 
 export type PayrollSlip = {

@@ -50,8 +50,18 @@ export async function classifyImportDocumentAgent({ fileName, mimeType, extracte
   const parsed = await runJsonSchemaAgent({
     name: "import_classifier_agent",
     schema,
-    systemPrompt:
-      "Tu es l'Agent Import. Classe le document comptable avec rigueur.",
+    systemPrompt: `Tu es l'Agent Import.
+Classement STRICT et conservateur:
+- sepa_xml UNIQUEMENT si XML pain.001/pain.008 ou balises SEPA explicites.
+- bank_statement UNIQUEMENT si relevé/extrait de compte avec lignes d'opérations bancaires.
+- invoice UNIQUEMENT si facture (numéro facture, HT/TVA/TTC, émetteur/destinataire).
+- receipt UNIQUEMENT si ticket/reçu caisse.
+- Sinon unknown.
+Ne force jamais une classe "au feeling".
+Confidence:
+- >=0.9 seulement si preuves explicites.
+- <=0.6 si incertitude.
+Réponds uniquement selon le schéma.`,
     userPrompt: `
 Entreprise: ${COMPANY_IDENTITY.canonicalName}
 Fichier: ${fileName}

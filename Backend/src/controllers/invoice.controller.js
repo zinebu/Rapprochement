@@ -2,11 +2,13 @@ import {
   deletePurchaseInvoiceById,
   listPurchaseInvoices as listPurchaseInvoicesFromStore,
   updatePurchaseInvoicesStatusByIds,
+  updatePurchaseInvoiceById,
 } from "../modules/invoices/purchase.store.js";
 import {
   deleteSalesInvoiceById,
   listSalesInvoices as listSalesInvoicesFromStore,
   updateSalesInvoicesStatusByIds,
+  updateSalesInvoiceById,
 } from "../modules/invoices/sales.store.js";
 import { parseMoneyToNumber } from "../utils/amount.js";
 
@@ -144,6 +146,86 @@ export async function deleteInvoice(req, res) {
     console.error("deleteInvoice error:", error);
     return res.status(500).json({
       error: "Erreur pendant la suppression de la facture",
+      details: String(error),
+    });
+  }
+}
+
+function normalizeInvoiceDateInput(value) {
+  if (value === null) return null;
+  if (value === undefined) return undefined;
+  const str = String(value).trim();
+  if (!str) return null;
+  // Accept ISO (YYYY-MM-DD), DD/MM/YYYY, DD-MM-YYYY
+  const iso = /^(\d{4})-(\d{2})-(\d{2})$/;
+  const fr = /^(\d{2})[\/\-](\d{2})[\/\-](\d{4})$/;
+  if (iso.test(str)) return str;
+  const m = str.match(fr);
+  if (m) {
+    const [, dd, mm, yyyy] = m;
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  const d = new Date(str);
+  if (!Number.isNaN(d.getTime())) {
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd}`;
+  }
+  return undefined;
+}
+
+export async function updateInvoice(req, res) {
+  try {
+    const { id } = req.params;
+    const body = req.body || {};
+
+    const fields = {};
+    if (body.invoiceDate !== undefined) {
+      const normalized = normalizeInvoiceDateInput(body.invoiceDate);
+      if (normalized === undefined) {
+        return res.status(400).json({
+          error: "Format de date invalide (attendu: YYYY-MM-DD ou DD/MM/YYYY)",
+        });
+      }
+      fields.invoiceDate = normalized;
+    }
+    if (body.dueDate !== undefined) {
+      const normalized = normalizeInvoiceDateInput(body.dueDate);
+      if (normalized === undefined) {
+        return res.status(400).json({
+          error: "Format de date d'échéance invalide",
+        });
+      }
+      fields.dueDate = normalized;
+    }
+
+    if (Object.keys(fields).length === 0) {
+      return res.status(400).json({
+        error: "Aucun champ à mettre à jour",
+      });
+    }
+
+    let updated = await updatePurchaseInvoiceById(id, fields);
+    let type = "purchase";
+    if (!updated) {
+      updated = await updateSalesInvoiceById(id, fields);
+      type = "sales";
+    }
+
+    if (!updated) {
+      return res.status(404).json({ error: "Facture introuvable" });
+    }
+
+    return res.json({
+      success: true,
+      message: "Facture mise à jour",
+      invoice: toFrontInvoice(updated, type),
+    });
+  } catch (error) {
+    console.error("updateInvoice error:", error);
+    return res.status(500).json({
+      error: "Erreur pendant la mise à jour de la facture",
       details: String(error),
     });
   }

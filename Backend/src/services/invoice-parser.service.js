@@ -5,6 +5,26 @@ function cleanValue(value) {
   return value.replace(/\s+/g, " ").replace(/\u00A0/g, " ").trim();
 }
 
+function sanitizePartyName(value) {
+  const raw = cleanValue(String(value || ""));
+  if (!raw) return null;
+
+  // Cut noisy OCR tails that often contain amounts/addresses/legal text.
+  const cut = raw
+    .split(
+      /\b(?:total|montant|tva|siret|siren|iban|bic|swift|r[èe]glement|date|facture|n[°º]|t[ée]l|email|@|adresse|page)\b/i
+    )[0]
+    .trim();
+
+  // Keep only plausible company/person name characters.
+  const cleaned = cut.replace(/[^A-Za-zÀ-ÿ0-9&'().,\-\/ ]/g, " ").replace(/\s+/g, " ").trim();
+  if (!cleaned) return null;
+
+  // Avoid absurdly long names coming from OCR block concatenation.
+  if (cleaned.length > 90) return cleaned.slice(0, 90).trim();
+  return cleaned;
+}
+
 function normalize(value) {
   return (value || "")
     .toLowerCase()
@@ -51,14 +71,40 @@ function parseMoneyToNumber(value) {
   return Number.isNaN(parsed) ? null : parsed;
 }
 
+/** Returns true only for the MAIN company (CONSULT HIGHTECH), NOT for related entities. */
 function isOwnCompany(name = "", siret = "") {
-  const normalizedName = normalize(name);
-  const aliases = COMPANY_IDENTITY.aliases.map((a) => normalize(a));
-  const byName = aliases.some((alias) => normalizedName.includes(alias));
-  const bySiret =
-    String(siret || "").replace(/\D/g, "") === COMPANY_IDENTITY.siret;
+  const cleanSiret = String(siret || "").replace(/\D/g, "");
 
-  return byName || bySiret;
+  if (cleanSiret && cleanSiret === COMPANY_IDENTITY.siret) return true;
+
+  const normalizedName = normalize(name);
+  if (!normalizedName) return false;
+
+  return COMPANY_IDENTITY.aliases.map((a) => normalize(a)).some((alias) => {
+    if (normalizedName === alias) return true;
+    const escaped = alias.replace(/[-]/g, "[-\\s]?");
+    return new RegExp(`(^|\\s)${escaped}(\\s|$)`).test(normalizedName);
+  });
+}
+
+/**
+ * Returns the related entity config { name, siret } if the given name/siret
+ * matches one of the declared relatedEntities, otherwise null.
+ */
+function findRelatedEntity(name = "", siret = "") {
+  const entities = COMPANY_IDENTITY.relatedEntities || [];
+  const cleanSiret = String(siret || "").replace(/\D/g, "");
+  const normalizedName = normalize(name);
+
+  return entities.find((e) => {
+    if (cleanSiret && cleanSiret === e.siret) return true;
+    if (!normalizedName) return false;
+    return (e.aliases || [e.name]).map((a) => normalize(a)).some((alias) => {
+      if (normalizedName === alias) return true;
+      const escaped = alias.replace(/[-]/g, "[-\\s]?");
+      return new RegExp(`(^|\\s)${escaped}(\\s|$)`).test(normalizedName);
+    });
+  }) || null;
 }
 
 function parseFrDate(value) {
@@ -278,7 +324,7 @@ function extractRecipientFromClientLabel(text) {
   const match = text.match(
     /Date\s+Client\s+Page\s+[0-9]{2}\/[0-9]{2}\/[0-9]{4}\s+(.+?)\s+\d+\b/i
   );
-  return match ? cleanValue(match[1]) : null;
+  return match ? sanitizePartyName(match[1]) : null;
 }
 
 function extractTopCompany(lines) {
@@ -292,8 +338,37 @@ function extractTopCompany(lines) {
     }
 
     if (line.length >= 3 && /[A-Za-z]/.test(line)) {
-      return cleanValue(line);
+      return sanitizePartyName(line);
     }
+  }
+  return null;
+}
+
+/**
+ * Scan lines to find a company name that is NOT our own company.
+ * Searches wider than extractTopCompany (up to 30 lines) and explicitly
+ * skips lines that match COMPANY_IDENTITY aliases / SIRET.
+ * Used to identify the true issuer when our company appears first in the OCR.
+ */
+function extractOtherCompanyName(lines) {
+  for (const line of lines.slice(0, 30)) {
+    if (
+      /facture|date|client|page|reference|montant|total|iban|bic|net a payer|devise|échéance|siret|siren|tva|rcs|capital|adresse|immatricul/i.test(
+        line
+      )
+    ) {
+      continue;
+    }
+
+    if (line.length < 2 || !/[A-Za-z]/.test(line)) continue;
+    if (/^\d[\d\s]*$/.test(line.trim())) continue; // skip pure numbers
+
+    const cleaned = sanitizePartyName(line);
+    if (!cleaned) continue;
+
+    if (isOwnCompany(cleaned)) continue; // skip our own company name
+
+    return cleaned;
   }
   return null;
 }
@@ -311,7 +386,7 @@ function extractFooterCompany(lines) {
     }
 
     if (line.length >= 3 && /[A-Za-z]/.test(line)) {
-      return cleanValue(line);
+      return sanitizePartyName(line);
     }
   }
 
@@ -377,44 +452,88 @@ function detectParties(text) {
     address: null,
   };
 
+  // Case 1: "Date Client Page ... XX/XX/XXXX <ClientName> N/N" pattern found.
+  // The extracted name is the CLIENT (recipient of the invoice).
   if (explicitClient) {
-    issuer.name = COMPANY_IDENTITY.canonicalName;
-    issuer.siret = COMPANY_IDENTITY.siret;
-    recipient.name = explicitClient;
-  }
-
-  if (!issuer.name && ownIndex >= 0) {
-    recipient.name = cleanValue(lines[ownIndex]);
-    recipient.siret = COMPANY_IDENTITY.siret;
-
-    if (footerCompany && !isOwnCompany(footerCompany)) {
-      issuer.name = footerCompany;
-    } else if (topCompany && !isOwnCompany(topCompany)) {
-      issuer.name = topCompany;
+    const clientName = sanitizePartyName(explicitClient);
+    if (isOwnCompany(clientName)) {
+      // WE are the client → we RECEIVED this invoice → purchase (achat)
+      recipient.name = COMPANY_IDENTITY.canonicalName;
+      recipient.siret = COMPANY_IDENTITY.siret;
+      // The issuer is whoever is NOT us — look for a known entity or any other company name
+      const otherBySearch = extractOtherCompanyName(lines);
+      const otherByTop    = topCompany && !isOwnCompany(topCompany) ? topCompany : null;
+      const issuerName = otherBySearch || otherByTop;
+      if (issuerName) {
+        issuer.name = sanitizePartyName(issuerName);
+        const related = findRelatedEntity(issuer.name);
+        if (related) issuer.siret = related.siret;
+      }
+    } else {
+      // External client → we ISSUED this invoice → sale (vente)
+      issuer.name = COMPANY_IDENTITY.canonicalName;
+      issuer.siret = COMPANY_IDENTITY.siret;
+      recipient.name = clientName;
+      const related = findRelatedEntity(clientName);
+      if (related) recipient.siret = related.siret;
     }
   }
 
-  if (!issuer.name && topCompany) {
-    issuer.name = topCompany;
+  // Case 2: our main company name found in the document body, but no explicit client label
+  if (!issuer.name && !recipient.name && ownIndex >= 0) {
+    // We appear in the document — determine if we are issuer or recipient
+    const otherBySearch = extractOtherCompanyName(lines);
+    const otherByFooter = footerCompany && !isOwnCompany(footerCompany) ? footerCompany : null;
+    const otherByTop    = topCompany    && !isOwnCompany(topCompany)    ? topCompany    : null;
+    const otherName = otherBySearch || otherByFooter || otherByTop;
+    if (otherName) {
+      // Default: we are recipient (purchase), other company is issuer
+      issuer.name = sanitizePartyName(otherName);
+      const related = findRelatedEntity(issuer.name);
+      if (related) issuer.siret = related.siret;
+      recipient.name = COMPANY_IDENTITY.canonicalName;
+      recipient.siret = COMPANY_IDENTITY.siret;
+    }
+  }
+
+  // Case 3: no own-company anchor at all → use topCompany as issuer
+  if (!issuer.name) {
+    const candidate = extractOtherCompanyName(lines) || topCompany;
+    if (candidate) {
+      issuer.name = sanitizePartyName(candidate);
+    }
   }
 
   if (!recipient.name && explicitClient) {
-    recipient.name = explicitClient;
+    recipient.name = sanitizePartyName(explicitClient);
   }
 
-  issuer.siret =
-    issuer.siret ||
-    extractSiretNearCompany(lines, issuer.name) ||
-    extractSiret(text) ||
-    extractSiren(text);
+  // Issuer SIRET: already set from COMPANY_IDENTITY if issuer is us;
+  // otherwise look it up near their name, then fall back to first SIRET in doc.
+  if (!issuer.siret) {
+    if (issuer.name && isOwnCompany(issuer.name)) {
+      issuer.siret = COMPANY_IDENTITY.siret;
+    } else {
+      issuer.siret =
+        extractSiretNearCompany(lines, issuer.name) ||
+        extractSiret(text) ||
+        extractSiren(text);
+    }
+  }
 
   issuer.taxNumber =
     extractTaxNumberNearCompany(lines, issuer.name) || extractTaxNumber(text);
 
-  recipient.siret =
-    recipient.siret ||
-    extractSiretNearCompany(lines, recipient.name) ||
-    null;
+  // Recipient SIRET: already set if it was a known related entity;
+  // otherwise look it up near their name.
+  if (!recipient.siret) {
+    const relatedRec = recipient.name ? findRelatedEntity(recipient.name) : null;
+    if (relatedRec) {
+      recipient.siret = relatedRec.siret;
+    } else {
+      recipient.siret = extractSiretNearCompany(lines, recipient.name) || null;
+    }
+  }
 
   recipient.taxNumber =
     extractTaxNumberNearCompany(lines, recipient.name) || null;
@@ -472,7 +591,7 @@ export function extractInvoiceFieldsFromText(text) {
     issuer: parties.issuer,
     recipient: parties.recipient,
 
-    vendorCustomer: counterpartyName,
+    vendorCustomer: sanitizePartyName(counterpartyName),
     counterpartyRole,
 
     invoiceNumber: extractInvoiceNumber(normalized),

@@ -11,6 +11,7 @@ import reviewRoutes from "./src/routes/review.routes.js";
 import bridgeRoutes from "./src/routes/bridge.routes.js";
 import importRoutes from "./src/routes/import.routes.js";
 import reconciliationRoutes from "./src/routes/reconciliation.routes.js";
+import partnerRoutes from "./src/routes/partner.routes.js";
 import { connectMongo } from "./src/lib/mongoose.js";
 
 const app = express();
@@ -73,6 +74,7 @@ app.use("/api", invoiceRoutes);
 app.use("/api", importRoutes);
 app.use("/api", reconciliationRoutes);
 app.use("/api/bridge", bridgeRoutes);
+app.use("/api/partner", partnerRoutes);
 
 app.use((err, req, res, next) => {
   console.error("Unhandled error:", err);

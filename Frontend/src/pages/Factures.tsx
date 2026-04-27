@@ -33,6 +33,9 @@ import {
   ChevronRight,
   CheckCircle2,
   AlertCircle,
+  Check,
+  CalendarPlus,
+  X,
   Layers,
   Search,
   RotateCcw,
@@ -184,12 +187,18 @@ function formatCurrencyGroups(groups: CurrencyTotal[]) {
     .join(" · ");
 }
 
+const UNDATED_BLOCK_ID = "0000-00";
+
 function buildMonthlyBlocks(invoices: Invoice[]): InvoiceBlock[] {
   const groups = new Map<string, { label: string; invoices: Invoice[] }>();
+  const undated: Invoice[] = [];
 
   invoices.forEach((inv) => {
     const d = parseAppDate(inv.invoiceDate);
-    if (!d) return;
+    if (!d) {
+      undated.push(inv);
+      return;
+    }
 
     const key = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
     const label = `${monthLabels[d.getMonth()]} ${d.getFullYear()}`;
@@ -223,7 +232,24 @@ function buildMonthlyBlocks(invoices: Invoice[]): InvoiceBlock[] {
     });
   });
 
-  return blocks.sort((a, b) => b.id.localeCompare(a.id));
+  if (undated.length > 0) {
+    const pendingUndated = undated.filter((i) => i.status !== "rapprochée");
+    blocks.push({
+      id: UNDATED_BLOCK_ID,
+      label: "Sans date",
+      invoices: undated,
+      totalGrossByCurrency: sumByCurrency(undated),
+      totalPendingByCurrency: sumByCurrency(pendingUndated),
+      overdueCount: 0,
+      allReconciled: undated.every((i) => isInvoiceReconciled(i)),
+    });
+  }
+
+  return blocks.sort((a, b) => {
+    if (a.id === UNDATED_BLOCK_ID) return 1;
+    if (b.id === UNDATED_BLOCK_ID) return -1;
+    return b.id.localeCompare(a.id);
+  });
 }
 
 function getFullPdfUrl(pdfUrl?: string | null) {
@@ -268,6 +294,9 @@ export default function Factures() {
   const [processingReviewId, setProcessingReviewId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [manualCurrencies, setManualCurrencies] = useState<Record<string, CurrencyCode | "">>({});
+  const [editingDateId, setEditingDateId] = useState<string | null>(null);
+  const [editingDateValue, setEditingDateValue] = useState<string>("");
+  const [savingDateId, setSavingDateId] = useState<string | null>(null);
 
   const loadInvoices = async () => {
     try {
@@ -396,6 +425,55 @@ export default function Factures() {
       toast.error("Impossible de supprimer cette facture.");
     } finally {
       setDeletingId(null);
+    }
+  };
+
+  const startEditingDate = (invoice: Invoice) => {
+    const current = invoice.invoiceDate || "";
+    const d = parseAppDate(current);
+    if (d) {
+      const yyyy = d.getFullYear();
+      const mm = String(d.getMonth() + 1).padStart(2, "0");
+      const dd = String(d.getDate()).padStart(2, "0");
+      setEditingDateValue(`${yyyy}-${mm}-${dd}`);
+    } else {
+      setEditingDateValue("");
+    }
+    setEditingDateId(invoice.id);
+  };
+
+  const cancelEditingDate = () => {
+    setEditingDateId(null);
+    setEditingDateValue("");
+  };
+
+  const saveInvoiceDate = async (invoice: Invoice) => {
+    if (!editingDateValue) {
+      toast.error("Sélectionnez une date valide.");
+      return;
+    }
+    try {
+      setSavingDateId(invoice.id);
+      const response = await fetch(
+        `${API_BASE_URL}/api/invoices/${invoice.id}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ invoiceDate: editingDateValue }),
+        }
+      );
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(data?.error || "Erreur pendant la mise à jour");
+      }
+      toast.success("Date de facture mise à jour.");
+      cancelEditingDate();
+      await loadInvoices();
+    } catch (error) {
+      console.error("Erreur mise à jour date facture:", error);
+      toast.error("Impossible de mettre à jour la date.");
+    } finally {
+      setSavingDateId(null);
     }
   };
 
@@ -723,7 +801,50 @@ export default function Factures() {
                               </TableCell>
 
                               <TableCell className="text-sm">
-                                {safeFormatDate(inv.invoiceDate)}
+                                {!parseAppDate(inv.invoiceDate) ? (
+                                  editingDateId === inv.id ? (
+                                    <div className="flex items-center gap-1.5">
+                                      <Input
+                                        type="date"
+                                        value={editingDateValue}
+                                        onChange={(e) => setEditingDateValue(e.target.value)}
+                                        className="h-8 w-[150px] text-xs"
+                                      />
+                                      <Button
+                                        variant="default"
+                                        size="sm"
+                                        className="h-8 px-2"
+                                        disabled={savingDateId === inv.id || !editingDateValue}
+                                        onClick={() => saveInvoiceDate(inv)}
+                                        title="Enregistrer la date"
+                                      >
+                                        <Check className="h-3.5 w-3.5" />
+                                      </Button>
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        className="h-8 px-2"
+                                        disabled={savingDateId === inv.id}
+                                        onClick={cancelEditingDate}
+                                        title="Annuler"
+                                      >
+                                        <X className="h-3.5 w-3.5" />
+                                      </Button>
+                                    </div>
+                                  ) : (
+                                    <Button
+                                      variant="outline"
+                                      size="sm"
+                                      className="h-8 gap-1.5 text-xs"
+                                      onClick={() => startEditingDate(inv)}
+                                    >
+                                      <CalendarPlus className="h-3.5 w-3.5" />
+                                      Ajouter une date
+                                    </Button>
+                                  )
+                                ) : (
+                                  safeFormatDate(inv.invoiceDate)
+                                )}
                               </TableCell>
 
                               <TableCell>
