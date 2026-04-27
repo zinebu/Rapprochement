@@ -10,6 +10,7 @@ import {
   sendImportToFactures,
   deleteImportById,
   saveImportReconciliation,
+  serveImportFile,
 } from "../controllers/import.controller.js";
 
 const router = Router();
@@ -56,6 +57,7 @@ const upload = multer({
 router.post("/import/upload", requireAuth, upload.single("file"), uploadDocument);
 router.post("/imports/:id/send", requireAuth, sendImportToFactures);
 router.get("/imports", requireAuth, listImports);
+router.get("/imports/:id/file", requireAuth, serveImportFile);
 router.get("/imports/:id", requireAuth, getImportById);
 router.delete("/imports/:id", requireAuth, deleteImportById);
 router.post("/imports/:id/reconciliation", requireAuth, saveImportReconciliation);

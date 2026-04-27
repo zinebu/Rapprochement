@@ -7,6 +7,7 @@ export async function createImportedDocument(data) {
     mimeType: data.mimeType ?? null,
     filePath: data.filePath ?? null,
     fileUrl: data.fileUrl ?? null,
+    fileData: data.fileData ?? null,
     extractedText: data.extractedText ?? null,
     extractionMethod: data.extractionMethod ?? null,
     documentType: data.documentType ?? null,
@@ -19,10 +20,16 @@ export async function createImportedDocument(data) {
 }
 
 export async function listImportedDocuments() {
-  return await ImportedDocument.find().sort({ createdAt: -1 });
+  // Exclude heavy binary field from list queries
+  return await ImportedDocument.find().select("-fileData").sort({ createdAt: -1 });
 }
 
 export async function getImportedDocumentById(id) {
+  // Exclude binary data by default; serveImportFile fetches it separately
+  return await ImportedDocument.findById(id).select("-fileData");
+}
+
+export async function getImportedDocumentWithFileById(id) {
   return await ImportedDocument.findById(id);
 }
 

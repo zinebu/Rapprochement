@@ -2,10 +2,11 @@ import {
   createImportedDocument,
   listImportedDocuments,
   getImportedDocumentById,
+  getImportedDocumentWithFileById,
   updateImportedDocument,
   deleteImportedDocument,
 } from "../storage/import.store.js";
-import fs from "fs";
+import fs from "fs/promises";
 import { dispatchBusinessDocument } from "../services/business-dispatch.service.js";
 import { extractDocumentContent } from "../services/file-extractor.service.js";
 import { extractInvoiceFieldsFromText } from "../services/invoice-parser.service.js";
@@ -492,7 +493,16 @@ export async function runImportPipelineForFile(file) {
   const finalDocumentType =
     structuredData?.documentType || classification.label || null;
 
-  const fileUrl = `/uploads/${file.filename}`;
+  // Read file bytes so they can be stored in MongoDB (no local disk dependency).
+  let fileData = null;
+  try {
+    fileData = await fs.readFile(file.path);
+  } catch {
+    // Non-blocking: file content unavailable but metadata is still saved.
+  }
+
+  // The canonical URL now points to the API endpoint so it works on any server.
+  const fileUrl = `/api/imports/__ID__/file`;
 
   const document = await createImportedDocument({
     fileName: file.filename,
@@ -500,6 +510,7 @@ export async function runImportPipelineForFile(file) {
     mimeType: file.mimetype,
     filePath: file.path,
     fileUrl,
+    fileData,
     extractedText: extracted.text || null,
     extractionMethod: extracted.method || extracted.kind || null,
     documentType: finalDocumentType,
@@ -515,6 +526,12 @@ export async function runImportPipelineForFile(file) {
     },
     structuredData,
   });
+
+  // Patch the fileUrl with the real document ID now that it is known.
+  if (document?._id) {
+    document.fileUrl = `/api/imports/${document._id}/file`;
+    await document.save();
+  }
 
   return {
     document,
@@ -751,11 +768,11 @@ export async function deleteImportById(req, res) {
       });
     }
 
-    if (document.filePath && fs.existsSync(document.filePath)) {
+    if (document.filePath) {
       try {
-        fs.unlinkSync(document.filePath);
-      } catch (fileError) {
-        console.warn("Suppression fichier import échouée:", fileError);
+        await fs.unlink(document.filePath);
+      } catch {
+        // File may not exist on the server — not critical.
       }
     }
 
@@ -771,6 +788,47 @@ export async function deleteImportById(req, res) {
       error: "Erreur pendant la suppression de l'import",
       details: String(error),
     });
+  }
+}
+
+/**
+ * Serve the original file bytes stored in MongoDB.
+ * Falls back to disk if fileData is not in DB (legacy documents).
+ */
+export async function serveImportFile(req, res) {
+  try {
+    const { id } = req.params;
+    const document = await getImportedDocumentWithFileById(id);
+
+    if (!document) {
+      return res.status(404).json({ error: "Document introuvable" });
+    }
+
+    const mimeType = document.mimeType || "application/octet-stream";
+    const fileName = encodeURIComponent(document.originalName || document.fileName || "file");
+
+    res.setHeader("Content-Type", mimeType);
+    res.setHeader("Content-Disposition", `inline; filename="${fileName}"`);
+
+    // Prefer DB-stored bytes
+    if (document.fileData && document.fileData.length > 0) {
+      return res.send(document.fileData);
+    }
+
+    // Legacy fallback: serve from disk
+    if (document.filePath) {
+      try {
+        const data = await fs.readFile(document.filePath);
+        return res.send(data);
+      } catch {
+        // File not found on disk
+      }
+    }
+
+    return res.status(404).json({ error: "Fichier non disponible" });
+  } catch (error) {
+    console.error("serveImportFile error:", error);
+    return res.status(500).json({ error: "Erreur lors de la récupération du fichier" });
   }
 }
 

@@ -7,6 +7,7 @@ const ImportedDocumentSchema = new mongoose.Schema(
     mimeType: String,
     filePath: String,
     fileUrl: String,
+    fileData: { type: Buffer, default: null },
     extractedText: String,
     extractionMethod: String,
     documentType: String,
