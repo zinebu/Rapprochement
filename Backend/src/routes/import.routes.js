@@ -11,6 +11,7 @@ import {
   deleteImportById,
   saveImportReconciliation,
   serveImportFile,
+  migrateFilesToDb,
 } from "../controllers/import.controller.js";
 
 const router = Router();
@@ -55,6 +56,7 @@ const upload = multer({
 });
 
 router.post("/import/upload", requireAuth, upload.single("file"), uploadDocument);
+router.post("/imports/migrate-files", requireAuth, migrateFilesToDb);
 router.post("/imports/:id/send", requireAuth, sendImportToFactures);
 router.get("/imports", requireAuth, listImports);
 router.get("/imports/:id/file", requireAuth, serveImportFile);

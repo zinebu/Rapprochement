@@ -6,7 +6,13 @@ import {
   updateImportedDocument,
   deleteImportedDocument,
 } from "../storage/import.store.js";
+import { ImportedDocument } from "../models/ImportedDocument.js";
 import fs from "fs/promises";
+import pathModule from "path";
+import { fileURLToPath } from "url";
+
+const __filenameCtrl = fileURLToPath(import.meta.url);
+const __dirnameCtrl = pathModule.dirname(__filenameCtrl);
 import { dispatchBusinessDocument } from "../services/business-dispatch.service.js";
 import { extractDocumentContent } from "../services/file-extractor.service.js";
 import { extractInvoiceFieldsFromText } from "../services/invoice-parser.service.js";
@@ -883,6 +889,66 @@ export async function saveImportReconciliation(req, res) {
     console.error("saveImportReconciliation error:", error);
     return res.status(500).json({
       error: "Erreur pendant la sauvegarde du rapprochement",
+      details: String(error),
+    });
+  }
+}
+
+/**
+ * Migration: for every document whose fileUrl still points to /uploads/...,
+ * read the file from disk, store it in MongoDB, and update the fileUrl to the
+ * new /api/imports/:id/file endpoint.
+ *
+ * This must be run once on the server that has the files on disk.
+ */
+export async function migrateFilesToDb(req, res) {
+  try {
+    // Uploads folder is two levels up from controllers → Backend/uploads
+    const uploadsDir = pathModule.resolve(__dirnameCtrl, "../../uploads");
+
+    const docs = await ImportedDocument.find({
+      fileUrl: { $regex: "^/uploads/" },
+      $or: [{ fileData: null }, { fileData: { $exists: false } }],
+    }).select("_id fileName filePath fileUrl mimeType");
+
+    let migrated = 0;
+    let skipped = 0;
+    const errors = [];
+
+    for (const doc of docs) {
+      // Derive disk path: use filePath if stored, otherwise build from uploads dir
+      const diskPath = doc.filePath && doc.filePath.includes(pathModule.sep)
+        ? doc.filePath
+        : pathModule.join(uploadsDir, doc.fileName);
+
+      try {
+        const data = await fs.readFile(diskPath);
+        await ImportedDocument.updateOne(
+          { _id: doc._id },
+          {
+            fileData: data,
+            fileUrl: `/api/imports/${doc._id}/file`,
+          }
+        );
+        migrated++;
+      } catch {
+        // File not on this disk — skip
+        skipped++;
+        errors.push({ id: String(doc._id), file: doc.fileName });
+      }
+    }
+
+    return res.json({
+      success: true,
+      total: docs.length,
+      migrated,
+      skipped,
+      errors,
+    });
+  } catch (error) {
+    console.error("migrateFilesToDb error:", error);
+    return res.status(500).json({
+      error: "Erreur pendant la migration des fichiers",
       details: String(error),
     });
   }
