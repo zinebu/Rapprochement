@@ -50,6 +50,7 @@ import type {
   PaymentMethod,
   ReconciliationFilter,
   SepaOperationCandidate,
+  SepaCombination,
   SepaOperationDecision,
   SepaOperationDecisionStatus,
   UnreconciledCategory,
@@ -203,6 +204,81 @@ export default function Banque() {
   const isOwnCompanyName = (name?: string | null) => {
     const n = normalizeText(name || "");
     return ownCompanyAliases.some((alias) => n.includes(alias));
+  };
+
+  const supplierNameLooksSame = (a?: string | null, b?: string | null) => {
+    const na = normalizeText(a || "");
+    const nb = normalizeText(b || "");
+    if (!na || !nb) return false;
+    if (na === nb) return true;
+    const stopWords = new Set([
+      "consult",
+      "consulting",
+      "groupe",
+      "holding",
+      "services",
+      "service",
+      "solutions",
+      "solution",
+      "company",
+      "societe",
+      "société",
+      "entreprise",
+      "international",
+      "france",
+      "europe",
+      "eurl",
+      "sarl",
+      "sas",
+      "sasu",
+      "sa",
+      "ei",
+      "it",
+    ]);
+    const tokenize = (s: string) =>
+      s.split(/\s+/).filter((w) => w.length >= 4 && !stopWords.has(w));
+    const wa = tokenize(na);
+    const wb = tokenize(nb);
+    if (wa.length === 0 || wb.length === 0) return false;
+    return wa.some((w) => wb.includes(w));
+  };
+
+  const buildSupplierFallbackCombo = (
+    targetAmountAbs: number,
+    supplierName: string,
+    invoices: LocalInvoice[],
+  ): SepaCombination[] => {
+    if (!targetAmountAbs || !supplierName) return [];
+    const supplierInvoices = invoices.filter((inv) => {
+      const status = String(inv.status || "").toLowerCase();
+      const isReconciled =
+        status === "rapprochée" || status === "rapprochee" || status === "reconciled";
+      return (
+        !isReconciled &&
+        Number(inv.amountGross || 0) > 0 &&
+        supplierNameLooksSame(supplierName, inv.vendorCustomer)
+      );
+    });
+    if (supplierInvoices.length === 0) return [];
+    const total = supplierInvoices.reduce((sum, inv) => sum + Number(inv.amountGross || 0), 0);
+    const diff = Math.abs(total - targetAmountAbs);
+    if (diff > 1.5) return [];
+    return [
+      {
+        invoiceIds: supplierInvoices.map((inv) => String(inv.id)),
+        invoices: supplierInvoices.map((inv) => ({
+          id: String(inv.id),
+          invoiceNumber: inv.invoiceNumber,
+          vendorCustomer: inv.vendorCustomer,
+          amountGross: Number(inv.amountGross || 0),
+        })),
+        totalAmount: Math.round(total * 100) / 100,
+        diff: Math.round(diff * 100) / 100,
+        score: diff === 0 ? 100 : 95,
+        reason: `Fournisseur SEPA identifié · Combinaison de ${supplierInvoices.length} factures · Montant exact`,
+        matchType: "supplier",
+      },
+    ];
   };
 
   const getCounterpartyDisplay = (txn: LocalTransaction) => {
@@ -697,6 +773,8 @@ export default function Banque() {
     payrollOnly,
   ]);
 
+  const [aiSuggestionAvailableByTxn, setAiSuggestionAvailableByTxn] = useState<Record<string, boolean>>({});
+
   const linkedInvoiceIdsAcrossDecisions = useMemo(() => {
     return (Object.values(sepaLineDecisions) as SepaOperationDecision[]).flatMap(
       (decision) => decision.selectedInvoiceIds
@@ -704,10 +782,123 @@ export default function Banque() {
   }, [sepaLineDecisions]);
 
   const [manualSuggestions, setManualSuggestions] = useState<SepaOperationCandidate[]>([]);
+  const [aiScoreCacheByTxn, setAiScoreCacheByTxn] = useState<Record<string, any>>({});
+  const [sepaFirstOpCacheByTxn, setSepaFirstOpCacheByTxn] = useState<
+    Record<string, { opId: string; suggestions: SepaOperationCandidate[]; combinations: SepaCombination[] }>
+  >({});
   const [dialogSepaSuggestions, setDialogSepaSuggestions] = useState<Record<string, SepaOperationCandidate[]>>({});
+  const [dialogSepaCombinations, setDialogSepaCombinations] = useState<Record<string, SepaCombination[]>>({});
+  const [batchLevelCombinations, setBatchLevelCombinations] = useState<SepaCombination[]>([]);
   const [dialogSepaLoading, setDialogSepaLoading] = useState(false);
   const autoReconciledRef = useRef<Set<string>>(new Set());
+  const manualSuggestionsReqRef = useRef(0);
   const AUTO_RECONCILE_THRESHOLD = 95;
+
+  useEffect(() => {
+    const checkAiSuggestionsAvailability = async () => {
+      if (!realInvoices.length) {
+        setAiSuggestionAvailableByTxn({});
+        return;
+      }
+
+      const openInvoices = realInvoices.filter((inv) => {
+        const status = String(inv.status || "").toLowerCase();
+        return !["rapprochée", "rapprochee", "reconciled"].includes(status);
+      });
+      if (!openInvoices.length) {
+        setAiSuggestionAvailableByTxn({});
+        return;
+      }
+
+      // Limit calls to visible top rows for responsiveness.
+      const targets = filteredTxns
+        .filter((txn) => txn.reconciledStatus !== "rapproché")
+        .slice(0, 25);
+
+      const entries = await Promise.all(
+        targets.map(async (txn) => {
+          try {
+            const res = await fetch("/api/reconciliation/score", {
+              method: "POST",
+              credentials: "include",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                transaction: txn,
+                invoices: openInvoices,
+              }),
+            });
+            const data = await res.json().catch(() => ({}));
+            const scoring = String(data?.scoring || "");
+            const hasAi = scoring.includes("ai");
+            const hasAnySuggestion =
+              (Array.isArray(data?.suggestions) && data.suggestions.length > 0) ||
+              (Array.isArray(data?.combinations) && data.combinations.length > 0);
+            return [txn.id, hasAi && hasAnySuggestion, data] as const;
+          } catch {
+            return [txn.id, false, null] as const;
+          }
+        })
+      );
+
+      const next: Record<string, boolean> = {};
+      const cacheNext: Record<string, any> = {};
+      const sepaPrefetchNext: Record<string, { opId: string; suggestions: SepaOperationCandidate[]; combinations: SepaCombination[] }> = {};
+      entries.forEach(([id, flag, data]) => {
+        next[id] = flag;
+        if (data) cacheNext[id] = data;
+      });
+
+      // Prefetch first SEPA line suggestions for instant dialog open.
+      await Promise.all(
+        targets.map(async (txn) => {
+          try {
+            if (!next[txn.id]) return;
+            const batch = findSepaBatchByReference(txn.reference);
+            if (!batch || !Array.isArray(batch.operations) || batch.operations.length === 0) return;
+            const firstOp = batch.operations[0];
+            const res = await fetch("/api/reconciliation/score", {
+              method: "POST",
+              credentials: "include",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                transaction: {
+                  id: `${txn.id}::${firstOp.id}`,
+                  sourceDocumentId: txn.sourceDocumentId,
+                  bankAccountId: txn.bankAccountId,
+                  txnDate: txn.txnDate,
+                  label: `${firstOp.creditorName} ${firstOp.remittanceInfo || ""}`.trim(),
+                  reference: firstOp.endToEndId || txn.reference,
+                  amount: -Math.abs(Number(firstOp.amount || 0)),
+                  balance: txn.balance,
+                  currency: firstOp.currency || txn.currency,
+                  operationType: "decaissement",
+                  paymentMethod: "SEPA",
+                  counterpartyName: firstOp.creditorName,
+                  reconciledStatus: "non_rapproché",
+                  matchedInvoiceIds: [],
+                  pendingInvoiceIds: [],
+                },
+                invoices: openInvoices,
+              }),
+            });
+            const scoreData = await res.json().catch(() => ({}));
+            if (!res.ok) return;
+            sepaPrefetchNext[txn.id] = buildSepaOpResultFromScorePayload(firstOp, txn, realInvoices, scoreData);
+          } catch {
+            // silent
+          }
+        })
+      );
+
+      setAiSuggestionAvailableByTxn(next);
+      setAiScoreCacheByTxn((prev) => ({ ...prev, ...cacheNext }));
+      if (Object.keys(sepaPrefetchNext).length > 0) {
+        setSepaFirstOpCacheByTxn((prev) => ({ ...prev, ...sepaPrefetchNext }));
+      }
+    };
+
+    void checkAiSuggestionsAvailability();
+  }, [filteredTxns, realInvoices]);
 
   const resolveInvoicesByIds = (ids?: string[]) => {
     if (!ids?.length) return [] as LocalInvoice[];
@@ -741,12 +932,260 @@ export default function Banque() {
     return Array.isArray(direct) ? direct : [];
   };
 
+  const buildSepaOpResultFromScorePayload = (
+    op: any,
+    selectedTxn: LocalTransaction,
+    candidates: LocalInvoice[],
+    data: any
+  ) => {
+    const opAmountAbs = Math.abs(Number(op.amount || 0));
+    const pseudoTxn = {
+      id: `${selectedTxn.id}::${op.id}`,
+      sourceDocumentId: selectedTxn.sourceDocumentId,
+      bankAccountId: selectedTxn.bankAccountId,
+      txnDate: selectedTxn.txnDate,
+      label: `${op.creditorName} ${op.remittanceInfo || ""}`.trim(),
+      reference: op.endToEndId || selectedTxn.reference,
+      amount: -opAmountAbs,
+      balance: selectedTxn.balance,
+      currency: op.currency || selectedTxn.currency,
+      operationType: "decaissement",
+      paymentMethod: "SEPA",
+      counterpartyName: op.creditorName,
+      reconciledStatus: "non_rapproché",
+      matchedInvoiceIds: [],
+      pendingInvoiceIds: [],
+    };
+
+    const scoreById = new Map<string, any>(
+      (Array.isArray(data?.suggestions) ? data.suggestions : []).map((s: any) => [String(s.invoiceId), s])
+    );
+    const rawCombos: SepaCombination[] = Array.isArray(data?.combinations)
+      ? (data.combinations as any[]).map((c) => ({
+          invoiceIds: Array.isArray(c.invoiceIds) ? c.invoiceIds.map(String) : [],
+          invoices: Array.isArray(c.invoices) ? c.invoices : [],
+          totalAmount: Number(c.totalAmount || 0),
+          diff: Number(c.diff || 0),
+          score: Number(c.score || 0),
+          reason: String(c.reason || ""),
+          matchType: (c.matchType === "supplier" || c.matchType === "amount") ? c.matchType : "amount",
+        }))
+      : [];
+    const fallbackCombos =
+      rawCombos.length === 0
+        ? buildSupplierFallbackCombo(opAmountAbs, op.creditorName || "", candidates)
+        : [];
+    const finalCombos = rawCombos.length > 0 ? rawCombos : fallbackCombos;
+
+    const enriched = candidates
+      .map((invoice) => {
+        const srv = scoreById.get(invoice.id);
+        if (!srv) return null;
+        const aiScore = Number(srv.score || 0);
+        const amountDiff = Math.abs(opAmountAbs - Number(invoice.amountGross || 0));
+        const amountRatio = opAmountAbs > 0 ? amountDiff / opAmountAbs : 1;
+        const labelRef = `${op.endToEndId || ""} ${op.remittanceInfo || ""}`.toLowerCase();
+        const invoiceNo = String(invoice.invoiceNumber || "").toLowerCase();
+        const vendor = String(invoice.vendorCustomer || "").toLowerCase();
+        const creditorName = String(op.creditorName || "");
+        const hasRefHit = invoiceNo.length >= 4 && labelRef.includes(invoiceNo);
+        const hasVendorHit =
+          vendor.length >= 4 &&
+          (labelRef.includes(vendor) ||
+            vendor.split(/\s+/).some((w) => w.length >= 4 && labelRef.includes(w)));
+        const hasCreditorSupplierHit = supplierNameLooksSame(creditorName, invoice.vendorCustomer || "");
+        const amountLooksPlausible = amountRatio <= 0.15;
+        const strongAmountMatch = amountRatio <= 0.03;
+
+        let score = aiScore;
+        if (amountRatio > 0.8) score -= 70;
+        else if (amountRatio > 0.5) score -= 45;
+        else if (amountRatio > 0.25) score -= 25;
+        if (hasRefHit) score += 12;
+        if (hasVendorHit) score += 8;
+        if (hasCreditorSupplierHit) score += 18;
+        score = Math.max(0, Math.min(100, Math.round(score)));
+
+        const passesBusinessGate = hasRefHit || hasCreditorSupplierHit || strongAmountMatch;
+        if (!passesBusinessGate) return null;
+        if (!hasCreditorSupplierHit && !hasRefHit && !amountLooksPlausible) return null;
+
+        const reasons = [];
+        if (Array.isArray(srv?.signals)) reasons.push(...srv.signals);
+        if (srv?.reason) reasons.push(String(srv.reason));
+        reasons.unshift(`Écart montant ligne: ${formatMoney(amountDiff, invoice.currency ?? pseudoTxn.currency)}`);
+        if (hasRefHit) reasons.unshift("Référence exacte détectée");
+        if (hasVendorHit) reasons.unshift("Tiers cohérent");
+        if (hasCreditorSupplierHit) reasons.unshift("Créancier SEPA cohérent avec le fournisseur");
+        return {
+          invoice,
+          score,
+          details: getMatchDetails(pseudoTxn as any, invoice),
+          reasons: reasons.length ? reasons : buildCandidateReasons(pseudoTxn as any, invoice, score),
+        } as SepaOperationCandidate;
+      })
+      .filter((x): x is SepaOperationCandidate => Boolean(x))
+      .filter((x) => x.score >= 35)
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+
+    return {
+      opId: op.id,
+      suggestions: enriched,
+      combinations: finalCombos,
+    };
+  };
+
+  const buildManualSuggestionsFromPayload = (payload: any, txn: LocalTransaction) => {
+    const aiCandidates = realInvoices
+      .filter((inv) => (inv.currency || txn.currency) === txn.currency)
+      .filter((inv) => {
+        const invoiceType = inv.type ?? (txn.amount < 0 ? "purchase" : "sales");
+        return txn.amount < 0 ? invoiceType === "purchase" : invoiceType === "sales";
+      });
+    const raw = Array.isArray(payload?.suggestions) ? payload.suggestions : [];
+    const byInvId = new Map(aiCandidates.map((inv) => [inv.id, inv]));
+    return raw
+      .map((s: any) => {
+        const invoice = byInvId.get(String(s.invoiceId));
+        if (!invoice) return null;
+        const score = Number(s.score ?? 0);
+        const parts: string[] = [];
+        if (Array.isArray(s.signals) && s.signals.length) parts.push(...s.signals);
+        if (s.reason) parts.push(String(s.reason));
+        if (typeof s.localScore === "number" && s.localScore !== score) {
+          parts.push(`Score local: ${s.localScore}%`);
+        }
+        return {
+          invoice,
+          score,
+          details: getMatchDetails(txn, invoice),
+          reasons: parts.length ? parts : buildCandidateReasons(txn, invoice, score),
+        };
+      })
+      .filter((row): row is SepaOperationCandidate => Boolean(row))
+      .filter((item) => item.score >= 24)
+      .slice(0, 8);
+  };
+
+  const handleSuggestionBadgeClick = async (txn: LocalTransaction) => {
+    const batch = findSepaBatchByReference(txn.reference);
+    // For non-SEPA: open reconciliation panel "sur place".
+    // For SEPA: keep dialog flow and inject prefetched suggestions instantly.
+    if (batch) {
+      // Open immediately; never block UI on network.
+      openDetailsSection(txn, "dialog");
+      const prefetched = sepaFirstOpCacheByTxn[txn.id];
+      if (prefetched) {
+        setDialogSepaSuggestions({ [prefetched.opId]: prefetched.suggestions });
+        setDialogSepaCombinations({ [prefetched.opId]: prefetched.combinations });
+        if (Array.isArray(batch.operations) && batch.operations.length === 1) {
+          setBatchLevelCombinations(prefetched.combinations);
+        }
+        const idx = Math.max(
+          0,
+          batch.operations.findIndex((op) => op.id === prefetched.opId)
+        );
+        setSepaCurrentOperationIndex(idx);
+        setDialogSepaLoading(false);
+      } else if (Array.isArray(batch.operations) && batch.operations.length > 0 && realInvoices.length > 0) {
+        // Hard instant path: fetch only first line now (single API call), no wait for full batch.
+        void (async () => {
+          try {
+          const firstOp = batch.operations[0];
+          const aiCandidates = realInvoices.filter((inv) => {
+            const status = String(inv.status || "").toLowerCase();
+            return !["rapprochée", "rapprochee", "reconciled"].includes(status);
+          });
+          if (aiCandidates.length > 0) {
+            const pseudoTxn = {
+              id: `${txn.id}::${firstOp.id}`,
+              sourceDocumentId: txn.sourceDocumentId,
+              bankAccountId: txn.bankAccountId,
+              txnDate: txn.txnDate,
+              label: `${firstOp.creditorName} ${firstOp.remittanceInfo || ""}`.trim(),
+              reference: firstOp.endToEndId || txn.reference,
+              amount: -Math.abs(Number(firstOp.amount || 0)),
+              balance: txn.balance,
+              currency: firstOp.currency || txn.currency,
+              operationType: "decaissement",
+              paymentMethod: "SEPA",
+              counterpartyName: firstOp.creditorName,
+              reconciledStatus: "non_rapproché",
+              matchedInvoiceIds: [],
+              pendingInvoiceIds: [],
+            };
+            const res = await fetch("/api/reconciliation/score", {
+              method: "POST",
+              credentials: "include",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                transaction: pseudoTxn,
+                invoices: aiCandidates,
+              }),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (res.ok) {
+              const built = buildSepaOpResultFromScorePayload(firstOp, txn, realInvoices, data);
+              setDialogSepaSuggestions({ [built.opId]: built.suggestions });
+              setDialogSepaCombinations({ [built.opId]: built.combinations });
+              if (Array.isArray(batch.operations) && batch.operations.length === 1) {
+                setBatchLevelCombinations(built.combinations);
+              }
+              setSepaFirstOpCacheByTxn((prev) => ({ ...prev, [txn.id]: built }));
+              setSepaCurrentOperationIndex(0);
+              setDialogSepaLoading(false);
+            }
+          }
+          } catch {
+            // fallback to normal dialog load
+          }
+        })();
+      }
+      return;
+    }
+
+    openDetailsSection(txn, "dialog");
+
+    const cachedPayload = aiScoreCacheByTxn[txn.id];
+    if (cachedPayload) {
+      setManualSuggestions(buildManualSuggestionsFromPayload(cachedPayload, txn));
+      return;
+    }
+
+    try {
+      const aiCandidates = realInvoices
+        .filter((inv) => (inv.currency || txn.currency) === txn.currency)
+        .filter((inv) => {
+          const invoiceType = inv.type ?? (txn.amount < 0 ? "purchase" : "sales");
+          return txn.amount < 0 ? invoiceType === "purchase" : invoiceType === "sales";
+        });
+      const res = await fetch("/api/reconciliation/score", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          transaction: txn,
+          invoices: aiCandidates,
+        }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) return;
+      setAiScoreCacheByTxn((prev) => ({ ...prev, [txn.id]: data }));
+      setManualSuggestions(buildManualSuggestionsFromPayload(data, txn));
+    } catch {
+      // keep UI responsive even if prefetch fails
+    }
+  };
+
   useEffect(() => {
     const loadReconciliationSuggestions = async () => {
       if (!selectedDetailsTxn) {
         setManualSuggestions([]);
         return;
       }
+      const requestId = ++manualSuggestionsReqRef.current;
+      const txnSnapshot = selectedDetailsTxn;
 
       const aiCandidates = realInvoices
         .filter((inv) => (inv.currency || selectedDetailsTxn.currency) === selectedDetailsTxn.currency)
@@ -759,69 +1198,64 @@ export default function Banque() {
         return;
       }
 
+      // Instant opening path: use preloaded IA cache if available.
+      const cachedPayload = aiScoreCacheByTxn[txnSnapshot.id];
+      if (cachedPayload) {
+        if (manualSuggestionsReqRef.current === requestId) {
+          setManualSuggestions(buildManualSuggestionsFromPayload(cachedPayload, txnSnapshot));
+        }
+        return;
+      }
+
       try {
         const res = await fetch("/api/reconciliation/score", {
           method: "POST",
           credentials: "include",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            transaction: selectedDetailsTxn,
+            transaction: txnSnapshot,
             invoices: aiCandidates,
           }),
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data?.error || "Agent IA indisponible");
 
-        const raw = Array.isArray(data?.suggestions) ? data.suggestions : [];
-        const byInvId = new Map(aiCandidates.map((inv) => [inv.id, inv]));
-
-        const fromServer = raw
-          .map((s: any) => {
-            const invoice = byInvId.get(String(s.invoiceId));
-            if (!invoice) return null;
-            const score = Number(s.score ?? 0);
-            const parts: string[] = [];
-            if (Array.isArray(s.signals) && s.signals.length) parts.push(...s.signals);
-            if (s.reason) parts.push(String(s.reason));
-            if (typeof s.localScore === "number" && s.localScore !== score) {
-              parts.push(`Score local: ${s.localScore}%`);
-            }
-            return {
-              invoice,
-              score,
-              details: getMatchDetails(selectedDetailsTxn, invoice),
-              reasons: parts.length ? parts : buildCandidateReasons(selectedDetailsTxn, invoice, score),
-            };
-          })
-          .filter((row): row is SepaOperationCandidate => Boolean(row))
-          .filter((item) => item.score >= 24)
-          .slice(0, 8);
-
-        const enriched =
-          fromServer.length > 0
-            ? fromServer
-            : [];
-
-        setManualSuggestions(enriched);
+        if (manualSuggestionsReqRef.current !== requestId) return;
+        setAiScoreCacheByTxn((prev) => ({ ...prev, [txnSnapshot.id]: data }));
+        setManualSuggestions(buildManualSuggestionsFromPayload(data, txnSnapshot));
       } catch (error) {
         console.error("Erreur scoring rapprochement IA:", error);
-        setManualSuggestions([]);
-        toast?.error?.("Rapprochement IA indisponible pour cette opération.");
+        if (manualSuggestionsReqRef.current === requestId) {
+          setManualSuggestions([]);
+          toast?.error?.("Rapprochement IA indisponible pour cette opération.");
+        }
       }
     };
 
     void loadReconciliationSuggestions();
-  }, [selectedDetailsTxn, realInvoices]);
+  }, [selectedDetailsTxn, realInvoices, aiScoreCacheByTxn]);
 
   useEffect(() => {
     const loadDialogSepaSuggestions = async () => {
+      console.log("[SEPA-SUGGEST] open=", detailsDialogOpen, "txn=", selectedDetailsTxn?.id, "isSepa=", selectedTxnIsSepa, "batch=", selectedSepaBatch?.id, "invoices=", realInvoices.length, "reconciledStatus=", selectedDetailsTxn?.reconciledStatus);
       if (!detailsDialogOpen || !selectedDetailsTxn || !selectedTxnIsSepa || !selectedSepaBatch) {
         setDialogSepaSuggestions({});
+        setDialogSepaCombinations({});
+        setBatchLevelCombinations([]);
         return;
       }
       if (!realInvoices.length) {
         setDialogSepaSuggestions({});
+        setDialogSepaCombinations({});
+        setBatchLevelCombinations([]);
         return;
+      }
+
+      // Instant render path from prefetch cache (first SEPA line).
+      const prefetched = sepaFirstOpCacheByTxn[selectedDetailsTxn.id];
+      if (prefetched) {
+        setDialogSepaSuggestions({ [prefetched.opId]: prefetched.suggestions });
+        setDialogSepaCombinations({ [prefetched.opId]: prefetched.combinations });
       }
 
       setDialogSepaLoading(true);
@@ -836,8 +1270,7 @@ export default function Banque() {
           return next;
         });
 
-        const entries = await Promise.all(
-          selectedSepaBatch.operations.map(async (op) => {
+        const fetchSepaOpSuggestions = async (op: any) => {
             const opAmountAbs = Math.abs(Number(op.amount || 0));
             const pseudoTxn = {
               id: `${selectedDetailsTxn.id}::${op.id}`,
@@ -857,11 +1290,8 @@ export default function Banque() {
               pendingInvoiceIds: [],
             };
 
-            const candidates = realInvoices.filter(
-              (inv) => (inv.currency || pseudoTxn.currency) === pseudoTxn.currency
-            );
-
-            if (!candidates.length) return [op.id, [] as SepaOperationCandidate[]] as const;
+            // Envoyer toutes les factures au backend — le filtrage par devise/statut/date se fait côté serveur
+            const candidates = realInvoices;
 
             const res = await fetch("/api/reconciliation/score", {
               method: "POST",
@@ -876,6 +1306,22 @@ export default function Banque() {
             const scoreById = new Map<string, any>(
               (Array.isArray(data?.suggestions) ? data.suggestions : []).map((s: any) => [String(s.invoiceId), s])
             );
+            const rawCombos: SepaCombination[] = Array.isArray(data?.combinations)
+              ? (data.combinations as any[]).map((c) => ({
+                  invoiceIds: Array.isArray(c.invoiceIds) ? c.invoiceIds.map(String) : [],
+                  invoices: Array.isArray(c.invoices) ? c.invoices : [],
+                  totalAmount: Number(c.totalAmount || 0),
+                  diff: Number(c.diff || 0),
+                  score: Number(c.score || 0),
+                  reason: String(c.reason || ""),
+                  matchType: (c.matchType === "supplier" || c.matchType === "amount") ? c.matchType : "amount",
+                }))
+              : [];
+            const fallbackCombos =
+              rawCombos.length === 0
+                ? buildSupplierFallbackCombo(opAmountAbs, op.creditorName || "", candidates)
+                : [];
+            const finalCombos = rawCombos.length > 0 ? rawCombos : fallbackCombos;
 
             const enriched = candidates
               .map((invoice) => {
@@ -887,11 +1333,15 @@ export default function Banque() {
                 const labelRef = `${op.endToEndId || ""} ${op.remittanceInfo || ""}`.toLowerCase();
                 const invoiceNo = String(invoice.invoiceNumber || "").toLowerCase();
                 const vendor = String(invoice.vendorCustomer || "").toLowerCase();
+                const creditorName = String(op.creditorName || "");
                 const hasRefHit = invoiceNo.length >= 4 && labelRef.includes(invoiceNo);
                 const hasVendorHit =
                   vendor.length >= 4 &&
                   (labelRef.includes(vendor) ||
                     vendor.split(/\s+/).some((w) => w.length >= 4 && labelRef.includes(w)));
+                const hasCreditorSupplierHit = supplierNameLooksSame(creditorName, invoice.vendorCustomer || "");
+                const amountLooksPlausible = amountRatio <= 0.15;
+                const strongAmountMatch = amountRatio <= 0.03;
 
                 // Guardrails: down-weight AI score when amount is not plausible.
                 let score = aiScore;
@@ -900,7 +1350,21 @@ export default function Banque() {
                 else if (amountRatio > 0.25) score -= 25;
                 if (hasRefHit) score += 12;
                 if (hasVendorHit) score += 8;
+                if (hasCreditorSupplierHit) score += 18;
                 score = Math.max(0, Math.min(100, Math.round(score)));
+
+                // Hard business filter for SEPA line suggestions:
+                // keep only candidates with at least one strong signal:
+                //  - reference hit, OR
+                //  - creditor name matches supplier, OR
+                //  - very close amount.
+                // This removes "n'importe quoi" suggestions.
+                const passesBusinessGate =
+                  hasRefHit || hasCreditorSupplierHit || strongAmountMatch;
+                if (!passesBusinessGate) return null;
+
+                // If creditor/supplier does not match, require very plausible amount.
+                if (!hasCreditorSupplierHit && !hasRefHit && !amountLooksPlausible) return null;
 
                 const reasons = [];
                 if (Array.isArray(srv?.signals)) reasons.push(...srv.signals);
@@ -908,6 +1372,7 @@ export default function Banque() {
                 reasons.unshift(`Écart montant ligne: ${formatMoney(amountDiff, invoice.currency ?? pseudoTxn.currency)}`);
                 if (hasRefHit) reasons.unshift("Référence exacte détectée");
                 if (hasVendorHit) reasons.unshift("Tiers cohérent");
+                if (hasCreditorSupplierHit) reasons.unshift("Créancier SEPA cohérent avec le fournisseur");
                 return {
                   invoice,
                   score,
@@ -916,29 +1381,118 @@ export default function Banque() {
                 } as SepaOperationCandidate;
               })
               .filter((x): x is SepaOperationCandidate => Boolean(x))
-              .filter((x) => x.score >= 45)
+              .filter((x) => x.score >= 35)
               .sort((a, b) => b.score - a.score)
               .slice(0, 5);
 
-            return [op.id, enriched] as const;
-          })
-        );
+            return [op.id, enriched, finalCombos] as const;
+          };
 
-        // Anti-duplicate between SEPA lines: an invoice should not be suggested as top choice on many lines.
-        const rawByOp = Object.fromEntries(entries) as Record<string, SepaOperationCandidate[]>;
-        const usedInvoiceIds = new Set<string>();
-        const opOrder = selectedSepaBatch.operations.map((op) => op.id);
-        const finalByOp: Record<string, SepaOperationCandidate[]> = {};
+        const operations = selectedSepaBatch.operations || [];
+        if (operations.length === 0) {
+          setDialogSepaSuggestions({});
+          setDialogSepaCombinations({});
+          return;
+        }
 
-        opOrder.forEach((opId) => {
-          const ranked = rawByOp[opId] || [];
-          const filtered = ranked.filter((c) => !usedInvoiceIds.has(c.invoice.id));
-          const keep = filtered.length > 0 ? filtered : ranked.slice(0, 1);
-          finalByOp[opId] = keep.slice(0, 3);
-          if (keep[0]?.invoice?.id) usedInvoiceIds.add(keep[0].invoice.id);
-        });
+        // Instant UX: compute current line first, render immediately,
+        // then hydrate remaining lines in background.
+        const firstIndex = Math.min(sepaCurrentOperationIndex, operations.length - 1);
+        const firstOp = operations[firstIndex];
+        const firstEntry = await fetchSepaOpSuggestions(firstOp);
 
-        setDialogSepaSuggestions(finalByOp);
+        setDialogSepaCombinations({ [firstEntry[0]]: firstEntry[2] });
+        setDialogSepaSuggestions({ [firstEntry[0]]: firstEntry[1].slice(0, 5) });
+        if (operations.length === 1) {
+          // For single-line SEPA (like 49k case), show global block immediately
+          // from first available combos, then refine with batch request later.
+          setBatchLevelCombinations(firstEntry[2]);
+        }
+
+        const remainingOps = operations.filter((op) => op.id !== firstOp.id);
+        void (async () => {
+          try {
+            const restEntries = await Promise.all(remainingOps.map((op) => fetchSepaOpSuggestions(op)));
+            setDialogSepaCombinations((prev) => {
+              const next = { ...prev };
+              restEntries.forEach(([opId, , combos]) => {
+                next[opId] = combos;
+              });
+              return next;
+            });
+            setDialogSepaSuggestions((prev) => {
+              const next = { ...prev };
+              restEntries.forEach(([opId, suggestions]) => {
+                next[opId] = suggestions.slice(0, 5);
+              });
+              return next;
+            });
+          } catch {
+            // keep first-line instant render even if background hydration fails
+          }
+        })();
+
+        // ── Recherche au niveau du lot entier (CtrlSum) ──────────────────────
+        // IMPORTANT: activée uniquement pour les SEPA à ligne unique.
+        // Pour les lots multi-lignes, le rapprochement doit rester strictement ligne par ligne.
+
+        // Calculer le total du lot : préférer totalAmount, sinon sommer les opérations
+        const batchTotalAbs =
+          Math.abs(Number(selectedSepaBatch.totalAmount || 0)) ||
+          selectedSepaBatch.operations.reduce((s, op) => s + Math.abs(Number(op.amount || 0)), 0);
+
+        // Déduire le(s) nom(s) de créancier depuis les opérations
+        const uniqueCreditors = [...new Set(
+          selectedSepaBatch.operations.map((op) => op.creditorName).filter(Boolean)
+        )];
+        // Pour lot à 1 créancier → utiliser ce nom directement
+        // Pour lot à N créanciers → laisser le backend chercher par montant
+        const batchCounterpartyName = uniqueCreditors.length === 1
+          ? uniqueCreditors[0]
+          : uniqueCreditors.join(" ");
+
+        const isSingleLineSepa = selectedSepaBatch.operations.length === 1;
+        if (batchTotalAbs > 0 && isSingleLineSepa) {
+          try {
+            const batchTxn = {
+              id: `batch::${selectedDetailsTxn.id}`,
+              amount: -batchTotalAbs,
+              txnDate: selectedDetailsTxn.txnDate,
+              currency: selectedDetailsTxn.currency || "EUR",
+              counterpartyName: batchCounterpartyName,
+              label: `Lot SEPA ${selectedSepaBatch.label || selectedDetailsTxn.reference || ""} ${batchCounterpartyName}`,
+            };
+            const batchRes = await fetch("/api/reconciliation/score", {
+              method: "POST",
+              credentials: "include",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ transaction: batchTxn, invoices: realInvoices }),
+            });
+            const batchData = await batchRes.json().catch(() => ({}));
+            console.log("[SEPA-BATCH] batchTotalAbs=", batchTotalAbs, "creditor=", batchCounterpartyName, "combos=", batchData?.combinations?.length, "firstCombo=", batchData?.combinations?.[0]);
+            const rawBatchCombos: SepaCombination[] = Array.isArray(batchData?.combinations)
+              ? (batchData.combinations as any[]).map((c) => ({
+                  invoiceIds: Array.isArray(c.invoiceIds) ? c.invoiceIds.map(String) : [],
+                  invoices: Array.isArray(c.invoices) ? c.invoices : [],
+                  totalAmount: Number(c.totalAmount || 0),
+                  diff: Number(c.diff || 0),
+                  score: Number(c.score || 0),
+                  reason: String(c.reason || ""),
+                  matchType: (c.matchType === "supplier" || c.matchType === "amount") ? c.matchType as "supplier" | "amount" : "amount",
+                }))
+              : [];
+            const batchFallbackCombos =
+              rawBatchCombos.length === 0 && uniqueCreditors.length === 1
+                ? buildSupplierFallbackCombo(batchTotalAbs, uniqueCreditors[0], realInvoices)
+                : [];
+            setBatchLevelCombinations(rawBatchCombos.length > 0 ? rawBatchCombos : batchFallbackCombos);
+            // Les combos de lot sont simplement affichés — l'utilisateur confirme manuellement.
+          } catch {
+            setBatchLevelCombinations([]);
+          }
+        } else {
+          setBatchLevelCombinations([]);
+        }
       } finally {
         setDialogSepaLoading(false);
       }
@@ -951,11 +1505,13 @@ export default function Banque() {
   useEffect(() => {
     if (!selectedDetailsTxn || !selectedTxnIsSepa || !selectedSepaBatch) return;
     if (selectedDetailsTxn.reconciledStatus === "rapproché") return;
-    if (!Object.keys(dialogSepaSuggestions).length) return;
     if (dialogSepaLoading) return;
+    const hasSuggestions = Object.keys(dialogSepaSuggestions).length > 0;
+    const hasCombinations = Object.keys(dialogSepaCombinations).length > 0;
+    if (!hasSuggestions && !hasCombinations) return;
 
     const updates: Record<string, SepaOperationDecision> = { ...sepaLineDecisions };
-    const autoAppliedLines: { opId: string; invoiceId: string; score: number }[] = [];
+    const autoAppliedLines: { opId: string; invoiceIds: string[]; score: number }[] = [];
 
     selectedSepaBatch.operations.forEach((op) => {
       const autoKey = `sepa::${selectedDetailsTxn.id}::${op.id}`;
@@ -963,20 +1519,32 @@ export default function Banque() {
       const current = updates[op.id];
       if (current?.status === "approved") return;
       if (current?.rejectAllSuggestions) return;
+
+      // Priorité : combinaison à score ≥ 95
+      const topCombo = (dialogSepaCombinations[op.id] || []).find((c) => c.score >= AUTO_RECONCILE_THRESHOLD);
+      if (topCombo) {
+        autoReconciledRef.current.add(autoKey);
+        updates[op.id] = {
+          ...(current ?? { status: "pending", selectedInvoiceIds: [], rejectAllSuggestions: false }),
+          status: "approved",
+          selectedInvoiceIds: topCombo.invoiceIds,
+          rejectAllSuggestions: false,
+        };
+        autoAppliedLines.push({ opId: op.id, invoiceIds: topCombo.invoiceIds, score: topCombo.score });
+        return;
+      }
+
+      // Sinon : suggestion individuelle à score ≥ 95
       const top = (dialogSepaSuggestions[op.id] || [])[0];
       if (!top || top.score < AUTO_RECONCILE_THRESHOLD) return;
       autoReconciledRef.current.add(autoKey);
       updates[op.id] = {
-        ...(current ?? {
-          status: "pending",
-          selectedInvoiceIds: [],
-          rejectAllSuggestions: false,
-        }),
+        ...(current ?? { status: "pending", selectedInvoiceIds: [], rejectAllSuggestions: false }),
         status: "approved",
         selectedInvoiceIds: [top.invoice.id],
         rejectAllSuggestions: false,
       };
-      autoAppliedLines.push({ opId: op.id, invoiceId: top.invoice.id, score: top.score });
+      autoAppliedLines.push({ opId: op.id, invoiceIds: [top.invoice.id], score: top.score });
     });
 
     if (!autoAppliedLines.length) return;
@@ -1040,9 +1608,10 @@ export default function Banque() {
     }
 
     const topScore = autoAppliedLines[0]?.score ?? AUTO_RECONCILE_THRESHOLD;
+    const totalLinked = autoAppliedLines.reduce((s, l) => s + l.invoiceIds.length, 0);
     toast?.success?.(
       allApproved
-        ? `Lot SEPA rapproché automatiquement (match ≥ ${AUTO_RECONCILE_THRESHOLD}%)`
+        ? `Lot SEPA rapproché automatiquement (${totalLinked} facture(s) liées, match ≥ ${AUTO_RECONCILE_THRESHOLD}%)`
         : `${autoAppliedLines.length} ligne(s) SEPA auto-rapprochée(s) (≥ ${topScore}%)`
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1112,20 +1681,32 @@ export default function Banque() {
       .map((id) => realInvoices.find((inv) => inv.id === id))
       .filter(Boolean)
       .filter((inv) => !existing.has(inv!.id))
-      .map((invoice) => ({
-        invoice: invoice!,
-        score: 0,
-        details: {
-          amountDiff: 0,
-          daysDiffInvoice: 0,
-          daysDiffDue: 0,
-          directionMatch: true,
-          isPartial: false,
-          partialPercent: 0,
-          remaining: 0,
-        },
-        reasons: ["Facture déjà sélectionnée manuellement"],
-      } as SepaOperationCandidate));
+      .map((invoice) => {
+        const opAmountAbs = Math.abs(Number(sepaCurrentOperation.amount || 0));
+        const invAmount = Math.abs(Number(invoice!.amountGross || 0));
+        const amountDiff = Math.abs(opAmountAbs - invAmount);
+        const sameSupplier = supplierNameLooksSame(
+          sepaCurrentOperation.creditorName || "",
+          invoice!.vendorCustomer || ""
+        );
+        let manualScore = amountDiff <= 1 ? 100 : amountDiff <= 5 ? 95 : amountDiff <= 20 ? 85 : 70;
+        if (sameSupplier) manualScore = Math.min(100, manualScore + 5);
+
+        return {
+          invoice: invoice!,
+          score: manualScore,
+          details: {
+            amountDiff,
+            daysDiffInvoice: 0,
+            daysDiffDue: 0,
+            directionMatch: true,
+            isPartial: false,
+            partialPercent: 0,
+            remaining: 0,
+          },
+          reasons: ["Facture déjà sélectionnée manuellement"],
+        } as SepaOperationCandidate;
+      });
 
     return [...ranked, ...selectedExtras];
   }, [
@@ -1915,8 +2496,7 @@ export default function Banque() {
                     filteredTxns.map((txn) => {
                       const invoiceIds = getTxnInvoiceIds(txn);
                       const batch = findSepaBatchByReference(txn.reference);
-                      const sepaConfig = batch ? getSepaBadgeConfig(batch.type) : null;
-                      const SepaIcon = sepaConfig?.icon;
+                      const hasSuggestion = Boolean(aiSuggestionAvailableByTxn[txn.id]);
 
                       return (
                         <TableRow key={txn.id} className={detailsTxnId === txn.id ? "bg-sky-50/60" : ""}>
@@ -1947,15 +2527,6 @@ export default function Banque() {
                                     {getCounterpartyDisplay(txn)?.role}: {getCounterpartyDisplay(txn)?.value}
                                   </span>
                                 ) : null}
-                                <span className={`rounded-full px-2 py-1 text-xs font-medium ${getCurrencyBadgeClass(txn.currency)}`}>
-                                  {txn.currency}
-                                </span>
-                                {sepaConfig && SepaIcon ? (
-                                  <span className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs ${sepaConfig.className}`}>
-                                    <SepaIcon className="h-3 w-3" />
-                                    {sepaConfig.label}
-                                  </span>
-                                ) : null}
                                 {batch ? (
                                   <button
                                     type="button"
@@ -1965,6 +2536,16 @@ export default function Banque() {
                                   >
                                     <Link2 className="h-3 w-3" />
                                     SEPA lié
+                                  </button>
+                                ) : null}
+                                {hasSuggestion ? (
+                                  <button
+                                    type="button"
+                                    onClick={() => void handleSuggestionBadgeClick(txn)}
+                                    className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-1 text-xs font-medium text-amber-700 ring-1 ring-amber-200 hover:bg-amber-100"
+                                    title="Suggestions de rapprochement disponibles"
+                                  >
+                                    Suggestion dispo
                                   </button>
                                 ) : null}
                               </div>
@@ -2018,13 +2599,6 @@ export default function Banque() {
                                     <Link2 className="mr-2 h-4 w-4" />
                                     Ouvrir le rapprochement
                                   </DropdownMenuItem>
-                                  {batch ? (
-                                    <DropdownMenuItem
-                                      onClick={() => setLinkedSepaPopupRef(batch.id || txn.reference)}
-                                    >
-                                      Voir détail SEPA
-                                    </DropdownMenuItem>
-                                  ) : null}
                                   {txn.reconciledStatus === "rapproché" ? (
                                     <DropdownMenuItem onClick={() => handleUnreconcile(txn.id)}>
                                       <Undo2 className="mr-2 h-4 w-4" />
@@ -2185,8 +2759,9 @@ export default function Banque() {
               </SectionCard>
             ) : null}
 
-            {false && selectedDetailsTxn && selectedTxnIsSepa && selectedSepaBatch ? (
-              <SectionCard title="Traitement SEPA" subtitle={selectedSepaBatch.label}>
+            {false ? (
+              <SectionCard title="Traitement SEPA" subtitle="">
+                <></>
                 <div className="space-y-4">
                   <div className="grid gap-3 sm:grid-cols-2">
                     <div className="rounded-xl border border-slate-200 p-3">
@@ -2208,6 +2783,105 @@ export default function Banque() {
                       <p className="mt-1 font-semibold text-slate-900">{sepaSummary.review}</p>
                     </div>
                   </div>
+
+                  {/* ── Rapprochement global du lot (CtrlSum) ── */}
+                  {selectedSepaBatch.operations.length === 1 &&
+                    batchLevelCombinations.length > 0 &&
+                    selectedDetailsTxn?.reconciledStatus !== "rapproché" && (
+                    <div className="rounded-2xl border border-amber-200 bg-amber-50/50 p-4 space-y-3">
+                      <div className="flex items-center gap-2">
+                        <span className="rounded-full bg-amber-100 px-2.5 py-1 text-xs font-bold text-amber-800 ring-1 ring-amber-200">
+                          Rapprochement global
+                        </span>
+                        <p className="text-xs font-medium text-amber-900">
+                          Des factures correspondent au total du lot ({formatMoney(selectedSepaBatch.totalAmount ?? 0, "EUR")})
+                        </p>
+                      </div>
+                      {batchLevelCombinations.map((combo, ci) => {
+                        const allSelected = combo.invoiceIds.every((id) =>
+                          Object.values(sepaLineDecisions).some((d) => d.selectedInvoiceIds.includes(id))
+                        );
+                        return (
+                          <div
+                            key={`batch-combo-${ci}`}
+                            className={`rounded-xl border p-3 ${allSelected ? "border-emerald-300 bg-emerald-50" : "border-amber-200 bg-white"}`}
+                          >
+                            <div className="flex items-center justify-between gap-2 mb-2">
+                              <div className="flex flex-wrap items-center gap-2">
+                                <span className={`rounded-full px-2 py-1 text-xs font-bold ring-1 ${
+                                  combo.score >= 95 ? "bg-emerald-100 text-emerald-800 ring-emerald-200"
+                                  : "bg-amber-100 text-amber-800 ring-amber-200"
+                                }`}>
+                                  {combo.score}%
+                                </span>
+                                {combo.matchType === "supplier" && (
+                                  <span className="rounded-full bg-sky-100 px-2 py-1 text-xs font-medium text-sky-700 ring-1 ring-sky-200">
+                                    Fournisseur identifié
+                                  </span>
+                                )}
+                                <span className="text-xs text-slate-600">{combo.reason}</span>
+                              </div>
+                              <Button
+                                type="button"
+                                size="sm"
+                                variant={allSelected ? "default" : "outline"}
+                                className="shrink-0"
+                                onClick={() => {
+                                  // Appliquer ce combo à toutes les lignes SEPA
+                                  const batchUpdates: Record<string, SepaOperationDecision> = {};
+                                  selectedSepaBatch.operations.forEach((op) => {
+                                    batchUpdates[op.id] = {
+                                      status: "approved",
+                                      selectedInvoiceIds: combo.invoiceIds,
+                                      rejectAllSuggestions: false,
+                                    };
+                                  });
+                                  setSepaLineDecisions(batchUpdates);
+                                  const allMatchedIds = [...new Set(combo.invoiceIds)];
+                                  void persistTxnReconciliation(selectedDetailsTxn!.id, {
+                                    reconciledStatus: "rapproché",
+                                    matchedInvoiceIds: allMatchedIds,
+                                    sepaLineDecisions: batchUpdates,
+                                  });
+                                  void syncInvoicesStatusFromTxn(allMatchedIds, []);
+                                  setTransactions((prev) =>
+                                    prev.map((txn) =>
+                                      txn.id === selectedDetailsTxn!.id
+                                        ? { ...txn, reconciledStatus: "rapproché", matchedInvoiceIds: allMatchedIds, sepaLineDecisions: batchUpdates }
+                                        : txn
+                                    )
+                                  );
+                                  toast?.success?.(`Lot rapproché — ${combo.invoiceIds.length} facture(s)`);
+                                }}
+                              >
+                                {allSelected ? "Appliqué" : "Rapprocher le lot"}
+                              </Button>
+                            </div>
+                            <div className="space-y-1">
+                              {combo.invoices.map((inv) => (
+                                <div key={inv.id} className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-1.5 text-sm">
+                                  <div className="flex items-center gap-2">
+                                    <span className="font-medium text-slate-800">{inv.invoiceNumber}</span>
+                                    <span className="text-slate-500">{inv.vendorCustomer}</span>
+                                  </div>
+                                  <span className="font-mono text-xs font-semibold text-slate-700">
+                                    {formatMoney(inv.amountGross, "EUR")}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                            {combo.invoices.length > 1 && (
+                              <div className="mt-2 flex justify-end">
+                                <span className="text-xs font-semibold text-slate-600">
+                                  Total : {formatMoney(combo.totalAmount, "EUR")}
+                                </span>
+                              </div>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
 
                   <div className="space-y-2">
                     {selectedSepaBatch.operations.map((op, index) => {
@@ -2304,12 +2978,114 @@ export default function Banque() {
                               </Button>
                             </div>
                           </div>
-                        ) : sepaCurrentCandidates.length === 0 ? (
-                          <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500">
-                            Aucune suggestion pour cette sous-opération.
-                          </div>
                         ) : (
-                          sepaCurrentCandidates.map((candidate) => {
+                          <>
+                          {/* Combinations block */}
+                          {(dialogSepaCombinations[sepaCurrentOperation.id] ?? []).length > 0 && (
+                            <div className="mb-4 space-y-2">
+                              <p className="text-xs font-semibold uppercase tracking-wide text-violet-700 mb-2">
+                                Suggestions de rapprochement
+                              </p>
+                              {(dialogSepaCombinations[sepaCurrentOperation.id] ?? []).map((combo, ci) => {
+                                const allChecked = combo.invoiceIds.every((id) =>
+                                  sepaCurrentDecision?.selectedInvoiceIds.includes(id)
+                                );
+                                const isSupplierMatch = combo.reason.includes("Fournisseur SEPA");
+                                const scoreColor =
+                                  combo.score >= 95 ? "bg-emerald-100 text-emerald-800 ring-emerald-200"
+                                  : combo.score >= 80 ? "bg-sky-100 text-sky-800 ring-sky-200"
+                                  : "bg-violet-100 text-violet-800 ring-violet-200";
+                                const borderColor =
+                                  allChecked ? "border-emerald-300 bg-emerald-50/40"
+                                  : isSupplierMatch ? "border-sky-200 bg-sky-50/30"
+                                  : "border-slate-200 bg-white";
+                                return (
+                                  <div
+                                    key={`combo-${ci}`}
+                                    className={`rounded-2xl border p-4 ${borderColor}`}
+                                  >
+                                    <div className="flex items-start justify-between gap-2 mb-3">
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <span className={`rounded-full px-2.5 py-1 text-xs font-bold ring-1 ${scoreColor}`}>
+                                          {combo.score}%
+                                        </span>
+                                        {isSupplierMatch && (
+                                          <span className="rounded-full bg-sky-100 px-2 py-1 text-xs font-medium text-sky-700 ring-1 ring-sky-200">
+                                            Fournisseur SEPA
+                                          </span>
+                                        )}
+                                        <span className="text-xs text-slate-500 leading-tight">{combo.reason}</span>
+                                      </div>
+                                      <Button
+                                        type="button"
+                                        size="sm"
+                                        variant={allChecked ? "default" : "outline"}
+                                        className="shrink-0"
+                                        onClick={() => {
+                                          // Si pas encore tout sélectionné, on sélectionne tout ; sinon on déselectionne
+                                          if (allChecked) {
+                                            combo.invoiceIds.forEach((id) => {
+                                              if (sepaCurrentDecision?.selectedInvoiceIds.includes(id)) {
+                                                toggleSepaInvoice(sepaCurrentOperation.id, id);
+                                              }
+                                            });
+                                          } else {
+                                            combo.invoiceIds.forEach((id) => {
+                                              if (!sepaCurrentDecision?.selectedInvoiceIds.includes(id)) {
+                                                toggleSepaInvoice(sepaCurrentOperation.id, id);
+                                              }
+                                            });
+                                          }
+                                        }}
+                                      >
+                                        {allChecked ? "Désélectionner" : "Sélectionner tout"}
+                                      </Button>
+                                    </div>
+                                    <div className="space-y-1">
+                                      {combo.invoices.map((inv) => {
+                                        const checked = sepaCurrentDecision?.selectedInvoiceIds.includes(inv.id) ?? false;
+                                        return (
+                                          <label
+                                            key={inv.id}
+                                            className={`flex cursor-pointer items-center justify-between rounded-lg border px-3 py-2 text-sm transition-colors ${
+                                              checked ? "border-emerald-200 bg-emerald-50" : "border-slate-100 bg-white hover:bg-slate-50"
+                                            }`}
+                                          >
+                                            <div className="flex items-center gap-2">
+                                              <input
+                                                type="checkbox"
+                                                checked={checked}
+                                                onChange={() => toggleSepaInvoice(sepaCurrentOperation.id, inv.id)}
+                                                className="accent-emerald-600"
+                                              />
+                                              <span className="font-medium text-slate-800">{inv.invoiceNumber}</span>
+                                              <span className="text-slate-500">{inv.vendorCustomer}</span>
+                                            </div>
+                                            <span className="text-slate-700 font-mono text-xs font-semibold">
+                                              {formatMoney(inv.amountGross, sepaCurrentOperation.currency)}
+                                            </span>
+                                          </label>
+                                        );
+                                      })}
+                                    </div>
+                                    {combo.invoices.length > 1 && (
+                                      <div className="mt-2 flex justify-end">
+                                        <span className="text-xs font-semibold text-slate-600">
+                                          Total : {formatMoney(combo.totalAmount, sepaCurrentOperation.currency)}
+                                        </span>
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                          {/* Individual suggestions (only if no combinations or extra matches) */}
+                          {sepaCurrentCandidates.length === 0 && (dialogSepaCombinations[sepaCurrentOperation.id] ?? []).length === 0 ? (
+                            <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500">
+                              Aucune suggestion pour cette sous-opération.
+                            </div>
+                          ) :                           sepaCurrentCandidates.map((candidate) => {
                             const checked = sepaCurrentDecision?.selectedInvoiceIds.includes(candidate.invoice.id) ?? false;
                             return (
                               <div
@@ -2362,7 +3138,8 @@ export default function Banque() {
                                 </div>
                               </div>
                             );
-                          })
+                          })}
+                          </>
                         )}
                       </div>
 
@@ -2704,6 +3481,102 @@ export default function Banque() {
                         </div>
                       ) : (
                         <>
+                          {/* ── Rapprochement global du lot (CtrlSum) ── */}
+                          {selectedSepaBatch.operations.length === 1 && batchLevelCombinations.length > 0 && (
+                            <div className="rounded-2xl border border-amber-200 bg-amber-50/50 p-4 space-y-3 mb-4">
+                              <div className="flex items-center gap-2">
+                                <span className="rounded-full bg-amber-100 px-2.5 py-1 text-xs font-bold text-amber-800 ring-1 ring-amber-200">
+                                  Rapprochement global
+                                </span>
+                                <p className="text-xs font-medium text-amber-900">
+                                  Des factures correspondent au total du lot ({formatMoney(
+                                    (selectedSepaBatch.totalAmount && selectedSepaBatch.totalAmount > 0
+                                      ? selectedSepaBatch.totalAmount
+                                      : selectedSepaBatch.operations.reduce((s, o) => s + Math.abs(Number(o.amount || 0)), 0)),
+                                    "EUR"
+                                  )})
+                                </p>
+                              </div>
+                              {batchLevelCombinations.map((combo, ci) => {
+                                const allSelected = combo.invoiceIds.every((id) =>
+                                  Object.values(sepaLineDecisions).some((d) => d.selectedInvoiceIds.includes(id))
+                                );
+                                return (
+                                  <div
+                                    key={`batch-combo-${ci}`}
+                                    className={`rounded-xl border p-3 ${allSelected ? "border-emerald-300 bg-emerald-50" : "border-amber-200 bg-white"}`}
+                                  >
+                                    <div className="flex items-center justify-between gap-2 mb-2">
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <span className={`rounded-full px-2 py-1 text-xs font-bold ring-1 ${
+                                          combo.score >= 95 ? "bg-emerald-100 text-emerald-800 ring-emerald-200"
+                                          : "bg-amber-100 text-amber-800 ring-amber-200"
+                                        }`}>
+                                          {combo.score}%
+                                        </span>
+                                        {combo.matchType === "supplier" && (
+                                          <span className="rounded-full bg-sky-100 px-2 py-1 text-xs font-medium text-sky-700 ring-1 ring-sky-200">
+                                            Fournisseur identifié
+                                          </span>
+                                        )}
+                                        <span className="text-xs text-slate-600">{combo.reason}</span>
+                                      </div>
+                                      <Button
+                                        type="button"
+                                        size="sm"
+                                        variant={allSelected ? "default" : "outline"}
+                                        className="shrink-0"
+                                        onClick={() => {
+                                          if (selectedSepaBatch.operations.length !== 1) {
+                                            toast?.error?.("Le rapprochement global est réservé aux SEPA à ligne unique.");
+                                            return;
+                                          }
+                                          const batchUpdates: Record<string, SepaOperationDecision> = {};
+                                          selectedSepaBatch.operations.forEach((op) => {
+                                            batchUpdates[op.id] = {
+                                              status: "approved",
+                                              selectedInvoiceIds: combo.invoiceIds,
+                                              rejectAllSuggestions: false,
+                                            };
+                                          });
+                                          setSepaLineDecisions(batchUpdates);
+                                          const allMatchedIds = [...new Set(combo.invoiceIds)];
+                                          void persistTxnReconciliation(selectedDetailsTxn!.id, {
+                                            reconciledStatus: "rapproché",
+                                            matchedInvoiceIds: allMatchedIds,
+                                            sepaLineDecisions: batchUpdates,
+                                          });
+                                          void syncInvoicesStatusFromTxn(allMatchedIds, []);
+                                          setTransactions((prev) =>
+                                            prev.map((txn) =>
+                                              txn.id === selectedDetailsTxn!.id
+                                                ? { ...txn, reconciledStatus: "rapproché", matchedInvoiceIds: allMatchedIds, sepaLineDecisions: batchUpdates }
+                                                : txn
+                                            )
+                                          );
+                                          toast?.success?.(`Lot rapproché — ${combo.invoiceIds.length} facture(s)`);
+                                        }}
+                                      >
+                                        {allSelected ? "Appliqué" : "Rapprocher le lot"}
+                                      </Button>
+                                    </div>
+                                    <div className="space-y-1">
+                                      {combo.invoices.map((inv) => (
+                                        <div key={inv.id} className="flex items-center justify-between rounded-lg border border-slate-100 bg-slate-50 px-3 py-1.5 text-sm">
+                                          <div className="flex items-center gap-2">
+                                            <span className="font-medium text-slate-800">{inv.invoiceNumber ?? inv.id}</span>
+                                            <span className="text-slate-500">{inv.vendorCustomer}</span>
+                                          </div>
+                                          <span className="font-semibold text-slate-700">{formatMoney(inv.amountGross ?? 0, "EUR")}</span>
+                                        </div>
+                                      ))}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+
                           <div className="space-y-2">
                             {selectedSepaBatch.operations.map((op, index) => {
                               const decision = sepaLineDecisions[op.id] ?? {

@@ -13,11 +13,14 @@ export default function ProtectedRoute({ children }: Props) {
     let mounted = true;
 
     async function checkAuth() {
+      const controller = new AbortController();
+      const timeout = window.setTimeout(() => controller.abort(), 8000);
       try {
         const res = await fetch("/auth/me", {
           method: "GET",
           credentials: "include",
           cache: "no-store",
+          signal: controller.signal,
         });
 
         if (!mounted) return;
@@ -27,13 +30,14 @@ export default function ProtectedRoute({ children }: Props) {
           return;
         }
 
-        const data = await res.json();
+        const data = await res.json().catch(() => null);
         setAuthenticated(data?.authenticated === true);
       } catch (error) {
         if (mounted) {
           setAuthenticated(false);
         }
       } finally {
+        window.clearTimeout(timeout);
         if (mounted) {
           setLoading(false);
         }

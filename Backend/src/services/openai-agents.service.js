@@ -257,7 +257,10 @@ export async function scoreReconciliationWithAgent({ transaction, invoices }) {
               type: "array",
               items: { type: "string" },
             },
-            matchType: { type: "string", enum: ["1:1", "1:N"] },
+            matchType: {
+              type: "string",
+              enum: ["1:1", "1:N", "simple", "multiple", "rapprochement global (SEPA)"],
+            },
             score: { type: "number" },
             reason: { type: "string" },
             signals: {
@@ -275,13 +278,66 @@ export async function scoreReconciliationWithAgent({ transaction, invoices }) {
   const parsed = await runJsonSchemaAgent({
     name: "reconciliation_scoring_agent_v2",
     schema,
-    systemPrompt: `Tu es l'Agent Rapprochement bancaire.
-Règles STRICTES:
-- Tu ne dois JAMAIS inventer un invoiceId: chaque invoiceId doit être EXACTEMENT l'un des id fournis dans la liste des factures.
-- Tu peux proposer 1:1 ou 1:N (une opération vers plusieurs factures).
-- Priorité des critères: (1) référence exacte, (2) montant, (3) date +/- quelques jours, (4) libellé/fuzzy.
+    systemPrompt: `Tu es un agent intelligent spécialisé en rapprochement bancaire et comptable.
+Ton objectif est de proposer des suggestions de rapprochement entre des opérations bancaires et des factures, en respectant strictement les règles métier suivantes :
+
+1. CRITÈRES PRINCIPAUX DE RAPPROCHEMENT
+Chaque opération doit être comparée aux factures selon 3 critères fondamentaux :
+- NOM (fournisseur / bénéficiaire)
+- DATE : tolérer un intervalle de ± 3 mois entre la date de l’opération et la date de facture
+- MONTANT : correspondance exacte ou quasi exacte (tolérance configurable si nécessaire)
+Ces 3 critères sont prioritaires et doivent être utilisés ensemble pour valider une correspondance.
+
+2. GESTION DES CAS SEPA
+
+Cas 1 : SEPA avec plusieurs sous-opérations
+- Une opération SEPA peut contenir plusieurs sous-opérations
+- Chaque sous-opération doit être rapprochée individuellement avec une facture
+- L’agent doit identifier chaque sous-opération et rechercher une facture correspondante
+
+Cas 2 : SEPA globale (montant unique élevé)
+- Une seule opération SEPA avec un montant global
+- Cette opération contient généralement un NOM de fournisseur
+- L’agent doit :
+  - identifier toutes les factures ayant le même fournisseur
+  - calculer la somme de ces factures
+  - comparer cette somme avec le montant de la SEPA
+- Si les montants correspondent, proposer :
+  -> "Rapprochement global"
+
+3. EXCLUSION DES FACTURES DÉJÀ RAPPROCHÉES
+- Une facture déjà rapprochée ne doit JAMAIS être réutilisée
+- Elle doit être exclue de toutes les suggestions futures
+
+4. LOGIQUE DE SUGGESTION
+Pour chaque opération :
+- proposer les meilleures correspondances possibles
+- classer les suggestions par pertinence (score basé sur nom + date + montant)
+- éviter les doublons
+- être explicite dans la justification (ex: correspondance nom + montant exact + date proche)
+
+5. SORTIE ATTENDUE
+L’agent doit retourner des suggestions structurées contenant :
+- id de l’opération
+- id(s) des facture(s) proposées
+- type de rapprochement :
+  - "simple"
+  - "multiple"
+  - "rapprochement global (SEPA)"
+- score de confiance
+- justification claire
+
+6. CONTRAINTES IMPORTANTES
+- Ne jamais proposer une facture déjà utilisée
+- Ne jamais proposer des rapprochements incohérents
+- Prioriser la précision plutôt que la quantité de suggestions
+- Gérer les cas ambigus avec prudence (score faible ou pas de suggestion)
+
+Objectif final : produire des suggestions de rapprochement fiables, explicables et exploitables en production.
+
+Règles techniques obligatoires:
+- Tu ne dois JAMAIS inventer un invoiceId: chaque invoiceId doit être EXACTEMENT l'un des id fournis.
 - Maximum 8 suggestions, triées par score décroissant.
-- Score entier 0-100. Raison courte en français (1 phrase) + signaux structurés.
 - Si aucune facture n'est plausible, retourne suggestions: [].`,
     userPrompt: `
 Transaction:

@@ -51,8 +51,8 @@ function amountMatchScore(txnAbs, invAbs) {
 }
 
 function dateProximityScore(txnDateMs, inv) {
-  const invDate = new Date(inv?.invoiceDate || 0).getTime();
-  const due = new Date(inv?.dueDate || 0).getTime();
+  const invDate = parseInvoiceDate(inv?.invoiceDate);
+  const due = parseInvoiceDate(inv?.dueDate);
   const d1 = Math.abs(txnDateMs - invDate) / 86400000;
   const d2 = Number.isFinite(due) ? Math.abs(txnDateMs - due) / 86400000 : Infinity;
   const days = Math.min(d1, d2);
@@ -133,6 +133,295 @@ export function buildLocalSuggestion(transaction, invoice) {
   const reason = signals.length ? signals.join(" · ") : "Peu de signaux communs";
 
   return { invoiceId: id, score, reason, signals };
+}
+
+/**
+ * Filtre les factures éligibles pour le rapprochement d'une opération :
+ *  - statut non rapproché
+ *  - date dans une plage de ±4 mois par rapport à la date de l'opération
+ *
+ * @param {object} transaction  - opération bancaire (txnDate, amount)
+ * @param {Array}  invoices     - toutes les factures disponibles
+ */
+/**
+ * Tente de parser une date en gérant les formats DD/MM/YYYY en plus de l'ISO.
+ */
+function parseInvoiceDate(raw) {
+  if (!raw) return NaN;
+  // Essai ISO standard
+  let d = new Date(raw).getTime();
+  if (Number.isFinite(d) && d > 0) return d;
+  // Essai DD/MM/YYYY
+  const m = String(raw).match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+  if (m) {
+    d = new Date(`${m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`).getTime();
+    if (Number.isFinite(d) && d > 0) return d;
+  }
+  return NaN;
+}
+
+export function filterEligibleInvoices(transaction, invoices) {
+  const txnDateMs = new Date(transaction?.txnDate || Date.now()).getTime();
+  // Fenêtre élargie : 12 mois (les fournisseurs peuvent facturer à terme)
+  const windowMs = 12 * 30 * 24 * 60 * 60 * 1000;
+
+  return invoices.filter((inv) => {
+    // Exclure les factures déjà rapprochées
+    const status = String(inv?.status || "").toLowerCase();
+    if (status === "rapprochée" || status === "rapproche" || status === "reconciled") {
+      return false;
+    }
+
+    // Vérifier la plage de date — si la date est indisponible ou non parseable, on laisse passer
+    const invDate = parseInvoiceDate(inv?.invoiceDate);
+    const dueDate = parseInvoiceDate(inv?.dueDate);
+    const dateRef = Number.isFinite(invDate) && invDate > 0 ? invDate
+      : Number.isFinite(dueDate) && dueDate > 0 ? dueDate
+      : null;
+
+    if (dateRef !== null && Number.isFinite(txnDateMs)) {
+      const diff = Math.abs(txnDateMs - dateRef);
+      if (diff > windowMs) return false;
+    }
+
+    return true;
+  });
+}
+
+/**
+ * Vérifie si deux noms de société se correspondent (matching souple par mots).
+ * ex: "FADLAOUI Zouhair EI" ↔ "FADLAOUI" → true
+ */
+function supplierNameMatch(nameA, nameB) {
+  const a = norm(nameA || "");
+  const b = norm(nameB || "");
+  if (!a || !b) return false;
+  if (a === b) return true;
+
+  // Ignore generic legal/business terms to avoid false positives
+  // like "CONSULT HIGHTECH" ~= "ALTEC CONSULTING".
+  const stopWords = new Set([
+    "consult",
+    "consulting",
+    "groupe",
+    "holding",
+    "services",
+    "service",
+    "solutions",
+    "solution",
+    "company",
+    "societe",
+    "société",
+    "entreprise",
+    "international",
+    "france",
+    "europe",
+    "eurl",
+    "sarl",
+    "sas",
+    "sasu",
+    "sa",
+    "ei",
+    "it",
+  ]);
+
+  const tokenize = (txt) =>
+    txt
+      .replace(/[^a-z0-9 ]/g, " ")
+      .split(/\s+/)
+      .filter((w) => w.length >= 4 && !stopWords.has(w));
+
+  // Extraire les mots discriminants
+  const wordsA = tokenize(a);
+  const wordsB = tokenize(b);
+  if (wordsA.length === 0 || wordsB.length === 0) return false;
+
+  // Match if at least one discriminant token overlaps.
+  return wordsA.some((w) => wordsB.includes(w));
+}
+
+/**
+ * Construit un objet résumé d'une facture pour la réponse.
+ */
+function invoiceSummary(inv) {
+  return {
+    id: invoiceId(inv),
+    invoiceNumber: inv.invoiceNumber || "",
+    vendorCustomer: inv.vendorCustomer || "",
+    amountGross: Number(inv.amountGross || 0),
+  };
+}
+
+/**
+ * Calcule le score et le libellé d'une combinaison selon son type et son écart.
+ *  - matchType "supplier" : correspondance trouvée via le nom du fournisseur SEPA
+ *  - matchType "amount"   : correspondance trouvée par somme des montants
+ */
+function scoreCombination(combo, txnAbs) {
+  const ratio = txnAbs > 0 ? combo.totalAmount / txnAbs : 0;
+  let score;
+
+  if (combo.diff === 0) {
+    score = 100;
+  } else if (combo.diff <= 0.5) {
+    score = 97;
+  } else if (combo.diff <= 1) {
+    score = 95;
+  } else if (ratio >= 0.95) {
+    score = combo.matchType === "supplier" ? 92 : 88;
+  } else if (ratio >= 0.90) {
+    score = combo.matchType === "supplier" ? 85 : 80;
+  } else if (combo.matchType === "supplier") {
+    // Fournisseur trouvé mais montant partiel — montrer quand même
+    score = Math.round(60 + ratio * 25);
+  } else {
+    score = 60;
+  }
+
+  const diffLabel =
+    combo.diff === 0 ? "Montant exact" : `Écart ${combo.diff.toFixed(2)} €`;
+  const comboLabel =
+    combo.invoiceIds.length === 1 ? "Facture unique" : `Combinaison de ${combo.invoiceIds.length} factures`;
+  const typeLabel = combo.matchType === "supplier" ? "Fournisseur SEPA identifié" : "Combinaison montant";
+
+  return {
+    ...combo,
+    score,
+    reason: `${typeLabel} · ${comboLabel} · ${diffLabel} · Total ${combo.totalAmount.toFixed(2)} €`,
+  };
+}
+
+/**
+ * Moteur de recherche de combinaisons de factures pour le rapprochement SEPA.
+ *
+ * Stratégie 1 — Nom fournisseur (prioritaire) :
+ *   Cherche dans les factures éligibles celles dont le vendorCustomer correspond
+ *   au creditorName de l'opération SEPA. Prend TOUTES les factures non rapprochées
+ *   de ce fournisseur et vérifie si leur somme atteint le montant de l'opération.
+ *   Si l'écart est > tolérance, on cherche le meilleur sous-ensemble.
+ *
+ * Stratégie 2 — Somme des montants (fallback) :
+ *   Backtracking sur toutes les factures éligibles pour trouver un sous-ensemble
+ *   dont la somme = montant opération.
+ *
+ * @returns {Array} Combinaisons triées par score décroissant, max 8.
+ */
+export function findInvoiceCombinations(
+  transaction,
+  invoices,
+  { maxComboSize = 5, toleranceEur = 1.5 } = {}
+) {
+  const txnAbs = Math.abs(Number(transaction?.amount || 0));
+  if (txnAbs < 1) return [];
+
+  // Factures éligibles : non rapprochées, date dans ±4 mois
+  const eligible = filterEligibleInvoices(transaction, invoices);
+  if (eligible.length === 0) return [];
+
+  const seenKeys = new Set();
+  const rawResults = [];
+
+  function addResult(invoiceList, matchType) {
+    if (!invoiceList.length) return;
+    const key = invoiceList.map(invoiceId).sort().join("|");
+    if (seenKeys.has(key)) return;
+    seenKeys.add(key);
+    const totalAmount = invoiceList.reduce(
+      (s, inv) => s + Math.abs(Number(inv.amountGross || 0)),
+      0
+    );
+    rawResults.push({
+      invoiceIds: invoiceList.map(invoiceId),
+      invoices: invoiceList.map(invoiceSummary),
+      totalAmount: Math.round(totalAmount * 100) / 100,
+      diff: Math.round(Math.abs(totalAmount - txnAbs) * 100) / 100,
+      matchType,
+    });
+  }
+
+  // ─── Stratégie 1 : Nom fournisseur ──────────────────────────────────────────
+  // Extraire le nom du créancier de l'opération SEPA
+  const creditorRaw = transaction?.counterpartyName || transaction?.label || "";
+
+  if (creditorRaw) {
+    // Trouver toutes les factures éligibles dont le fournisseur correspond au créancier SEPA
+    const supplierInvoices = eligible.filter((inv) =>
+      supplierNameMatch(creditorRaw, inv.vendorCustomer || "")
+    );
+
+    if (supplierInvoices.length > 0) {
+      const totalSupplier = supplierInvoices.reduce(
+        (s, inv) => s + Math.abs(Number(inv.amountGross || 0)),
+        0
+      );
+      const supplierDiff = Math.abs(totalSupplier - txnAbs);
+
+      if (supplierDiff <= toleranceEur) {
+        // Somme exacte (ou quasi) de toutes les factures du fournisseur → suggestion directe
+        addResult(supplierInvoices, "supplier");
+      } else {
+        // Toujours montrer le groupe complet comme suggestion (même partiel)
+        addResult(supplierInvoices, "supplier");
+
+        // Chercher aussi un sous-ensemble exact parmi les factures de ce fournisseur
+        const suppCandidates = supplierInvoices
+          .filter((inv) => Math.abs(Number(inv.amountGross || 0)) <= txnAbs + toleranceEur)
+          .sort((a, b) => Math.abs(Number(b.amountGross)) - Math.abs(Number(a.amountGross)));
+
+        function searchSupplier(startIdx, current, currentSum) {
+          const diff = Math.abs(currentSum - txnAbs);
+          if (current.length >= 1 && diff <= toleranceEur) {
+            addResult(current, "supplier");
+            return;
+          }
+          if (current.length >= maxComboSize) return;
+          if (currentSum > txnAbs + toleranceEur) return;
+          for (let i = startIdx; i < suppCandidates.length; i++) {
+            const inv = suppCandidates[i];
+            const amt = Math.abs(Number(inv.amountGross || 0));
+            if (currentSum + amt > txnAbs + toleranceEur) continue;
+            searchSupplier(i + 1, [...current, inv], currentSum + amt);
+          }
+        }
+        searchSupplier(0, [], 0);
+      }
+    }
+  }
+
+  // ─── Stratégie 2 : Combinaisons par montant (fallback) ──────────────────────
+  const amtCandidates = eligible
+    .filter((inv) => Math.abs(Number(inv.amountGross || 0)) <= txnAbs + toleranceEur)
+    .sort((a, b) => Math.abs(Number(b.amountGross)) - Math.abs(Number(a.amountGross)))
+    .slice(0, 30);
+
+  function searchAmount(startIdx, current, currentSum) {
+    const diff = Math.abs(currentSum - txnAbs);
+    if (current.length >= 1 && diff <= toleranceEur) {
+      addResult(current, "amount");
+      return;
+    }
+    if (current.length >= maxComboSize) return;
+    if (currentSum > txnAbs + toleranceEur) return;
+    for (let i = startIdx; i < amtCandidates.length; i++) {
+      const inv = amtCandidates[i];
+      const amt = Math.abs(Number(inv.amountGross || 0));
+      if (currentSum + amt > txnAbs + toleranceEur) continue;
+      searchAmount(i + 1, [...current, inv], currentSum + amt);
+    }
+  }
+  searchAmount(0, [], 0);
+
+  // ─── Scorer, trier, dédupliquer ──────────────────────────────────────────────
+  return rawResults
+    .map((combo) => scoreCombination(combo, txnAbs))
+    .sort((a, b) => {
+      // Supplier en premier, puis score décroissant
+      const aSupplier = a.matchType === "supplier" ? 1 : 0;
+      const bSupplier = b.matchType === "supplier" ? 1 : 0;
+      if (aSupplier !== bSupplier) return bSupplier - aSupplier;
+      return b.score - a.score;
+    })
+    .slice(0, 8);
 }
 
 /**

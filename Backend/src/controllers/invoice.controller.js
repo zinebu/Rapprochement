@@ -19,7 +19,13 @@ function toFrontInvoice(invoice, type) {
   let amountGross = parseMoneyToNumber(invoice.amount);
 
   if (amountGross === 0 && amountNet > 0) {
+    // Montant stocké absent → calculer TTC
     amountGross = vatAmount > 0 ? amountNet + vatAmount : amountNet;
+  } else if (amountGross > 0 && amountNet > 0 && vatAmount > 0) {
+    // Si le montant stocké ≈ amountNet (écart < 1€), c'est du HT → reconstituer TTC
+    if (Math.abs(amountGross - amountNet) < 1) {
+      amountGross = amountNet + vatAmount;
+    }
   }
 
   const vatRate =

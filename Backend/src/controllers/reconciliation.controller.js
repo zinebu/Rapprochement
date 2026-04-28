@@ -4,6 +4,12 @@ import {
   scoreSepaReconciliationWithAgent,
 } from "../services/openai-agents.service.js";
 import {
+  buildLocalSuggestion,
+  findInvoiceCombinations,
+  filterEligibleInvoices,
+  mergeAiWithLocal,
+} from "../services/reconciliation-scoring.service.js";
+import {
   listPurchaseInvoices as listPurchaseInvoicesFromStore,
   updatePurchaseInvoicesStatusByIds,
 } from "../modules/invoices/purchase.store.js";
@@ -19,29 +25,184 @@ export async function scoreReconciliation(req, res) {
       return res.status(400).json({ error: "transaction et invoices requis" });
     }
 
-    const ai = await scoreReconciliationWithAgent({ transaction, invoices });
-    if (!ai || !Array.isArray(ai)) {
-      return res.status(503).json({
-        error: "Agent IA indisponible pour le rapprochement",
-      });
-    }
+    const isSepaTxn =
+      String(transaction?.paymentMethod || "").toUpperCase() === "SEPA" ||
+      /\bsepa\b/i.test(String(transaction?.label || ""));
 
-    const allowedIds = new Set(invoices.map((inv) => String(inv.id || inv._id || "")).filter(Boolean));
-    const sanitized = ai
-      .map((row) => ({
-        invoiceId: String(row?.invoiceId || ""),
-        invoiceIds: Array.isArray(row?.invoiceIds) ? row.invoiceIds.map((x) => String(x)) : [],
-        matchType: row?.matchType || "1:1",
-        score: Number(row?.score || 0),
-        reason: String(row?.reason || ""),
-        signals: Array.isArray(row?.signals) ? row.signals.map((x) => String(x)) : [],
-      }))
-      .filter((row) => allowedIds.has(row.invoiceId))
-      .filter((row) => row.score >= 0 && row.score <= 100)
+    // 1. Filtrer les factures éligibles : non rapprochées + plage 12 mois
+    const eligible = filterEligibleInvoices(transaction, invoices);
+
+    // 2. Combinaisons uniquement pour SEPA.
+    //    Pour les opérations classiques, on garde le comportement ai-only/local sans combos.
+    const combinations = isSepaTxn
+      ? findInvoiceCombinations(transaction, eligible.length > 0 ? eligible : invoices)
+      : [];
+
+    const candidateInvoices = eligible.length > 0 ? eligible : invoices;
+
+    // 3. Suggestions individuelles locales (fallback + garde-fous)
+    const localSuggestions = candidateInvoices
+      .map((inv) => buildLocalSuggestion(transaction, inv))
+      .filter((s) => s.score >= 15)
       .sort((a, b) => b.score - a.score)
       .slice(0, 8);
 
-    return res.json({ success: true, suggestions: sanitized, scoring: "ai-only" });
+    // 4. Suggestions IA (prioritaires), fusionnées avec le scoring local pour rester explicables.
+    const validInvoiceIds = new Set(candidateInvoices.map((inv) => String(inv.id || inv._id || "")));
+    const localById = new Map(localSuggestions.map((s) => [String(s.invoiceId), s]));
+    const invoiceById = new Map(
+      candidateInvoices.map((inv) => [String(inv.id || inv._id || ""), inv])
+    );
+
+    let aiSuggestions = null;
+    try {
+      aiSuggestions = await scoreReconciliationWithAgent({
+        transaction,
+        invoices: candidateInvoices,
+      });
+    } catch (error) {
+      console.warn("scoreReconciliationWithAgent fallback local:", error?.message || error);
+      aiSuggestions = null;
+    }
+
+    let suggestions = localSuggestions;
+    if (Array.isArray(aiSuggestions) && aiSuggestions.length > 0) {
+      const merged = aiSuggestions
+        .map((ai) => {
+          const invoiceId = String(ai?.invoiceId || "");
+          if (!invoiceId || !validInvoiceIds.has(invoiceId)) return null;
+          const baseLocal =
+            localById.get(invoiceId) ||
+            buildLocalSuggestion(transaction, invoiceById.get(invoiceId));
+          if (!baseLocal) return null;
+
+          const blended = mergeAiWithLocal(
+            baseLocal,
+            Number(ai?.score || 0),
+            String(ai?.reason || "")
+          );
+          const aiSignals = Array.isArray(ai?.signals)
+            ? ai.signals.map((s) => String(s)).filter(Boolean)
+            : [];
+
+          return {
+            invoiceId,
+            score: blended.score,
+            reason: blended.reason,
+            signals: [...new Set([...(baseLocal.signals || []), ...aiSignals])],
+          };
+        })
+        .filter(Boolean)
+        .filter((s) => s.score >= 20)
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 8);
+
+      if (merged.length > 0) suggestions = merged;
+    }
+
+    // Strict production guardrail:
+    // Never suggest absurd matches (huge amount gap + unrelated supplier name).
+    const stopWords = new Set([
+      "consult",
+      "consulting",
+      "groupe",
+      "holding",
+      "services",
+      "service",
+      "solutions",
+      "solution",
+      "company",
+      "societe",
+      "société",
+      "entreprise",
+      "international",
+      "france",
+      "europe",
+      "eurl",
+      "sarl",
+      "sas",
+      "sasu",
+      "sa",
+      "ei",
+      "it",
+    ]);
+    const norm = (s) =>
+      String(s || "")
+        .toLowerCase()
+        .normalize("NFD")
+        .replace(/[\u0300-\u036f]/g, "")
+        .replace(/[^a-z0-9 ]/g, " ")
+        .replace(/\s+/g, " ")
+        .trim();
+    const tokenize = (s) => norm(s).split(/\s+/).filter((w) => w.length >= 4 && !stopWords.has(w));
+    const similarSupplier = (a, b) => {
+      const ta = tokenize(a);
+      const tb = tokenize(b);
+      if (ta.length === 0 || tb.length === 0) return false;
+      return ta.some((w) => tb.includes(w));
+    };
+
+    const txnAbs = Math.abs(Number(transaction?.amount || 0));
+    const txnCounterparty =
+      transaction?.counterpartyName ||
+      transaction?.bankMeta?.beneficiary ||
+      transaction?.bankMeta?.debtor ||
+      "";
+    suggestions = suggestions.filter((s) => {
+      const inv = invoiceById.get(String(s.invoiceId));
+      if (!inv) return false;
+      const invAbs = Math.abs(Number(inv.amountGross || 0));
+      const amountDiff = Math.abs(txnAbs - invAbs);
+      const sameSupplier = similarSupplier(txnCounterparty, inv.vendorCustomer || "");
+      const hasCounterparty = tokenize(txnCounterparty).length > 0;
+      const hasRefSignal =
+        String(s.reason || "").toLowerCase().includes("référence") ||
+        String(s.reason || "").toLowerCase().includes("reference") ||
+        (Array.isArray(s.signals) &&
+          s.signals.some((sig) =>
+            String(sig || "")
+              .toLowerCase()
+              .includes("référence") ||
+            String(sig || "")
+              .toLowerCase()
+              .includes("reference")
+          ));
+
+      // Hard constraints requested by business, but keep valid cases:
+      // - If counterparty exists: enforce similar supplier name.
+      // - Amount should be exact/quasi exact (<= 1€), except exact reference signal (<= 20€).
+      // - For SEPA, individual suggestions stay strict; sums are handled by combinations.
+      if (hasCounterparty && !sameSupplier) return false;
+      if (amountDiff > 1 && !(hasRefSignal && amountDiff <= 20 && !isSepaTxn)) return false;
+      if (isSepaTxn && amountDiff > 1) return false;
+      return true;
+    });
+
+    // Dédupliquer : les factures déjà dans une combinaison 100% n'ont pas besoin d'apparaître seules.
+    const exactComboIds = new Set(
+      combinations
+        .filter((c) => c.score === 100)
+        .flatMap((c) => c.invoiceIds)
+    );
+    suggestions = suggestions.filter((s) => !exactComboIds.has(s.invoiceId));
+
+    // For non-SEPA flows: keep response minimal and compatible with prior ai-only behavior.
+    if (!isSepaTxn) {
+      return res.json({
+        success: true,
+        suggestions,
+        scoring: Array.isArray(aiSuggestions) && aiSuggestions.length > 0 ? "ai-only" : "local-only",
+      });
+    }
+
+    return res.json({
+      success: true,
+      suggestions,
+      combinations,
+      scoring: Array.isArray(aiSuggestions) && aiSuggestions.length > 0
+        ? "ai+local+combinations"
+        : "local+combinations",
+    });
   } catch (error) {
     console.error("scoreReconciliation error:", error);
     return res.status(500).json({

@@ -160,3 +160,15 @@ export type SepaOperationCandidate = {
     remaining: number;
   };
 };
+
+/** A group of invoices whose amounts sum to the operation amount. */
+export type SepaCombination = {
+  invoiceIds: string[];
+  invoices: { id: string; invoiceNumber: string; vendorCustomer: string; amountGross: number }[];
+  totalAmount: number;
+  diff: number;
+  score: number;
+  reason: string;
+  /** "supplier" = match par nom fournisseur SEPA | "amount" = match par somme des montants */
+  matchType?: "supplier" | "amount";
+};

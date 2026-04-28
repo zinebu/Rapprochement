@@ -32,6 +32,19 @@ export default function Login() {
         return;
       }
 
+      // Verify that session cookie is effective before redirecting.
+      const meRes = await fetch("/auth/me", {
+        method: "GET",
+        credentials: "include",
+        cache: "no-store",
+      });
+      const meData = await meRes.json().catch(() => null);
+      if (!meRes.ok || meData?.authenticated !== true) {
+        setError("Session non établie. Réessayez.");
+        setLoading(false);
+        return;
+      }
+
       navigate("/");
     } catch (err) {
       setError("Erreur réseau");
