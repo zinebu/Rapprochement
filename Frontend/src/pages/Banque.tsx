@@ -951,6 +951,7 @@ export default function Banque() {
       currency: op.currency || selectedTxn.currency,
       operationType: "decaissement",
       paymentMethod: "SEPA",
+      sepaContext: true,
       counterpartyName: op.creditorName,
       reconciledStatus: "non_rapproché",
       matchedInvoiceIds: [],
@@ -1110,6 +1111,7 @@ export default function Banque() {
               currency: firstOp.currency || txn.currency,
               operationType: "decaissement",
               paymentMethod: "SEPA",
+              sepaContext: true,
               counterpartyName: firstOp.creditorName,
               reconciledStatus: "non_rapproché",
               matchedInvoiceIds: [],
@@ -1284,6 +1286,7 @@ export default function Banque() {
               currency: op.currency || selectedDetailsTxn.currency,
               operationType: "decaissement",
               paymentMethod: "SEPA",
+              sepaContext: true,
               counterpartyName: op.creditorName,
               reconciledStatus: "non_rapproché",
               matchedInvoiceIds: [],
@@ -1459,6 +1462,7 @@ export default function Banque() {
               amount: -batchTotalAbs,
               txnDate: selectedDetailsTxn.txnDate,
               currency: selectedDetailsTxn.currency || "EUR",
+              sepaContext: true,
               counterpartyName: batchCounterpartyName,
               label: `Lot SEPA ${selectedSepaBatch.label || selectedDetailsTxn.reference || ""} ${batchCounterpartyName}`,
             };
@@ -1715,6 +1719,13 @@ export default function Banque() {
     sepaCurrentOperation,
     realInvoices,
   ]);
+
+  const effectiveGlobalCombos = useMemo(() => {
+    if (!selectedSepaBatch || selectedSepaBatch.operations.length !== 1) return [] as SepaCombination[];
+    if (batchLevelCombinations.length > 0) return batchLevelCombinations;
+    const op = selectedSepaBatch.operations[0];
+    return dialogSepaCombinations[op.id] || [];
+  }, [selectedSepaBatch, batchLevelCombinations, dialogSepaCombinations]);
 
   const sepaSummary = useMemo(() => {
     const summary = { approved: 0, rejected: 0, review: 0, pending: 0 };
@@ -2786,7 +2797,7 @@ export default function Banque() {
 
                   {/* ── Rapprochement global du lot (CtrlSum) ── */}
                   {selectedSepaBatch.operations.length === 1 &&
-                    batchLevelCombinations.length > 0 &&
+                    effectiveGlobalCombos.length > 0 &&
                     selectedDetailsTxn?.reconciledStatus !== "rapproché" && (
                     <div className="rounded-2xl border border-amber-200 bg-amber-50/50 p-4 space-y-3">
                       <div className="flex items-center gap-2">
@@ -2797,7 +2808,7 @@ export default function Banque() {
                           Des factures correspondent au total du lot ({formatMoney(selectedSepaBatch.totalAmount ?? 0, "EUR")})
                         </p>
                       </div>
-                      {batchLevelCombinations.map((combo, ci) => {
+                      {effectiveGlobalCombos.map((combo, ci) => {
                         const allSelected = combo.invoiceIds.every((id) =>
                           Object.values(sepaLineDecisions).some((d) => d.selectedInvoiceIds.includes(id))
                         );
@@ -3482,7 +3493,7 @@ export default function Banque() {
                       ) : (
                         <>
                           {/* ── Rapprochement global du lot (CtrlSum) ── */}
-                          {selectedSepaBatch.operations.length === 1 && batchLevelCombinations.length > 0 && (
+                          {selectedSepaBatch.operations.length === 1 && effectiveGlobalCombos.length > 0 && (
                             <div className="rounded-2xl border border-amber-200 bg-amber-50/50 p-4 space-y-3 mb-4">
                               <div className="flex items-center gap-2">
                                 <span className="rounded-full bg-amber-100 px-2.5 py-1 text-xs font-bold text-amber-800 ring-1 ring-amber-200">
@@ -3497,7 +3508,7 @@ export default function Banque() {
                                   )})
                                 </p>
                               </div>
-                              {batchLevelCombinations.map((combo, ci) => {
+                              {effectiveGlobalCombos.map((combo, ci) => {
                                 const allSelected = combo.invoiceIds.every((id) =>
                                   Object.values(sepaLineDecisions).some((d) => d.selectedInvoiceIds.includes(id))
                                 );

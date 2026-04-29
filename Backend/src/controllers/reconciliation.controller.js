@@ -26,6 +26,7 @@ export async function scoreReconciliation(req, res) {
     }
 
     const isSepaTxn =
+      Boolean(transaction?.sepaContext) ||
       String(transaction?.paymentMethod || "").toUpperCase() === "SEPA" ||
       /\bsepa\b/i.test(String(transaction?.label || ""));
 
