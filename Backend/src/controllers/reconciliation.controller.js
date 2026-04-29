@@ -28,7 +28,10 @@ export async function scoreReconciliation(req, res) {
     const isSepaTxn =
       Boolean(transaction?.sepaContext) ||
       String(transaction?.paymentMethod || "").toUpperCase() === "SEPA" ||
-      /\bsepa\b/i.test(String(transaction?.label || ""));
+      /\bsepa\b/i.test(String(transaction?.label || "")) ||
+      /\bsepa\b/i.test(String(transaction?.reference || "")) ||
+      String(transaction?.id || "").startsWith("batch::") ||
+      String(transaction?.id || "").includes("::");
 
     // 1. Filtrer les factures éligibles : non rapprochées + plage 12 mois
     const eligible = filterEligibleInvoices(transaction, invoices);
