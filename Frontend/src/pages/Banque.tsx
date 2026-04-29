@@ -188,7 +188,20 @@ export default function Banque() {
     if (!reference) return null;
     const wanted = normalizeSepaRef(reference);
     for (const [key, batch] of Object.entries(sepaBatchesByReference)) {
-      if (normalizeSepaRef(key) === wanted || normalizeSepaRef(batch?.id || "") === wanted) {
+      const keyNorm = normalizeSepaRef(key);
+      const idNorm = normalizeSepaRef(batch?.id || "");
+      const strict =
+        keyNorm === wanted ||
+        idNorm === wanted;
+      const loose =
+        wanted.length >= 8 &&
+        (
+          keyNorm.includes(wanted) ||
+          wanted.includes(keyNorm) ||
+          idNorm.includes(wanted) ||
+          wanted.includes(idNorm)
+        );
+      if (strict || loose) {
         return batch;
       }
     }
