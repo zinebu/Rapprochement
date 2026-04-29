@@ -20,6 +20,7 @@ import {
 
 export async function scoreReconciliation(req, res) {
   try {
+    const engineVersion = "reco-v3-sepa-context-guard";
     const { transaction, invoices } = req.body || {};
     if (!transaction || !Array.isArray(invoices)) {
       return res.status(400).json({ error: "transaction et invoices requis" });
@@ -196,6 +197,7 @@ export async function scoreReconciliation(req, res) {
         success: true,
         suggestions,
         scoring: Array.isArray(aiSuggestions) && aiSuggestions.length > 0 ? "ai-only" : "local-only",
+        engineVersion,
       });
     }
 
@@ -206,6 +208,7 @@ export async function scoreReconciliation(req, res) {
       scoring: Array.isArray(aiSuggestions) && aiSuggestions.length > 0
         ? "ai+local+combinations"
         : "local+combinations",
+      engineVersion,
     });
   } catch (error) {
     console.error("scoreReconciliation error:", error);
