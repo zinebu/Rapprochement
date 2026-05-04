@@ -297,6 +297,7 @@ function parseSepaXml(structuredXml, rawText = "", fallbackFileName = "") {
     const creditorIban = cleanText(tx.CdtrAcct?.Id?.IBAN || "");
     const creditorBic = cleanText(tx.CdtrAgt?.FinInstnId?.BICFI || tx.CdtrAgt?.FinInstnId?.BIC || "");
     const endToEndId = cleanText(tx.PmtId?.EndToEndId || `${paymentInfoId}-${index + 1}`);
+    const instrId = cleanText(tx.PmtId?.InstrId || "");
     const remittanceInfo = cleanText(tx.RmtInf?.Ustrd || tx.RmtInf?.Strd?.RfrdDocInf?.Nb || "");
 
     return {
@@ -306,6 +307,7 @@ function parseSepaXml(structuredXml, rawText = "", fallbackFileName = "") {
       creditorBic: creditorBic || null,
       amount,
       currency: cleanText(amountNode?.["@_Ccy"] || currency || "EUR"),
+      instrId: instrId || null,
       endToEndId,
       remittanceInfo,
     };
@@ -316,6 +318,7 @@ function parseSepaXml(structuredXml, rawText = "", fallbackFileName = "") {
   }
 
   const totalAmount = operations.reduce((sum, op) => sum + (Number(op.amount) || 0), 0);
+  const ctrlOrSum = Number.isNaN(ctrlSum) ? totalAmount : ctrlSum;
 
   return {
     documentType: "sepa_xml",
@@ -324,7 +327,7 @@ function parseSepaXml(structuredXml, rawText = "", fallbackFileName = "") {
       type: "invoice",
       label: `SEPA scanné — ${paymentInfoId}`,
       executionDate: executionDate || null,
-      totalAmount: Number.isNaN(ctrlSum) ? totalAmount : ctrlSum,
+      totalAmount: ctrlOrSum,
       numberOfTransactions: Number.isNaN(nbOfTxs) ? operations.length : nbOfTxs,
       debtorName: debtorName || null,
       debtorIban: debtorIban || null,
@@ -336,7 +339,7 @@ function parseSepaXml(structuredXml, rawText = "", fallbackFileName = "") {
       txnDate: executionDate || null,
       label: `SEPA XML ${paymentInfoId}`,
       reference: paymentInfoId,
-      amount: -Math.abs(totalAmount),
+      amount: -Math.abs(ctrlOrSum),
       currency,
       operationType: "decaissement",
       paymentMethod: "SEPA",

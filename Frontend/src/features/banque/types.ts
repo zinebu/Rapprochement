@@ -112,6 +112,8 @@ export type SepaBatchOperation = {
   creditorBic?: string;
   amount: number;
   currency: CurrencyCode;
+  /** Référence instruction (PmtId.InstrId), souvent reprise sur le relevé */
+  instrId?: string;
   endToEndId: string;
   remittanceInfo: string;
   payrollSlipRef?: string;

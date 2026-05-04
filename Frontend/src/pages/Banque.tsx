@@ -190,16 +190,26 @@ export default function Banque() {
     for (const [key, batch] of Object.entries(sepaBatchesByReference)) {
       const keyNorm = normalizeSepaRef(key);
       const idNorm = normalizeSepaRef(batch?.id || "");
+      const opRefs = Array.isArray(batch?.operations)
+        ? batch.operations.flatMap((op: any) => [
+            normalizeSepaRef(op?.instrId || ""),
+            normalizeSepaRef(op?.endToEndId || ""),
+            normalizeSepaRef(op?.remittanceInfo || ""),
+            normalizeSepaRef(op?.id || ""),
+          ])
+        : [];
       const strict =
         keyNorm === wanted ||
-        idNorm === wanted;
+        idNorm === wanted ||
+        opRefs.includes(wanted);
       const loose =
         wanted.length >= 8 &&
         (
           keyNorm.includes(wanted) ||
           wanted.includes(keyNorm) ||
           idNorm.includes(wanted) ||
-          wanted.includes(idNorm)
+          wanted.includes(idNorm) ||
+          opRefs.some((r) => r && (r.includes(wanted) || wanted.includes(r)))
         );
       if (strict || loose) {
         return batch;
@@ -316,6 +326,79 @@ export default function Banque() {
     return value ? { role: "Débiteur", value } : null;
   };
 
+  const txnLooksSepaRelated = (txn: LocalTransaction) => {
+    const hay = `${txn.label || ""} ${txn.reference || ""} ${(txn as { bankOperationType?: string }).bankOperationType || ""}`.toLowerCase();
+    return (
+      txn.paymentMethod === "SEPA" ||
+      /\bsepa\b|\brem\s+vir\s+sepa\b|\bvir\.?\s*[eé]mis\b|\bpain\.001\b/i.test(hay)
+    );
+  };
+
+  const findSepaBatchForTransaction = (txn: LocalTransaction | null | undefined): SepaBatchTemplate | null => {
+    if (!txn) return null;
+    const refCandidates: string[] = [];
+    const push = (v?: string | null) => {
+      const s = String(v || "").trim();
+      if (s && !refCandidates.includes(s)) refCandidates.push(s);
+    };
+    push(txn.reference);
+    const m = txn.bankMeta;
+    push(m?.reference);
+    push(m?.remittanceRef);
+    push(m?.mandate);
+    push(m?.orgId);
+    push(m?.info);
+    for (const s of refCandidates) {
+      const hit = findSepaBatchByReference(s);
+      if (hit) return hit;
+    }
+    const viaLabel = findSepaBatchByReference(txn.label || "");
+    if (viaLabel) return viaLabel;
+
+    if (!txnLooksSepaRelated(txn)) return null;
+
+    const amt = Math.round(Math.abs(Number(txn.amount || 0)) * 100) / 100;
+    if (!amt) return null;
+
+    const amountMatchesBatch = (batch: SepaBatchTemplate) => {
+      const batchTotal = Math.round(Math.abs(Number(batch.totalAmount || 0)) * 100) / 100;
+      const sumOps = Math.round(
+        Math.abs((batch.operations || []).reduce((s, op) => s + Number(op.amount || 0), 0)) * 100
+      ) / 100;
+      return Math.abs(batchTotal - amt) <= 0.02 || Math.abs(sumOps - amt) <= 0.02;
+    };
+
+    const candidates = Object.values(sepaBatchesByReference).filter((batch) => {
+      if (!amountMatchesBatch(batch)) return false;
+      const ex = batch.executionDate ? Date.parse(String(batch.executionDate).slice(0, 10)) : NaN;
+      const txd = txn.txnDate ? Date.parse(String(txn.txnDate).slice(0, 10)) : NaN;
+      if (Number.isFinite(ex) && Number.isFinite(txd) && Math.abs(ex - txd) > 14 * 86400000) {
+        return false;
+      }
+      return true;
+    });
+
+    if (candidates.length === 1) return candidates[0];
+
+    if (candidates.length > 1) {
+      const cp = normalizeText(
+        getCounterpartyDisplay(txn)?.value || txn.counterpartyName || ""
+      );
+      if (cp.length >= 3) {
+        const narrowed = candidates.filter((batch) => {
+          const names = (batch.operations || [])
+            .map((op) => normalizeText(op.creditorName || ""))
+            .filter(Boolean)
+            .join(" ");
+          return names && (names.includes(cp) || cp.includes(names.slice(0, 48)));
+        });
+        if (narrowed.length === 1) return narrowed[0];
+      }
+    }
+
+    return null;
+  };
+
   const resolveBankAccountId = (
     _scannedIban: string | undefined,
     _scannedCurrency: string | undefined
@@ -422,7 +505,7 @@ export default function Banque() {
             }
           }
 
-          if (docType === "sepa_xml" && structured?.sepaBatch) {
+          if (structured?.sepaBatch && (docType === "sepa_xml" || String(docType || "").includes("sepa"))) {
             const batch = structured.sepaBatch;
             const seenIds = new Set<string>();
             const normalizedOperations = (batch.operations || []).map((op, index) => {
@@ -615,7 +698,7 @@ export default function Banque() {
 
   const selectedTxnIsSepa = useMemo(() => {
     if (!selectedDetailsTxn) return false;
-    return Boolean(findSepaBatchByReference(selectedDetailsTxn.reference));
+    return Boolean(findSepaBatchForTransaction(selectedDetailsTxn));
   }, [selectedDetailsTxn, sepaBatchesByReference]);
 
   const linkedSepaPopupBatch = useMemo(() => {
@@ -648,12 +731,9 @@ export default function Banque() {
     );
     setSepaCurrentOperationIndex(0);
 
-    if (Boolean(findSepaBatchByReference(selectedDetailsTxn.reference))) {
-      setDetailsSepaReference(selectedDetailsTxn.reference);
-    } else {
-      setDetailsSepaReference(null);
-    }
-  }, [selectedDetailsTxn]);
+    const linkedBatch = findSepaBatchForTransaction(selectedDetailsTxn);
+    setDetailsSepaReference(linkedBatch?.id ? String(linkedBatch.id) : null);
+  }, [selectedDetailsTxn, sepaBatchesByReference]);
 
   useEffect(() => {
     if (!selectedDetailsTxn || !selectedTxnIsSepa || !selectedSepaBatch) {
@@ -694,7 +774,8 @@ export default function Banque() {
 
   const openDetailsSection = (txn: LocalTransaction, mode: "panel" | "dialog" = "panel") => {
     setDetailsTxnId(txn.id);
-    setDetailsSepaReference(Boolean(findSepaBatchByReference(txn.reference)) ? txn.reference : null);
+    const linkedBatch = findSepaBatchForTransaction(txn);
+    setDetailsSepaReference(linkedBatch?.id ? String(linkedBatch.id) : null);
     if (mode === "dialog") {
       setDetailsDialogOpen(true);
     } else {
@@ -765,7 +846,7 @@ export default function Banque() {
       .filter((txn) => (sepaOnly ? txn.paymentMethod === "SEPA" : true))
       .filter((txn) => {
         if (!payrollOnly) return true;
-        const batch = sepaBatchesByReference[txn.reference];
+        const batch = findSepaBatchForTransaction(txn);
         return Boolean(batch && batch.type === "payroll") || isPayrollCharge(txn);
       })
       .sort((a, b) => new Date(b.txnDate).getTime() - new Date(a.txnDate).getTime());
@@ -784,6 +865,7 @@ export default function Banque() {
     invoiceFilter,
     sepaOnly,
     payrollOnly,
+    sepaBatchesByReference,
   ]);
 
   const [aiSuggestionAvailableByTxn, setAiSuggestionAvailableByTxn] = useState<Record<string, boolean>>({});
@@ -866,7 +948,7 @@ export default function Banque() {
         targets.map(async (txn) => {
           try {
             if (!next[txn.id]) return;
-            const batch = findSepaBatchByReference(txn.reference);
+            const batch = findSepaBatchForTransaction(txn);
             if (!batch || !Array.isArray(batch.operations) || batch.operations.length === 0) return;
             const firstOp = batch.operations[0];
             const res = await fetch("/api/reconciliation/score", {
@@ -1083,7 +1165,7 @@ export default function Banque() {
   };
 
   const handleSuggestionBadgeClick = async (txn: LocalTransaction) => {
-    const batch = findSepaBatchByReference(txn.reference);
+    const batch = findSepaBatchForTransaction(txn);
     // For non-SEPA: open reconciliation panel "sur place".
     // For SEPA: keep dialog flow and inject prefetched suggestions instantly.
     if (batch) {
@@ -2191,15 +2273,16 @@ export default function Banque() {
   const handleUnreconcile = (txnId: string) => {
     const current = transactions.find((t) => t.id === txnId);
     const prevMatched = current?.matchedInvoiceIds ?? [];
-    const currentRef = current?.reference;
+    const linkedBatch = current ? findSepaBatchForTransaction(current) : null;
+    const batchKey = linkedBatch?.id ? String(linkedBatch.id) : null;
 
-    if (currentRef && sepaBatchesByReference[currentRef]) {
+    if (batchKey && sepaBatchesByReference[batchKey]) {
       setSepaBatchesByReference((prev) => {
-        const batch = prev[currentRef];
+        const batch = prev[batchKey];
         if (!batch) return prev;
         return {
           ...prev,
-          [currentRef]: {
+          [batchKey]: {
             ...batch,
             operations: batch.operations.map((op) => ({
               ...op,
@@ -2254,17 +2337,15 @@ export default function Banque() {
         throw new Error(payload?.error || "Suppression impossible");
       }
 
-      const removedRefs = transactions
-        .filter((t) => t.sourceDocumentId === txn.sourceDocumentId)
-        .map((t) => t.reference);
-
       setTransactions((prev) =>
         prev.filter((t) => t.sourceDocumentId !== txn.sourceDocumentId)
       );
       setSepaBatchesByReference((prev) => {
         const next = { ...prev };
-        removedRefs.forEach((ref) => {
-          delete next[ref];
+        Object.entries(next).forEach(([key, batch]) => {
+          if (batch?.sourceDocumentId === txn.sourceDocumentId) {
+            delete next[key];
+          }
         });
         return next;
       });
@@ -2519,7 +2600,7 @@ export default function Banque() {
                   ) : (
                     filteredTxns.map((txn) => {
                       const invoiceIds = getTxnInvoiceIds(txn);
-                      const batch = findSepaBatchByReference(txn.reference);
+                      const batch = findSepaBatchForTransaction(txn);
                       const hasSuggestion = Boolean(aiSuggestionAvailableByTxn[txn.id]);
 
                       return (
