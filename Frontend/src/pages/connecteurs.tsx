@@ -128,6 +128,30 @@ export default function Connecteurs() {
     }
   };
 
+  const disconnectBridge = async () => {
+    try {
+      setBridgeLoading(true);
+      setBridgeError("");
+      const res = await fetch("/api/bridge/disconnect", {
+        method: "POST",
+        credentials: "include",
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setBridgeError(data?.error || "Impossible de déconnecter la banque");
+        return;
+      }
+      setBridgeAccounts([]);
+      setBridgeTransactions([]);
+      setSelectedBridgeAccountId("");
+      toast.success("Banque déconnectée.");
+    } catch {
+      setBridgeError("Erreur lors de la déconnexion bancaire.");
+    } finally {
+      setBridgeLoading(false);
+    }
+  };
+
   const handleConnectJupiter = () => {
     if (!jupiterApiUrl.trim() || !jupiterApiKey.trim()) {
       toast.error("Renseigne l'URL API et la clé API Jupiter.");
@@ -157,7 +181,7 @@ export default function Connecteurs() {
           {bridgeError ? (
             <p className="rounded-md border border-destructive/20 bg-destructive/10 px-3 py-2 text-sm text-destructive">{bridgeError}</p>
           ) : null}
-          <div className="grid gap-2 md:grid-cols-3">
+          <div className="grid gap-2 md:grid-cols-4">
             <Button onClick={handleConnectBank}>Initialiser la session</Button>
             <Button variant="outline" onClick={loadBridgeAccounts} disabled={bridgeLoading}>
               Charger les comptes
@@ -168,6 +192,13 @@ export default function Connecteurs() {
               disabled={bridgeLoading || !selectedBridgeAccountId}
             >
               Charger les transactions
+            </Button>
+            <Button
+              variant="destructive"
+              onClick={disconnectBridge}
+              disabled={bridgeLoading}
+            >
+              Déconnecter la banque
             </Button>
           </div>
           {bridgeAccounts.length > 0 ? (

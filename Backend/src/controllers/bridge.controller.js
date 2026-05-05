@@ -5,6 +5,16 @@ function isBridgeConfigured() {
   return Boolean(process.env.BRIDGE_CLIENT_ID && process.env.BRIDGE_CLIENT_SECRET);
 }
 
+function isProductionEnv() {
+  return String(process.env.NODE_ENV || "").toLowerCase() === "production";
+}
+
+function bridgeNotConfiguredResponse(res) {
+  return res.status(503).json({
+    error: "Bridge n'est pas configuré sur ce serveur (BRIDGE_CLIENT_ID / BRIDGE_CLIENT_SECRET manquants).",
+  });
+}
+
 const demoAccounts = [
   {
     id: "demo-acc-1",
@@ -56,6 +66,9 @@ export async function createConnectSession(req, res) {
         : "payment";
 
     if (!isBridgeConfigured()) {
+      if (isProductionEnv()) {
+        return bridgeNotConfiguredResponse(res);
+      }
       const fallbackUrl = `${req.protocol}://${req.get("host")}/connecteurs`;
       const callback = resolvedCallbackUrl || fallbackUrl;
       bridgeSessionStore.accessToken = "demo-token";
@@ -177,6 +190,9 @@ export async function createConnectSession(req, res) {
 export async function getAccounts(req, res) {
   try {
     if (!isBridgeConfigured()) {
+      if (isProductionEnv()) {
+        return bridgeNotConfiguredResponse(res);
+      }
       return res.json({
         demo: true,
         resources: demoAccounts,
@@ -238,6 +254,9 @@ export async function getAccounts(req, res) {
 export async function getTransactions(req, res) {
   try {
     if (!isBridgeConfigured()) {
+      if (isProductionEnv()) {
+        return bridgeNotConfiguredResponse(res);
+      }
       const accountId = req.query.account_id;
       const resources = accountId
         ? demoTransactions.filter((tx) => String(tx.account_id) === String(accountId))
@@ -284,6 +303,9 @@ export async function getTransactions(req, res) {
 export async function getItems(req, res) {
   try {
     if (!isBridgeConfigured()) {
+      if (isProductionEnv()) {
+        return bridgeNotConfiguredResponse(res);
+      }
       return res.json({
         demo: true,
         resources: [
@@ -325,6 +347,9 @@ export async function getItems(req, res) {
 export async function getCategories(req, res) {
   try {
     if (!isBridgeConfigured()) {
+      if (isProductionEnv()) {
+        return bridgeNotConfiguredResponse(res);
+      }
       return res.json({
         demo: true,
         resources: [
@@ -362,6 +387,25 @@ export async function getCategories(req, res) {
     console.error("categories error:", error);
     return res.status(500).json({
       error: "Erreur serveur",
+      details: String(error),
+    });
+  }
+}
+
+export async function disconnectBridge(req, res) {
+  try {
+    bridgeSessionStore.accessToken = null;
+    bridgeSessionStore.userUuid = null;
+    bridgeSessionStore.externalUserId = null;
+
+    return res.json({
+      success: true,
+      message: "Connexion bancaire Bridge supprimée pour cette session.",
+    });
+  } catch (error) {
+    console.error("disconnect bridge error:", error);
+    return res.status(500).json({
+      error: "Impossible de déconnecter la banque.",
       details: String(error),
     });
   }
