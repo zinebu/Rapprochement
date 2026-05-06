@@ -1,6 +1,7 @@
 import {
   useState,
   useMemo,
+  useEffect,
   Card,
   CardContent,
   CardHeader,
@@ -17,10 +18,8 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-  mockInvoices,
   formatCurrency,
   formatDate,
-  type Invoice,
   Download,
   Receipt,
   TrendingUp,
@@ -40,6 +39,7 @@ import {
   toast,
   StatusBadge,
 } from "./imports";
+import { Fragment } from "react";
 
 const months = [
   "Janvier", "Février", "Mars", "Avril", "Mai", "Juin",
@@ -57,14 +57,27 @@ interface PeriodRow {
   htAchats: number;
   ttcVentes: number;
   ttcAchats: number;
-  invoices: Invoice[];
+  invoices: RealInvoice[];
 }
+
+type RealInvoice = {
+  id: string;
+  type: "sales" | "purchase";
+  invoiceNumber: string;
+  invoiceDate: string;
+  status?: string | null;
+  amountNet?: number | null;
+  vatAmount?: number | null;
+  amountGross?: number | null;
+};
 
 export default function TVA() {
   const currentYear = new Date().getFullYear().toString();
   const [year, setYear] = useState(currentYear);
   const [frequency, setFrequency] = useState<"mensuel" | "trimestriel">("mensuel");
   const [expandedPeriods, setExpandedPeriods] = useState<Set<string>>(new Set());
+  const [reconciledInvoices, setReconciledInvoices] = useState<RealInvoice[]>([]);
+  const [loading, setLoading] = useState(false);
 
   const togglePeriod = (label: string) => {
     setExpandedPeriods(prev => {
@@ -75,21 +88,59 @@ export default function TVA() {
     });
   };
 
+  useEffect(() => {
+    const loadInvoices = async () => {
+      try {
+        setLoading(true);
+        const res = await fetch("/api/invoices", { credentials: "include" });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setReconciledInvoices([]);
+          return;
+        }
+        const allInvoices: RealInvoice[] = Array.isArray(data?.invoices) ? data.invoices : [];
+        const rec = allInvoices.filter((inv) => {
+          const status = String(inv?.status || "").toLowerCase();
+          return status === "rapprochée" || status === "rapprochee" || status === "rapproché" || status === "reconciled";
+        });
+        setReconciledInvoices(rec);
+      } catch {
+        setReconciledInvoices([]);
+      } finally {
+        setLoading(false);
+      }
+    };
+    void loadInvoices();
+  }, []);
+
   const periodData: PeriodRow[] = useMemo(() => {
     const periods = frequency === "mensuel"
       ? Array.from({ length: 12 }, (_, i) => ({ label: months[i], startMonth: i, endMonth: i }))
       : Array.from({ length: 4 }, (_, i) => ({ label: `T${i + 1}`, startMonth: i * 3, endMonth: i * 3 + 2 }));
 
     return periods.map(p => {
-      const periodInvoices = mockInvoices.filter(inv => {
+      const periodInvoices = reconciledInvoices.filter(inv => {
+        if (!inv.invoiceDate) return false;
         const d = new Date(inv.invoiceDate);
+        if (Number.isNaN(d.getTime())) return false;
         return d.getFullYear().toString() === year && d.getMonth() >= p.startMonth && d.getMonth() <= p.endMonth;
       });
       const sales = periodInvoices.filter(i => i.type === "sales");
       const purchases = periodInvoices.filter(i => i.type === "purchase");
 
-      const tvaCollectee = sales.reduce((s, i) => s + i.vatAmount, 0);
-      const tvaDeductible = purchases.reduce((s, i) => s + i.vatAmount, 0);
+      const getNet = (i: RealInvoice) => Number(i.amountNet || 0);
+      const getGross = (i: RealInvoice) => Number(i.amountGross || 0);
+      const getVat = (i: RealInvoice) => {
+        const vat = Number(i.vatAmount || 0);
+        if (vat > 0) return vat;
+        const gross = getGross(i);
+        const net = getNet(i);
+        if (gross > 0 && net > 0 && gross >= net) return gross - net;
+        return 0;
+      };
+
+      const tvaCollectee = sales.reduce((s, i) => s + getVat(i), 0);
+      const tvaDeductible = purchases.reduce((s, i) => s + getVat(i), 0);
 
       return {
         label: p.label,
@@ -98,14 +149,14 @@ export default function TVA() {
         tvaCollectee,
         tvaDeductible,
         tvaNette: tvaCollectee - tvaDeductible,
-        htVentes: sales.reduce((s, i) => s + i.amountNet, 0),
-        htAchats: purchases.reduce((s, i) => s + i.amountNet, 0),
-        ttcVentes: sales.reduce((s, i) => s + i.amountGross, 0),
-        ttcAchats: purchases.reduce((s, i) => s + i.amountGross, 0),
+        htVentes: sales.reduce((s, i) => s + getNet(i), 0),
+        htAchats: purchases.reduce((s, i) => s + getNet(i), 0),
+        ttcVentes: sales.reduce((s, i) => s + getGross(i), 0),
+        ttcAchats: purchases.reduce((s, i) => s + getGross(i), 0),
         invoices: periodInvoices,
       };
     });
-  }, [year, frequency]);
+  }, [year, frequency, reconciledInvoices]);
 
   const totals = useMemo(() => ({
     tvaCollectee: periodData.reduce((s, p) => s + p.tvaCollectee, 0),
@@ -138,7 +189,7 @@ export default function TVA() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold">TVA</h1>
-          <p className="text-muted-foreground">Récapitulatif et projection de TVA</p>
+          <p className="text-muted-foreground">Calcul basé uniquement sur les factures rapprochées</p>
         </div>
         <div className="flex items-center gap-3">
           <Select value={year} onValueChange={setYear}>
@@ -163,6 +214,11 @@ export default function TVA() {
           </Button>
         </div>
       </div>
+      <p className="text-xs text-muted-foreground">
+        {loading
+          ? "Chargement des factures rapprochées..."
+          : `${reconciledInvoices.length} facture(s) rapprochée(s) utilisée(s) pour ce calcul.`}
+      </p>
 
       {/* Summary cards */}
       <div className="grid gap-4 sm:grid-cols-3">
@@ -237,9 +293,8 @@ export default function TVA() {
                 const isExpanded = expandedPeriods.has(p.label);
                 const hasInvoices = p.invoices.length > 0;
                 return (
-                  <>
+                  <Fragment key={p.label}>
                     <TableRow
-                      key={p.label}
                       className={hasInvoices ? "cursor-pointer hover:bg-muted/50 transition-colors" : ""}
                       onClick={() => hasInvoices && togglePeriod(p.label)}
                     >
@@ -267,7 +322,7 @@ export default function TVA() {
                       </TableCell>
                     </TableRow>
                    {isExpanded && p.invoices.map(inv => (
-  <TableRow key={inv.id} className="bg-muted/30">
+  <TableRow key={`${p.label}-${inv.id}`} className="bg-muted/30">
     <TableCell></TableCell>
     <TableCell colSpan={6}>
       <div className="grid grid-cols-[20px_140px_90px_110px_120px_120px_120px] items-center gap-4 py-2 text-sm">
@@ -304,7 +359,7 @@ export default function TVA() {
     </TableCell>
   </TableRow>
 ))}
-                  </>
+                  </Fragment>
                 );
               })}
               <TableRow className="bg-muted/50 font-bold">

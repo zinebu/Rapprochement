@@ -2,10 +2,13 @@ import { Router } from "express";
 import multer from "multer";
 import path from "path";
 import { requireApiKey } from "../middleware/apiKey.middleware.js";
+import { requireAuth } from "../middleware/auth.middleware.js";
 import {
   ingestPartnerDocument,
+  ingestPartnerInvoice,
   getPartnerDocumentStatus,
   partnerHealth,
+  streamPartnerCrmFile,
 } from "../controllers/partner.controller.js";
 
 const router = Router();
@@ -56,6 +59,8 @@ router.post(
   upload.single("file"),
   ingestPartnerDocument
 );
+router.post("/invoices", requireApiKey, ingestPartnerInvoice);
 router.get("/documents/:id", requireApiKey, getPartnerDocumentStatus);
+router.get("/crm-files/:attachmentId/:fileName", requireAuth, streamPartnerCrmFile);
 
 export default router;
