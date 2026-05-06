@@ -87,6 +87,29 @@ function pickInvoiceNature(payload) {
   return "purchase";
 }
 
+/** ID pièce jointe EspoCRM : souvent identique au paramètre `id=` en fin de lien view/download. */
+function attachmentIdFromCrmPdfUrl(url) {
+  if (!url || typeof url !== "string") return null;
+  const raw = url.trim();
+  if (!raw) return null;
+  try {
+    const u = /^https?:\/\//i.test(raw)
+      ? new URL(raw)
+      : new URL(raw, "https://local.invalid/");
+    const id = u.searchParams.get("id");
+    if (id && id.trim()) return id.trim();
+  } catch {
+    /* fallback regex ci-dessous */
+  }
+  const m = raw.match(/[?&#]id=([^&"#\s]+)/i);
+  if (!m) return null;
+  try {
+    return decodeURIComponent(m[1]).trim();
+  } catch {
+    return m[1].trim();
+  }
+}
+
 function extractCrmInvoicePayload(body = {}) {
   const parsedResultats =
     typeof body?.resultats === "string"
@@ -126,6 +149,27 @@ function extractCrmInvoicePayload(body = {}) {
     ? invoiceNumberRaw.split(" - ")[0].trim()
     : null;
 
+  const pdfViewUrl =
+    String(
+      body?.pdfViewUrl ||
+        body?.previewUrl ||
+        body?.crmFileUrl ||
+        normalized?.pdfViewUrl ||
+        normalized?.previewUrl ||
+        ""
+    ).trim() || null;
+
+  const explicitFileId =
+    String(
+      body?.nomfichierId ||
+        normalized?.nomfichierId ||
+        body?.attachmentId ||
+        body?.fileId ||
+        ""
+    ).trim() || null;
+
+  const crmFileId = explicitFileId || attachmentIdFromCrmPdfUrl(pdfViewUrl);
+
   return {
     externalId: body?.id ? String(body.id) : body?.externalId ? String(body.externalId) : null,
     invoiceNature: pickInvoiceNature({ ...body, ...normalized }),
@@ -139,18 +183,15 @@ function extractCrmInvoicePayload(body = {}) {
       String(amount?.devise || body?.ttcCurrency || body?.totalCurrency || "EUR").trim() || "EUR",
     vendorCustomer:
       String(
-        header?.fournisseur || body?.accountName || body?.account1Name || ""
+        header?.fournisseur ||
+          body?.fournisseur ||
+          body?.accountName ||
+          body?.account1Name ||
+          ""
       ).trim() || null,
     siret: String(header?.siret || body?.numrcs || "").trim() || null,
     taxNumber: String(header?.taxNumber || "").trim() || null,
-    crmFileId:
-      String(
-        body?.nomfichierId ||
-          normalized?.nomfichierId ||
-          body?.attachmentId ||
-          body?.fileId ||
-          ""
-      ).trim() || null,
+    crmFileId,
     crmFileName:
       String(
         body?.nomfichierName ||
@@ -158,15 +199,7 @@ function extractCrmInvoicePayload(body = {}) {
           body?.fileName ||
           `${invoiceNumber || "facture"}.pdf`
       ).trim() || null,
-    pdfViewUrl:
-      String(
-        body?.pdfViewUrl ||
-          body?.previewUrl ||
-          body?.crmFileUrl ||
-          normalized?.pdfViewUrl ||
-          normalized?.previewUrl ||
-          ""
-      ).trim() || null,
+    pdfViewUrl,
     raw: normalized,
   };
 }
