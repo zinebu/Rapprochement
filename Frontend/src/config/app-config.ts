@@ -1,3 +1,8 @@
-export const APP_TITLE = "Titre de l'application"; // À remplacer par le nom définitif en fin de projet
-export const APP_SUBTITLE = "Gestion comptable";   // Sous-titre personnalisable
+export const APP_TITLE = "Settle IT";
+export const APP_SUBTITLE = "Rapprochement bancaire & factures";
+/** Fichier servi depuis `public/` (favicon + marque dans l’UI). */
+export const APP_LOGO_PATH = "/settle-it-logo.png";
+
+/** Arrière-plan de la page de connexion (`public/`). */
+export const APP_LOGIN_BG_PATH = "/settle-login-bg.png";
 

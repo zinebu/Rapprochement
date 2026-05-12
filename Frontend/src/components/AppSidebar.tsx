@@ -6,7 +6,6 @@ import {
   Receipt,
   Settings,
   HelpCircle,
-  Building2,
   HandCoins,
   Plug,
   SendHorizontal,
@@ -25,7 +24,7 @@ import {
 } from "@/components/ui/sidebar";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { csvHelpText } from "@/lib/mock-data";
-import { APP_TITLE, APP_SUBTITLE } from "@/config/app-config";
+import { APP_TITLE, APP_SUBTITLE, APP_LOGO_PATH } from "@/config/app-config";
 import { useState } from "react";
 
 const mainNav = [
@@ -50,12 +49,20 @@ export function AppSidebar() {
     <Sidebar className="border-r">
       <SidebarHeader className="p-4 border-b">
         <div className="flex items-center gap-2.5">
-          <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary">
-            <Building2 className="h-4 w-4 text-primary-foreground" />
+          <div className="flex h-10 w-10 shrink-0 items-center justify-center overflow-hidden rounded-lg bg-white ring-1 ring-border">
+            <img
+              src={APP_LOGO_PATH}
+              alt={`${APP_TITLE}`}
+              width={40}
+              height={40}
+              className="h-8 w-8 object-contain"
+            />
           </div>
-          <div className="flex flex-col">
-            <span className="text-sm font-semibold text-foreground">{APP_TITLE}</span>
-            <span className="text-[11px] text-muted-foreground">{APP_SUBTITLE}</span>
+          <div className="flex min-w-0 flex-col">
+            <span className="truncate text-sm font-semibold tracking-tight text-foreground">
+              {APP_TITLE}
+            </span>
+            <span className="truncate text-[11px] text-muted-foreground">{APP_SUBTITLE}</span>
           </div>
         </div>
       </SidebarHeader>

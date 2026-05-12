@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { APP_TITLE, APP_LOGO_PATH, APP_LOGIN_BG_PATH } from "@/config/app-config";
 
 export default function Login() {
   const [username, setUsername] = useState("");
@@ -32,7 +33,6 @@ export default function Login() {
         return;
       }
 
-      // Verify that session cookie is effective before redirecting.
       const meRes = await fetch("/auth/me", {
         method: "GET",
         credentials: "include",
@@ -54,37 +54,53 @@ export default function Login() {
   }
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-slate-50 px-4">
-      <div className="w-full max-w-md bg-white rounded-2xl shadow p-6">
-        <h1 className="text-2xl font-bold mb-2">Connexion</h1>
-        <p className="text-sm text-slate-500 mb-6">
-          Connectez-vous avec vos identifiants Jupiter
-        </p>
+    <div
+      className="relative isolate flex min-h-screen items-center justify-center px-4 py-6"
+      style={{
+        backgroundImage: `linear-gradient(to bottom, rgba(15, 23, 42, 0.45), rgba(15, 23, 42, 0.55)), url(${APP_LOGIN_BG_PATH})`,
+        backgroundSize: "cover",
+        backgroundPosition: "center",
+        backgroundRepeat: "no-repeat",
+      }}
+    >
+      <div className="relative z-10 w-full max-w-md rounded-2xl bg-white/95 p-6 shadow-xl ring-1 ring-black/5 backdrop-blur-sm sm:p-7">
+        <div className="mb-5 flex w-full flex-col items-center px-1 pt-2 pb-1 text-center">
+          <img
+            src={APP_LOGO_PATH}
+            alt={`${APP_TITLE} — logo`}
+            width={208}
+            height={208}
+            className="mb-0 block h-44 w-44 object-contain object-top sm:h-52 sm:w-52"
+          />
+          <p className="-mt-7 text-2xl font-bold leading-none tracking-tight text-slate-900 sm:-mt-9 sm:text-3xl">
+            {APP_TITLE}
+          </p>
+        </div>
 
-        <form onSubmit={handleSubmit} className="space-y-4">
+        <h1 className="sr-only">Connexion — {APP_TITLE}</h1>
+        <form onSubmit={handleSubmit} className="space-y-3">
           <div>
-            <label className="block text-sm mb-1">Email</label>
+            <label className="mb-1 block text-sm text-slate-700">Email</label>
             <input
               type="text"
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              className="w-full border rounded-lg px-3 py-2"
+              className="w-full rounded-lg border border-slate-200 px-3 py-2 outline-none ring-offset-2 focus:ring-2 focus:ring-slate-900/20"
             />
           </div>
 
           <div>
-            <label className="block text-sm mb-1">Mot de passe</label>
+            <label className="mb-1 block text-sm text-slate-700">Mot de passe</label>
             <input
               type="password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full border rounded-lg px-3 py-2"
-           
+              className="w-full rounded-lg border border-slate-200 px-3 py-2 outline-none ring-offset-2 focus:ring-2 focus:ring-slate-900/20"
             />
           </div>
 
           {error && (
-            <div className="text-sm text-red-600 bg-red-50 border border-red-200 rounded-lg px-3 py-2">
+            <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-600">
               {error}
             </div>
           )}
@@ -92,7 +108,7 @@ export default function Login() {
           <button
             type="submit"
             disabled={loading}
-            className="w-full rounded-lg bg-black text-white py-2 disabled:opacity-50"
+            className="w-full rounded-lg bg-slate-900 py-2.5 font-medium text-white transition-colors hover:bg-slate-800 disabled:opacity-50"
           >
             {loading ? "Connexion..." : "Se connecter"}
           </button>
