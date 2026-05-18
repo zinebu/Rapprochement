@@ -401,10 +401,22 @@ export async function ingestPartnerInvoice(req, res) {
             issuerName: mapped.vendorCustomer || "Fournisseur CRM",
           });
 
+    const invoiceId = created?._id?.toString?.() || created?.id || null;
+    if (invoiceId) {
+      try {
+        const { onInvoiceCreatedOrUpdated } = await import(
+          "../services/reconciliation-import-hook.service.js"
+        );
+        void onInvoiceCreatedOrUpdated(invoiceId);
+      } catch (hookError) {
+        console.warn("Reconciliation hook CRM invoice:", hookError?.message || hookError);
+      }
+    }
+
     return res.status(201).json({
       success: true,
       invoice: {
-        id: created?._id?.toString?.() || created?.id || null,
+        id: invoiceId,
         type: mapped.invoiceNature,
         invoiceNumber: created?.invoiceNumber || mapped.invoiceNumber,
         invoiceDate: created?.invoiceDate || mapped.invoiceDate,

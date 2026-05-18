@@ -1,3 +1,4 @@
+import { notifyInvoicesChanged } from "@/lib/invoices-sync";
 import {
   useState,
   useMemo,
@@ -310,6 +311,7 @@ export default function Factures() {
       }
 
       setInvoices(data.invoices || []);
+      notifyInvoicesChanged();
     } catch (error) {
       console.error("Erreur chargement factures:", error);
       toast.error("Impossible de charger les factures.");

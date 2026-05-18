@@ -613,6 +613,14 @@ export async function dispatchImportedDocumentById(id) {
       status: "sent",
     });
     const refreshed = await getImportedDocumentById(id);
+    try {
+      const { onBankStatementDocumentDispatched } = await import(
+        "../services/reconciliation-import-hook.service.js"
+      );
+      void onBankStatementDocumentDispatched(refreshed);
+    } catch (hookError) {
+      console.warn("Reconciliation hook banque:", hookError?.message || hookError);
+    }
     return {
       document: refreshed,
       business: { target: "banque", duplicated: false },
@@ -634,6 +642,25 @@ export async function dispatchImportedDocumentById(id) {
   });
 
   const refreshed = await getImportedDocumentById(id);
+
+  const createdInvoiceId =
+    businessResult?.invoice?.id ||
+    businessResult?.invoice?._id?.toString?.() ||
+    null;
+  if (
+    createdInvoiceId &&
+    (businessResult?.target === "purchase" || businessResult?.target === "sales") &&
+    !businessResult?.duplicated
+  ) {
+    try {
+      const { onInvoiceCreatedOrUpdated } = await import(
+        "../services/reconciliation-import-hook.service.js"
+      );
+      void onInvoiceCreatedOrUpdated(String(createdInvoiceId));
+    } catch (hookError) {
+      console.warn("Reconciliation hook facture:", hookError?.message || hookError);
+    }
+  }
 
   return {
     document: refreshed,

@@ -271,8 +271,22 @@ export async function scoreReconciliationWithAgent({ transaction, invoices }) {
           required: ["invoiceId", "invoiceIds", "matchType", "score", "reason", "signals"],
         },
       },
+      missingInvoices: {
+        type: "array",
+        items: {
+          type: "object",
+          additionalProperties: false,
+          properties: {
+            invoiceReference: { type: "string" },
+            creditorName: { type: "string" },
+            reason: { type: "string" },
+            hint: { type: "string" },
+          },
+          required: ["invoiceReference", "creditorName", "reason", "hint"],
+        },
+      },
     },
-    required: ["suggestions"],
+    required: ["suggestions", "missingInvoices"],
   };
 
   const parsed = await runJsonSchemaAgent({
@@ -288,7 +302,16 @@ Chaque opération doit être comparée aux factures selon 3 critères fondamenta
 - MONTANT : correspondance exacte ou quasi exacte (tolérance configurable si nécessaire)
 Ces 3 critères sont prioritaires et doivent être utilisés ensemble pour valider une correspondance.
 
+RÈGLE DE PROPOSITION vs RAPPROCHEMENT DIRECT :
+- Si fournisseur + montant + date (±3 mois) sont cohérents : PROPOSER la facture même si le n° dans le SEPA diffère.
+- Si en plus le n° facture (invoiceNumber) apparaît dans remittanceInfo/reference/endToEndId : score 100, matchType "simple", signal "Rapprochement direct".
+
 2. GESTION DES CAS SEPA
+
+Les fichiers SEPA contiennent souvent la référence facture dans remittanceInfo / endToEndId / instrId.
+- PRIORITÉ ABSOLUE : rapprocher via cette référence avec invoiceNumber des factures candidates.
+- Si la référence SEPA ne correspond à aucune facture candidate, ajouter une entrée dans missingInvoices
+  (invoiceReference, creditorName, reason, hint) — ne pas inventer de facture.
 
 Cas 1 : SEPA avec plusieurs sous-opérations
 - Une opération SEPA peut contenir plusieurs sous-opérations
@@ -338,7 +361,11 @@ Objectif final : produire des suggestions de rapprochement fiables, explicables 
 Règles techniques obligatoires:
 - Tu ne dois JAMAIS inventer un invoiceId: chaque invoiceId doit être EXACTEMENT l'un des id fournis.
 - Maximum 8 suggestions, triées par score décroissant.
-- Si aucune facture n'est plausible, retourne suggestions: [].`,
+- Si aucune facture n'est plausible, retourne suggestions: [].
+- INTERDIT de proposer une facture dont vendorCustomer ne correspond PAS au nom du tiers de l'opération (counterpartyName / créancier SEPA).
+- INTERDIT de regrouper plusieurs factures de fournisseurs différents dans invoiceIds.
+- INTERDIT d'attribuer un score >= 90 sans correspondance de nom fournisseur ET montant quasi exact (≤ 1,50 € d'écart).
+- Ne jamais combiner des factures uniquement pour atteindre un montant : le nom fournisseur prime toujours.`,
     userPrompt: `
 Transaction:
 ${JSON.stringify(transaction || {}, null, 2)}
@@ -346,12 +373,20 @@ ${JSON.stringify(transaction || {}, null, 2)}
 Factures candidates (utiliser uniquement le champ id comme invoiceId):
 ${JSON.stringify(invoices || [], null, 2)}
 
-Critères à respecter dans l'ordre: référence, montant, date, libellé.
+Critères OBLIGATOIRES dans l'ordre: (1) nom fournisseur identique au tiers bancaire, (2) montant, (3) date, (4) référence.
+Si le nom ne correspond pas, ne propose PAS la facture (même si le montant colle).
+Pour une ligne SEPA (sepaContext / paymentMethod SEPA) : si remittanceInfo ou reference contient un n° facture
+absent du catalogue, remplis missingInvoices (creditorName vide "" si inconnu) au lieu de deviner.
+Ne mets PAS dans missingInvoices si une facture candidate a le même fournisseur, le même montant (±1,50€) et une date dans ±3 mois.
 Évite les doublons et propose des justifications explicables.
 `.trim(),
   });
 
-  return parsed?.suggestions || null;
+  if (!parsed) return null;
+  return {
+    suggestions: Array.isArray(parsed.suggestions) ? parsed.suggestions : [],
+    missingInvoices: Array.isArray(parsed.missingInvoices) ? parsed.missingInvoices : [],
+  };
 }
 
 export async function scoreSepaReconciliationWithAgent({ sepaBatch, invoices }) {
@@ -408,7 +443,10 @@ export async function scoreSepaReconciliationWithAgent({ sepaBatch, invoices }) 
     systemPrompt: `Tu es l'Agent IA de rapprochement SEPA.
 Tu dois rapprocher chaque sous-opération SEPA avec des factures ouvertes.
 Règles:
-- Priorité: référence transaction > montant > date > libellé/fuzzy.
+- PRIORITÉ: référence facture dans remittanceInfo / endToEndId / instrId de chaque ligne SEPA,
+  comparée au champ invoiceNumber des factures (correspondance exacte ou normalisée).
+- Si une référence SEPA ne matche aucune facture: lister l'operationId dans unmatchedOperationIds.
+- Ensuite: montant, date, nom créancier (creditorName).
 - Gérer 1:1, 1:N, paiements partiels, trop-perçu, écarts de centimes.
 - Pour les lots/groupes: proposer aussi des combinaisons de factures dont la somme approche le montant global.
 - Ne jamais inventer d'IDs.`,

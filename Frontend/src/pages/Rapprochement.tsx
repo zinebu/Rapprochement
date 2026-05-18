@@ -1,4 +1,10 @@
-import { useEffect, useMemo, useState, Card, CardContent, CardHeader, CardTitle, Button, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, StatusBadge, formatCurrency } from "./imports";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Card, CardContent, CardHeader, CardTitle, Button, Table, TableBody, TableCell, TableHead, TableHeader, TableRow, formatCurrency } from "./imports";
+import {
+  fetchStoredProposals,
+  requestRecalculate,
+  subscribeReconciliationEvents,
+} from "@/features/banque/reconciliation-proposals-api";
 
 type Invoice = {
   id: string;
@@ -9,6 +15,7 @@ type Invoice = {
   amountGross: number;
   currency?: string;
   type?: "purchase" | "sales";
+  status?: string;
 };
 
 type BankOperation = {
@@ -60,6 +67,7 @@ export default function Rapprochement() {
   >({});
   const [sepaSuggestions, setSepaSuggestions] = useState<Record<string, any[]>>({});
   const [loading, setLoading] = useState(false);
+  const [recoRecalculatingId, setRecoRecalculatingId] = useState<string | null>(null);
 
   useEffect(() => {
     const load = async () => {
@@ -109,46 +117,57 @@ export default function Rapprochement() {
     void load();
   }, []);
 
-  useEffect(() => {
-    const scoreOps = async () => {
-      if (!invoices.length || !bankOperations.length) return;
-      const entries = await Promise.all(
-        bankOperations.map(async (op) => {
-          const res = await fetch("/api/reconciliation/score", {
-            method: "POST",
-            credentials: "include",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ transaction: op, invoices }),
-          });
-          const data = await res.json().catch(() => ({}));
-          const s = Array.isArray(data?.suggestions) ? data.suggestions : [];
-          return [op.id, s] as const;
-        })
-      );
-      setOpSuggestions(Object.fromEntries(entries));
-    };
-    void scoreOps();
-  }, [invoices, bankOperations]);
+  const loadProposalsForOperations = useCallback(async (ops: BankOperation[]) => {
+    if (!ops.length) {
+      setOpSuggestions({});
+      return;
+    }
+    const { proposals: byId } = await fetchStoredProposals(ops.map((o) => o.id));
+    const entries = ops.map((op) => {
+      const row = byId[op.id];
+      const suggestions =
+        row?.processingStatus === "processed" && Array.isArray(row.suggestions)
+          ? row.suggestions.map((s) => ({
+              invoiceId: String(s.invoiceId),
+              score: Number(s.score || 0),
+              reason: String(s.reason || ""),
+              signals: s.signals,
+            }))
+          : [];
+      return [op.id, suggestions] as const;
+    });
+    setOpSuggestions(Object.fromEntries(entries));
+  }, []);
 
   useEffect(() => {
-    const scoreSepa = async () => {
-      if (!invoices.length || !sepaBatches.length) return;
-      const entries = await Promise.all(
-        sepaBatches.map(async (batch) => {
-          const res = await fetch("/api/reconciliation/sepa-score", {
-            method: "POST",
-            credentials: "include",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ sepaBatch: batch, invoices }),
-          });
-          const data = await res.json().catch(() => ({}));
-          return [batch.id, Array.isArray(data?.combinationSuggestions) ? data.combinationSuggestions : []] as const;
-        })
-      );
-      setSepaSuggestions(Object.fromEntries(entries));
-    };
-    void scoreSepa();
-  }, [invoices, sepaBatches]);
+    void loadProposalsForOperations(bankOperations);
+  }, [bankOperations, loadProposalsForOperations]);
+
+  useEffect(() => {
+    return subscribeReconciliationEvents((payload) => {
+      const type = String(payload?.type || "");
+      if (type !== "RECONCILIATION_PROCESSED" && type !== "RECONCILIATION_FAILED") return;
+      void loadProposalsForOperations(bankOperations);
+    });
+  }, [bankOperations, loadProposalsForOperations]);
+
+  const openInvoices = useMemo(
+    () =>
+      invoices.filter((inv) => {
+        const status = String(inv.status || "").toLowerCase();
+        return !["rapprochée", "rapprochee", "reconciled"].includes(status);
+      }),
+    [invoices]
+  );
+
+  const handleRecalculate = async (op: BankOperation) => {
+    setRecoRecalculatingId(op.id);
+    try {
+      await requestRecalculate(op, openInvoices);
+    } finally {
+      setRecoRecalculatingId(null);
+    }
+  };
 
   const invoicesById = useMemo(() => {
     const m = new Map<string, Invoice>();
@@ -183,7 +202,7 @@ export default function Rapprochement() {
       <div>
         <h1 className="text-2xl font-bold">Rapprochement</h1>
         <p className="text-sm text-muted-foreground">
-          Scoring serveur (montant, dates, références, sens) avec complément IA seulement si cohérent — combinaisons SEPA côté serveur.
+          Suggestions lues depuis le cache serveur (aucun appel OpenAI au chargement). Utilisez « Recalculer » pour forcer une nouvelle analyse.
         </p>
       </div>
 
@@ -195,7 +214,28 @@ export default function Rapprochement() {
           {loading ? (
             <p className="text-sm text-muted-foreground">Chargement...</p>
           ) : matchedOperations.length === 0 ? (
-            <p className="text-sm text-muted-foreground">Aucune correspondance trouvée pour les opérations bancaires.</p>
+            <div className="space-y-3">
+              <p className="text-sm text-muted-foreground">
+                Aucune correspondance en cache pour les opérations bancaires.
+              </p>
+              {bankOperations.length > 0 ? (
+                <div className="space-y-2">
+                  {bankOperations.slice(0, 20).map((op) => (
+                    <div key={op.id} className="flex items-center justify-between gap-2 rounded-lg border px-3 py-2">
+                      <span className="truncate text-sm">{op.label}</span>
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        disabled={recoRecalculatingId === op.id}
+                        onClick={() => void handleRecalculate(op)}
+                      >
+                        {recoRecalculatingId === op.id ? "Recalcul…" : "Recalculer"}
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+              ) : null}
+            </div>
           ) : (
             <div className="space-y-4">
               {matchedOperations.map(({ op, suggestions }) => {
@@ -208,9 +248,19 @@ export default function Rapprochement() {
                           {toIsoDate(op.txnDate)} · {op.reference} · {op.counterpartyName || "—"}
                         </p>
                       </div>
-                      <p className={`font-mono font-semibold ${op.amount < 0 ? "text-red-600" : "text-emerald-600"}`}>
-                        {formatCurrency(op.amount, op.currency)}
-                      </p>
+                      <div className="flex items-center gap-2">
+                        <p className={`font-mono font-semibold ${op.amount < 0 ? "text-red-600" : "text-emerald-600"}`}>
+                          {formatCurrency(op.amount, op.currency)}
+                        </p>
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          disabled={recoRecalculatingId === op.id}
+                          onClick={() => void handleRecalculate(op)}
+                        >
+                          Recalculer
+                        </Button>
+                      </div>
                     </div>
                     <div className="mt-3 space-y-2">
                       {suggestions.map((s) => {
@@ -231,14 +281,6 @@ export default function Rapprochement() {
                                 </div>
                               ) : null}
                             </div>
-                            <div className="flex shrink-0 flex-col items-end gap-1">
-                              <span className="rounded-full bg-primary/10 px-2 py-1 text-xs font-semibold text-primary">
-                                {s.score}%
-                              </span>
-                              {typeof s.localScore === "number" && s.localScore !== s.score ? (
-                                <span className="text-[10px] text-muted-foreground">local {s.localScore}%</span>
-                              ) : null}
-                            </div>
                           </div>
                         );
                       })}
@@ -257,7 +299,9 @@ export default function Rapprochement() {
         </CardHeader>
         <CardContent>
           {matchedSepa.length === 0 ? (
-            <p className="text-sm text-muted-foreground">Aucune correspondance trouvée pour les lots SEPA.</p>
+            <p className="text-sm text-muted-foreground">
+              Aucune combinaison SEPA en cache. Utilisez la page Banque pour rapprocher les lots SEPA.
+            </p>
           ) : (
             <div className="space-y-6">
               {matchedSepa.map(({ batch, combos }) => (
@@ -277,7 +321,6 @@ export default function Rapprochement() {
                       <TableRow>
                         <TableHead>Factures proposées (combinaison)</TableHead>
                         <TableHead className="w-[180px]">Total combinaison</TableHead>
-                        <TableHead className="w-[120px]">Score</TableHead>
                       </TableRow>
                     </TableHeader>
                     <TableBody>
@@ -289,7 +332,6 @@ export default function Rapprochement() {
                               .join(", ")}
                           </TableCell>
                           <TableCell>{formatCurrency(Number(combo.totalAmount || 0), batch.debtorCurrency || "EUR")}</TableCell>
-                          <TableCell>{Number(combo.score || 0)}%</TableCell>
                         </TableRow>
                       ))}
                     </TableBody>

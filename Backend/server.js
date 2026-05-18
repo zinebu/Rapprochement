@@ -13,6 +13,7 @@ import importRoutes from "./src/routes/import.routes.js";
 import reconciliationRoutes from "./src/routes/reconciliation.routes.js";
 import partnerRoutes from "./src/routes/partner.routes.js";
 import { connectMongo } from "./src/lib/mongoose.js";
+import { recoverStuckReconciliationJobs } from "./src/services/reconciliation-job.service.js";
 
 const app = express();
 const PORT = process.env.PORT || 8000;
@@ -86,6 +87,18 @@ app.use((err, req, res, next) => {
 
 async function start() {
   await connectMongo();
+
+  recoverStuckReconciliationJobs()
+    .then((meta) => {
+      if (meta?.enqueued > 0) {
+        console.log(
+          `[reconciliation] ${meta.enqueued} job(s) relancé(s) après traitement bloqué`
+        );
+      }
+    })
+    .catch((err) => {
+      console.warn("[reconciliation] recover stuck jobs:", err?.message || err);
+    });
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Backend lancé sur le port ${PORT}`);

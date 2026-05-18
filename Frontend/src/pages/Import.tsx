@@ -1,3 +1,4 @@
+import { notifyInvoicesChanged } from "@/lib/invoices-sync";
 import { useState } from "react";
 import {
   useNavigate,
@@ -415,6 +416,9 @@ export default function ImportPage() {
           ? "Document envoyé dans Banque."
           : "Document envoyé dans Factures."
       );
+      if (data?.document?.destination !== "banque") {
+        notifyInvoicesChanged();
+      }
     } catch (error) {
       const message = error instanceof Error ? error.message : "Erreur pendant l'envoi";
 

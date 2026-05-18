@@ -131,6 +131,14 @@ export async function deleteInvoice(req, res) {
 
     const deletedPurchase = await deletePurchaseInvoiceById(id);
     if (deletedPurchase) {
+      try {
+        const { onInvoiceRemoved } = await import(
+          "../services/reconciliation-import-hook.service.js"
+        );
+        void onInvoiceRemoved(String(id));
+      } catch (hookError) {
+        console.warn("Reconciliation hook suppression facture:", hookError?.message || hookError);
+      }
       return res.json({
         success: true,
         message: "Facture d'achat supprimée",
@@ -139,6 +147,14 @@ export async function deleteInvoice(req, res) {
 
     const deletedSales = await deleteSalesInvoiceById(id);
     if (deletedSales) {
+      try {
+        const { onInvoiceRemoved } = await import(
+          "../services/reconciliation-import-hook.service.js"
+        );
+        void onInvoiceRemoved(String(id));
+      } catch (hookError) {
+        console.warn("Reconciliation hook suppression facture:", hookError?.message || hookError);
+      }
       return res.json({
         success: true,
         message: "Facture de vente supprimée",

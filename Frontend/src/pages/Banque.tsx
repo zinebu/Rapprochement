@@ -1,5 +1,5 @@
 import {
-  useEffect, useMemo, useRef, useState, Card,
+  useCallback, useEffect, useMemo, useRef, useState, Card,
   CardContent,
   CardHeader, CardTitle, Table,
   TableBody,
@@ -60,6 +60,9 @@ import type {
 import {
   amountMatchesRange,
   buildCandidateReasons,
+  computeMatchScore,
+  shouldDisplayBankSuggestion,
+  isObviousBadBankMatch,
   formatCompactAmount,
   formatDisplayDate,
   formatMoney,
@@ -73,6 +76,22 @@ import {
   isPayrollCharge,
   normalizeText,
 } from "@/features/banque/utils";
+import {
+  fetchEngineMatch,
+  fetchStoredProposalsMap,
+  requestRecalculate,
+  subscribeReconciliationEvents,
+  type StoredReconciliationProposal,
+} from "@/features/banque/reconciliation-proposals-api";
+import {
+  filterSepaCandidateReasons,
+  getTxnReconciliationBadgeStatus,
+  getTxnDisplayInvoiceIds,
+  getTxnInvoiceDisplayChips,
+  collectInvoiceIdsFromSepaDecisions,
+  applySepaDecisionsToBatch,
+  proposalPayloadFromRow,
+} from "@/features/banque/reconciliation-display";
 
 type ImportedBankOperation = {
   id?: string;
@@ -117,7 +136,7 @@ type ImportedDocumentDto = {
   };
 };
 
-export default function Banque() {
+function Banque() {
   const [transactions, setTransactions] = useState<LocalTransaction[]>(initialTransactions);
   const [realInvoices, setRealInvoices] = useState<LocalInvoice[]>([]);
   const [sepaBatchesByReference, setSepaBatchesByReference] = useState<Record<string, SepaBatchTemplate>>({});
@@ -157,6 +176,13 @@ export default function Banque() {
   const [sepaCurrentOperationIndex, setSepaCurrentOperationIndex] = useState(0);
   const [linkedSepaPopupRef, setLinkedSepaPopupRef] = useState<string | null>(null);
   const [backendRecoPersistenceUnavailable, setBackendRecoPersistenceUnavailable] = useState(false);
+
+  const isMongoObjectId = (value?: string | null) =>
+    /^[a-f\d]{24}$/i.test(String(value || "").trim());
+
+  /** Seuls les imports MongoDB sont persistés via /api/imports/:id/reconciliation */
+  const canPersistToImportBackend = (sourceDocumentId?: string | null) =>
+    isMongoObjectId(sourceDocumentId);
 
   const RECONCILIATION_CACHE_KEY = "banque_reconciliation_cache_v1";
   const readLocalReconciliationCache = (): Record<string, any> => {
@@ -453,6 +479,17 @@ export default function Banque() {
               const opId = op.id || `${docId}-op-${index + 1}`;
               const localPersisted = localCache[makeRecoCacheKey(docId, opId)] || {};
               const persisted = { ...(persistedOps[opId] || {}), ...localPersisted };
+              const fromSepaDecisions = collectInvoiceIdsFromSepaDecisions(
+                persisted.sepaLineDecisions
+              );
+              const matchedInvoiceIds = Array.isArray(persisted.matchedInvoiceIds)
+                ? persisted.matchedInvoiceIds
+                : [];
+              const pendingInvoiceIds = Array.isArray(persisted.pendingInvoiceIds)
+                ? persisted.pendingInvoiceIds
+                : fromSepaDecisions.length > 0
+                  ? fromSepaDecisions
+                  : [];
               scannedTransactions.push({
                 id: opId,
                 sourceDocumentId: docId,
@@ -466,8 +503,8 @@ export default function Banque() {
                 currency: (op.currency || accountCurrency || "EUR") as CurrencyCode,
                 operationType: op.operationType || (normalizedAmount >= 0 ? "encaissement" : "decaissement"),
                 paymentMethod: op.paymentMethod || "AUTRE",
-                matchedInvoiceIds: Array.isArray(persisted.matchedInvoiceIds) ? persisted.matchedInvoiceIds : [],
-                pendingInvoiceIds: Array.isArray(persisted.pendingInvoiceIds) ? persisted.pendingInvoiceIds : [],
+                matchedInvoiceIds,
+                pendingInvoiceIds,
                 counterpartyName: op.counterpartyName || undefined,
                 bankMeta: op.bankMeta,
                 unreconciledComment: persisted.unreconciledComment || "Opération scannée depuis relevé bancaire",
@@ -525,6 +562,36 @@ export default function Banque() {
               operations: normalizedOperations,
               sourceDocumentId: docId,
             };
+          }
+        });
+
+        scannedTransactions.forEach((txn) => {
+          const decisions = txn.sepaLineDecisions;
+          if (!decisions) return;
+          const wanted = normalizeSepaRef(txn.reference);
+          const txnAmt = Math.abs(Number(txn.amount || 0));
+          for (const [key, batch] of Object.entries(scannedSepaBatches)) {
+            const keyNorm = normalizeSepaRef(key);
+            const idNorm = normalizeSepaRef(batch?.id || "");
+            const refMatch =
+              keyNorm === wanted ||
+              idNorm === wanted ||
+              (wanted.length >= 8 &&
+                (keyNorm.includes(wanted) ||
+                  wanted.includes(keyNorm) ||
+                  idNorm.includes(wanted) ||
+                  wanted.includes(idNorm)));
+            const batchTotal = Math.abs(Number(batch.totalAmount || 0));
+            const sumOps = (batch.operations || []).reduce(
+              (s, op) => s + Math.abs(Number(op.amount || 0)),
+              0
+            );
+            const amountMatch =
+              (batchTotal > 0 && Math.abs(batchTotal - txnAmt) <= 0.02) ||
+              (sumOps > 0 && Math.abs(sumOps - txnAmt) <= 0.02);
+            if (!refMatch && !amountMatch) continue;
+            scannedSepaBatches[key] = applySepaDecisionsToBatch(batch, decisions);
+            break;
           }
         });
 
@@ -793,7 +860,9 @@ export default function Banque() {
         const query = normalizeText(searchText);
         if (!query) return true;
 
-        const invoiceNumbers = resolveInvoicesByIds(getTxnInvoiceIds(txn))
+        const invoiceNumbers = resolveInvoicesByIds(
+          getTxnDisplayInvoiceIds(txn, findSepaBatchForTransaction(txn))
+        )
           .map((inv) => inv.invoiceNumber)
           .join(" ")
           .toLowerCase();
@@ -816,8 +885,9 @@ export default function Banque() {
       })
       .filter((txn) => {
         if (statusFilter === "all") return true;
-        if (statusFilter === "reconciled") return txn.reconciledStatus === "rapproché";
-        return txn.reconciledStatus === "non_rapproché";
+        const badge = getTxnReconciliationBadgeStatus(txn, findSepaBatchForTransaction(txn));
+        if (statusFilter === "reconciled") return badge === "rapproché";
+        return badge !== "rapproché";
       })
       .filter((txn) => (currencyFilter ? txn.currency === currencyFilter : true))
       .filter((txn) => (operationTypeFilter ? txn.operationType === operationTypeFilter : true))
@@ -836,7 +906,7 @@ export default function Banque() {
       })
       .filter((txn) => amountMatchesRange(txn.amount, minAmount, maxAmount))
       .filter((txn) => {
-        const invoiceCount = getTxnInvoiceIds(txn).length;
+        const invoiceCount = getTxnDisplayInvoiceIds(txn, findSepaBatchForTransaction(txn)).length;
         if (invoiceFilter === "all") return true;
         if (invoiceFilter === "with_invoice") return invoiceCount > 0;
         if (invoiceFilter === "without_invoice") return invoiceCount === 0;
@@ -868,7 +938,6 @@ export default function Banque() {
     sepaBatchesByReference,
   ]);
 
-  const [aiSuggestionAvailableByTxn, setAiSuggestionAvailableByTxn] = useState<Record<string, boolean>>({});
 
   const linkedInvoiceIdsAcrossDecisions = useMemo(() => {
     return (Object.values(sepaLineDecisions) as SepaOperationDecision[]).flatMap(
@@ -885,69 +954,58 @@ export default function Banque() {
   const [dialogSepaCombinations, setDialogSepaCombinations] = useState<Record<string, SepaCombination[]>>({});
   const [batchLevelCombinations, setBatchLevelCombinations] = useState<SepaCombination[]>([]);
   const [dialogSepaLoading, setDialogSepaLoading] = useState(false);
+  const [manualRecoLoading, setManualRecoLoading] = useState(false);
+  const [manualRecoProcessing, setManualRecoProcessing] = useState(false);
   const autoReconciledRef = useRef<Set<string>>(new Set());
   const manualSuggestionsReqRef = useRef(0);
-  const AUTO_RECONCILE_THRESHOLD = 95;
+  const manualEngineRowsRef = useRef<SepaOperationCandidate[]>([]);
+  const manualRecoPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const AUTO_RECONCILE_THRESHOLD = 78;
+
+  const realInvoiceIdSet = useMemo(
+    () => new Set(realInvoices.map((inv) => String(inv.id))),
+    [realInvoices]
+  );
+
+  const getOpenInvoices = useCallback(
+    () =>
+      realInvoices.filter((inv) => {
+        const status = String(inv.status || "").toLowerCase();
+        return !["rapprochée", "rapprochee", "reconciled"].includes(status);
+      }),
+    [realInvoices]
+  );
 
   useEffect(() => {
-    const checkAiSuggestionsAvailability = async () => {
-      if (!realInvoices.length) {
-        setAiSuggestionAvailableByTxn({});
-        return;
-      }
+    const prefetchReconciliationCaches = async () => {
+      if (!realInvoices.length) return;
 
       const openInvoices = realInvoices.filter((inv) => {
         const status = String(inv.status || "").toLowerCase();
         return !["rapprochée", "rapprochee", "reconciled"].includes(status);
       });
-      if (!openInvoices.length) {
-        setAiSuggestionAvailableByTxn({});
-        return;
-      }
+      if (!openInvoices.length) return;
 
-      // Limit calls to visible top rows for responsiveness.
       const targets = filteredTxns
-        .filter((txn) => txn.reconciledStatus !== "rapproché")
+        .filter((txn) => getTxnReconciliationBadgeStatus(txn) !== "rapproché")
         .slice(0, 25);
 
-      const entries = await Promise.all(
-        targets.map(async (txn) => {
-          try {
-            const res = await fetch("/api/reconciliation/score", {
-              method: "POST",
-              credentials: "include",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                transaction: txn,
-                invoices: openInvoices,
-              }),
-            });
-            const data = await res.json().catch(() => ({}));
-            const scoring = String(data?.scoring || "");
-            const hasAi = scoring.includes("ai");
-            const hasAnySuggestion =
-              (Array.isArray(data?.suggestions) && data.suggestions.length > 0) ||
-              (Array.isArray(data?.combinations) && data.combinations.length > 0);
-            return [txn.id, hasAi && hasAnySuggestion, data] as const;
-          } catch {
-            return [txn.id, false, null] as const;
-          }
-        })
-      );
+      const scopeIds = targets.map((t) => t.id);
+      const { proposals: byId } = await fetchStoredProposalsMap(scopeIds, { ensure: true });
 
-      const next: Record<string, boolean> = {};
       const cacheNext: Record<string, any> = {};
       const sepaPrefetchNext: Record<string, { opId: string; suggestions: SepaOperationCandidate[]; combinations: SepaCombination[] }> = {};
-      entries.forEach(([id, flag, data]) => {
-        next[id] = flag;
-        if (data) cacheNext[id] = data;
-      });
+      for (const txn of targets) {
+        const row = byId[txn.id];
+        const payload = proposalPayloadFromRow(row);
+        if (payload && row?.processingStatus === "processed") {
+          cacheNext[txn.id] = payload;
+        }
+      }
 
-      // Prefetch first SEPA line suggestions for instant dialog open.
       await Promise.all(
         targets.map(async (txn) => {
           try {
-            if (!next[txn.id]) return;
             const batch = findSepaBatchForTransaction(txn);
             if (!batch || !Array.isArray(batch.operations) || batch.operations.length === 0) return;
             const firstOp = batch.operations[0];
@@ -985,14 +1043,13 @@ export default function Banque() {
         })
       );
 
-      setAiSuggestionAvailableByTxn(next);
       setAiScoreCacheByTxn((prev) => ({ ...prev, ...cacheNext }));
       if (Object.keys(sepaPrefetchNext).length > 0) {
         setSepaFirstOpCacheByTxn((prev) => ({ ...prev, ...sepaPrefetchNext }));
       }
     };
 
-    void checkAiSuggestionsAvailability();
+    void prefetchReconciliationCaches();
   }, [filteredTxns, realInvoices]);
 
   const resolveInvoicesByIds = (ids?: string[]) => {
@@ -1132,36 +1189,221 @@ export default function Banque() {
     };
   };
 
+  const mergeManualSuggestionLists = (
+    primary: SepaOperationCandidate[],
+    secondary: SepaOperationCandidate[]
+  ): SepaOperationCandidate[] => {
+    const seen = new Set(primary.map((row) => row.invoice.id));
+    const merged = [...primary];
+    for (const row of secondary) {
+      if (!seen.has(row.invoice.id)) {
+        merged.push(row);
+        seen.add(row.invoice.id);
+      }
+    }
+    return merged.sort((a, b) => b.score - a.score).slice(0, 8);
+  };
+
   const buildManualSuggestionsFromPayload = (payload: any, txn: LocalTransaction) => {
-    const aiCandidates = realInvoices
-      .filter((inv) => (inv.currency || txn.currency) === txn.currency)
-      .filter((inv) => {
-        const invoiceType = inv.type ?? (txn.amount < 0 ? "purchase" : "sales");
-        return txn.amount < 0 ? invoiceType === "purchase" : invoiceType === "sales";
-      });
+    const openById = new Map(getOpenInvoices().map((inv) => [String(inv.id), inv]));
     const raw = Array.isArray(payload?.suggestions) ? payload.suggestions : [];
-    const byInvId = new Map(aiCandidates.map((inv) => [inv.id, inv]));
+    const isEnginePayload = String(payload?.scoring || "").includes("engine");
     return raw
       .map((s: any) => {
-        const invoice = byInvId.get(String(s.invoiceId));
+        const invoiceId = String(s.invoiceId || s.invoice?.id || "");
+        const embedded = s.invoice;
+        const invoice =
+          openById.get(invoiceId) ||
+          realInvoices.find((inv) => String(inv.id) === invoiceId) ||
+          (embedded?.id
+            ? {
+                id: String(embedded.id),
+                invoiceNumber: embedded.invoiceNumber || "",
+                vendorCustomer: embedded.vendorCustomer || "",
+                amountGross: Number(embedded.amountGross || 0),
+                currency: txn.currency,
+                status: "non_rapprochée",
+                type: txn.amount < 0 ? "purchase" : "sales",
+              }
+            : null);
         if (!invoice) return null;
+        const status = String(invoice.status || "").toLowerCase();
+        if (["rapprochée", "rapprochee", "reconciled"].includes(status)) return null;
         const score = Number(s.score ?? 0);
         const parts: string[] = [];
         if (Array.isArray(s.signals) && s.signals.length) parts.push(...s.signals);
         if (s.reason) parts.push(String(s.reason));
-        if (typeof s.localScore === "number" && s.localScore !== score) {
-          parts.push(`Score local: ${s.localScore}%`);
-        }
+        const reasons = parts.length
+          ? filterSepaCandidateReasons(parts)
+          : buildCandidateReasons(txn, invoice as LocalInvoice, score);
+        return {
+          invoice: invoice as LocalInvoice,
+          score,
+          details: getMatchDetails(txn, invoice as LocalInvoice),
+          reasons: reasons.length ? reasons : [s.reason || "Correspondance moteur serveur"],
+        };
+      })
+      .filter((row): row is SepaOperationCandidate => Boolean(row))
+      .filter((item) => {
+        if (isEnginePayload) return item.score >= 35 && !isObviousBadBankMatch(txn, item.invoice, item.score);
+        return shouldDisplayBankSuggestion(txn, item.invoice, item.score, { trustBackend: true });
+      })
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 8);
+  };
+
+  const buildLocalFallbackManualSuggestions = (txn: LocalTransaction): SepaOperationCandidate[] => {
+    const txnCurrency = txn.currency || "EUR";
+    return getOpenInvoices()
+      .map((invoice) => {
+        const invForScore = {
+          ...invoice,
+          currency: (invoice.currency || txnCurrency) as CurrencyCode,
+        };
+        const score = computeMatchScore(txn, invForScore);
+        if (!shouldDisplayBankSuggestion(txn, invForScore, score)) return null;
         return {
           invoice,
           score,
           details: getMatchDetails(txn, invoice),
-          reasons: parts.length ? parts : buildCandidateReasons(txn, invoice, score),
-        };
+          reasons: buildCandidateReasons(txn, invForScore, score),
+        } as SepaOperationCandidate;
       })
       .filter((row): row is SepaOperationCandidate => Boolean(row))
-      .filter((item) => item.score >= 24)
-      .slice(0, 8);
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 5);
+  };
+
+  const applyManualSuggestionsFromStoredRow = (
+    txn: LocalTransaction,
+    row?: StoredReconciliationProposal,
+    engineRows: SepaOperationCandidate[] = manualEngineRowsRef.current
+  ) => {
+    const payload = row ? proposalPayloadFromRow(row) : null;
+    const fromStore = payload ? buildManualSuggestionsFromPayload(payload, txn) : [];
+    const merged = mergeManualSuggestionLists(engineRows, fromStore);
+
+    if (!row || row.processingStatus === "failed") {
+      setManualRecoProcessing(false);
+      if (merged.length > 0) {
+        setManualSuggestions(merged);
+        return;
+      }
+      setManualSuggestions(buildLocalFallbackManualSuggestions(txn));
+      return;
+    }
+    if (row.processingStatus === "processing") {
+      setManualRecoProcessing(true);
+      setManualSuggestions(merged);
+      return;
+    }
+    setManualRecoProcessing(false);
+    if (merged.length > 0) {
+      setManualSuggestions(merged);
+      if (payload) {
+        setAiScoreCacheByTxn((prev) => ({ ...prev, [txn.id]: payload }));
+      }
+      return;
+    }
+    setManualSuggestions(buildLocalFallbackManualSuggestions(txn));
+  };
+
+  const loadManualSuggestionsForTxn = async (
+    txn: LocalTransaction,
+    options?: { ensure?: boolean }
+  ) => {
+    const requestId = ++manualSuggestionsReqRef.current;
+    setManualRecoLoading(true);
+
+    const finish = () => {
+      if (manualSuggestionsReqRef.current === requestId) {
+        setManualRecoLoading(false);
+      }
+    };
+
+    try {
+      let engineRows: SepaOperationCandidate[] = [];
+      try {
+        const engine = await fetchEngineMatch(
+          txn as unknown as Record<string, unknown>,
+          getOpenInvoices()
+        );
+        if (manualSuggestionsReqRef.current !== requestId) return;
+        const enginePayload = {
+          suggestions: engine.suggestions || [],
+          scoring: engine.scoring || "engine-deterministic",
+          processingStatus: "processed",
+        };
+        engineRows = buildManualSuggestionsFromPayload(enginePayload, txn);
+        manualEngineRowsRef.current = engineRows;
+        if (engineRows.length > 0) {
+          setManualSuggestions(engineRows);
+          setManualRecoProcessing(false);
+        }
+      } catch (engineError) {
+        console.warn("fetchEngineMatch:", engineError);
+        manualEngineRowsRef.current = [];
+      }
+
+      const { proposals } = await fetchStoredProposalsMap([txn.id], {
+        ensure: options?.ensure !== false,
+      });
+      if (manualSuggestionsReqRef.current !== requestId) return;
+
+      let row = proposals[txn.id];
+      applyManualSuggestionsFromStoredRow(txn, row, engineRows);
+
+      const needsPoll =
+        row?.processingStatus === "processing" || (!row && options?.ensure !== false);
+
+      if (!needsPoll) {
+        finish();
+        return;
+      }
+
+      let attempts = 0;
+      const poll = async () => {
+        if (manualSuggestionsReqRef.current !== requestId) return;
+        attempts += 1;
+        const { proposals: nextMap } = await fetchStoredProposalsMap([txn.id], { ensure: false });
+        if (manualSuggestionsReqRef.current !== requestId) return;
+        row = nextMap[txn.id];
+        if (row?.processingStatus === "processed" || row?.processingStatus === "failed") {
+          applyManualSuggestionsFromStoredRow(txn, row, manualEngineRowsRef.current);
+          finish();
+          return;
+        }
+        if (attempts < 20) {
+          manualRecoPollTimerRef.current = window.setTimeout(() => void poll(), 2500);
+        } else {
+          applyManualSuggestionsFromStoredRow(txn, row, manualEngineRowsRef.current);
+          finish();
+        }
+      };
+      manualRecoPollTimerRef.current = window.setTimeout(() => void poll(), 2000);
+    } catch (error) {
+      console.error("loadManualSuggestionsForTxn:", error);
+      if (manualSuggestionsReqRef.current === requestId) {
+        setManualSuggestions(buildLocalFallbackManualSuggestions(txn));
+        setManualRecoProcessing(false);
+      }
+      finish();
+    }
+  };
+
+  const handleRecalculateReconciliation = async (txn: LocalTransaction) => {
+    setManualRecoLoading(true);
+    setManualRecoProcessing(true);
+    setManualSuggestions([]);
+    try {
+      await requestRecalculate(txn, getOpenInvoices());
+      await loadManualSuggestionsForTxn(txn, { ensure: false });
+    } catch (error) {
+      console.error("handleRecalculateReconciliation:", error);
+      toast?.error?.("Impossible de lancer le recalcul.");
+      setManualRecoLoading(false);
+      setManualRecoProcessing(false);
+    }
   };
 
   const handleSuggestionBadgeClick = async (txn: LocalTransaction) => {
@@ -1243,94 +1485,51 @@ export default function Banque() {
     }
 
     openDetailsSection(txn, "dialog");
-
-    const cachedPayload = aiScoreCacheByTxn[txn.id];
-    if (cachedPayload) {
-      setManualSuggestions(buildManualSuggestionsFromPayload(cachedPayload, txn));
-      return;
-    }
-
-    try {
-      const aiCandidates = realInvoices
-        .filter((inv) => (inv.currency || txn.currency) === txn.currency)
-        .filter((inv) => {
-          const invoiceType = inv.type ?? (txn.amount < 0 ? "purchase" : "sales");
-          return txn.amount < 0 ? invoiceType === "purchase" : invoiceType === "sales";
-        });
-      const res = await fetch("/api/reconciliation/score", {
-        method: "POST",
-        credentials: "include",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          transaction: txn,
-          invoices: aiCandidates,
-        }),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) return;
-      setAiScoreCacheByTxn((prev) => ({ ...prev, [txn.id]: data }));
-      setManualSuggestions(buildManualSuggestionsFromPayload(data, txn));
-    } catch {
-      // keep UI responsive even if prefetch fails
-    }
+    void loadManualSuggestionsForTxn(txn, { ensure: true });
   };
 
   useEffect(() => {
-    const loadReconciliationSuggestions = async () => {
-      if (!selectedDetailsTxn) {
-        setManualSuggestions([]);
-        return;
-      }
-      const requestId = ++manualSuggestionsReqRef.current;
-      const txnSnapshot = selectedDetailsTxn;
-
-      const aiCandidates = realInvoices
-        .filter((inv) => (inv.currency || selectedDetailsTxn.currency) === selectedDetailsTxn.currency)
-        .filter((inv) => {
-          const invoiceType = inv.type ?? (selectedDetailsTxn.amount < 0 ? "purchase" : "sales");
-          return selectedDetailsTxn.amount < 0 ? invoiceType === "purchase" : invoiceType === "sales";
-        });
-      if (!aiCandidates.length) {
-        setManualSuggestions([]);
-        return;
-      }
-
-      // Instant opening path: use preloaded IA cache if available.
-      const cachedPayload = aiScoreCacheByTxn[txnSnapshot.id];
-      if (cachedPayload) {
-        if (manualSuggestionsReqRef.current === requestId) {
-          setManualSuggestions(buildManualSuggestionsFromPayload(cachedPayload, txnSnapshot));
-        }
-        return;
-      }
-
-      try {
-        const res = await fetch("/api/reconciliation/score", {
-          method: "POST",
-          credentials: "include",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            transaction: txnSnapshot,
-            invoices: aiCandidates,
-          }),
-        });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data?.error || "Agent IA indisponible");
-
-        if (manualSuggestionsReqRef.current !== requestId) return;
-        setAiScoreCacheByTxn((prev) => ({ ...prev, [txnSnapshot.id]: data }));
-        setManualSuggestions(buildManualSuggestionsFromPayload(data, txnSnapshot));
-      } catch (error) {
-        console.error("Erreur scoring rapprochement IA:", error);
-        if (manualSuggestionsReqRef.current === requestId) {
-          setManualSuggestions([]);
-          toast?.error?.("Rapprochement IA indisponible pour cette opération.");
-        }
+    if (manualRecoPollTimerRef.current) {
+      window.clearTimeout(manualRecoPollTimerRef.current);
+      manualRecoPollTimerRef.current = null;
+    }
+    if (!selectedDetailsTxn || selectedTxnIsSepa) {
+      setManualSuggestions([]);
+      setManualRecoLoading(false);
+      setManualRecoProcessing(false);
+      return;
+    }
+    void loadManualSuggestionsForTxn(selectedDetailsTxn, { ensure: true });
+    return () => {
+      if (manualRecoPollTimerRef.current) {
+        window.clearTimeout(manualRecoPollTimerRef.current);
       }
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDetailsTxn?.id, selectedTxnIsSepa, realInvoices.length]);
 
-    void loadReconciliationSuggestions();
-  }, [selectedDetailsTxn, realInvoices, aiScoreCacheByTxn]);
+  useEffect(() => {
+    if (!selectedDetailsTxn || selectedTxnIsSepa) return;
+    if (selectedDetailsTxn.reconciledStatus === "rapproché") return;
+    if (manualInvoiceSelection.length > 0) return;
+    const top = manualSuggestions[0];
+    if (top?.invoice?.id && top.score >= 40) {
+      setManualInvoiceSelection([top.invoice.id]);
+    }
+  }, [manualSuggestions, selectedDetailsTxn, selectedTxnIsSepa, manualInvoiceSelection.length]);
+
+  useEffect(() => {
+    return subscribeReconciliationEvents((payload) => {
+      const type = String(payload?.type || "");
+      if (type !== "RECONCILIATION_PROCESSED" && type !== "RECONCILIATION_FAILED") return;
+      const txnId = String(payload?.bank_transaction_id || payload?.entity_id || "");
+      if (!txnId || txnId.includes("::")) return;
+      if (selectedDetailsTxn?.id === txnId && !selectedTxnIsSepa) {
+        void loadManualSuggestionsForTxn(selectedDetailsTxn, { ensure: false });
+      }
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedDetailsTxn?.id, selectedTxnIsSepa]);
 
   useEffect(() => {
     const loadDialogSepaSuggestions = async () => {
@@ -1680,6 +1879,8 @@ export default function Banque() {
       ? "rapproché"
       : "non_rapproché";
     const previousMatched = selectedDetailsTxn.matchedInvoiceIds ?? [];
+    const nextMatched = allApproved ? allMatched : [];
+    const nextPending = allApproved ? [] : allMatched;
 
     setTransactions((prev) =>
       prev.map((txn) =>
@@ -1687,7 +1888,8 @@ export default function Banque() {
           ? {
               ...txn,
               reconciledStatus: nextTxnStatus,
-              matchedInvoiceIds: allMatched,
+              matchedInvoiceIds: nextMatched,
+              pendingInvoiceIds: nextPending,
               sepaLineDecisions: updates,
             }
           : txn
@@ -1696,7 +1898,8 @@ export default function Banque() {
 
     void persistTxnReconciliation(selectedDetailsTxn.id, {
       reconciledStatus: nextTxnStatus,
-      matchedInvoiceIds: allMatched,
+      matchedInvoiceIds: nextMatched,
+      pendingInvoiceIds: nextPending,
       sepaLineDecisions: updates,
     });
 
@@ -1706,12 +1909,11 @@ export default function Banque() {
       void syncInvoicesStatusFromTxn(added, removed);
     }
 
-    const topScore = autoAppliedLines[0]?.score ?? AUTO_RECONCILE_THRESHOLD;
     const totalLinked = autoAppliedLines.reduce((s, l) => s + l.invoiceIds.length, 0);
     toast?.success?.(
       allApproved
-        ? `Lot SEPA rapproché automatiquement (${totalLinked} facture(s) liées, match ≥ ${AUTO_RECONCILE_THRESHOLD}%)`
-        : `${autoAppliedLines.length} ligne(s) SEPA auto-rapprochée(s) (≥ ${topScore}%)`
+        ? `Lot SEPA rapproché automatiquement (${totalLinked} facture(s) liées).`
+        : `${autoAppliedLines.length} ligne(s) SEPA rapprochée(s) en partie (${totalLinked} facture(s) liées).`
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dialogSepaSuggestions, dialogSepaLoading, selectedDetailsTxn, selectedSepaBatch, selectedTxnIsSepa]);
@@ -1753,7 +1955,7 @@ export default function Banque() {
     if (added.length || removed.length) {
       void syncInvoicesStatusFromTxn(added, removed);
     }
-    toast?.success?.(`Rapprochement automatique (match ${top.score}%).`);
+    toast?.success?.("Rapprochement automatique appliqué.");
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [manualSuggestions, selectedDetailsTxn, selectedTxnIsSepa]);
 
@@ -1766,9 +1968,20 @@ export default function Banque() {
         rejectAllSuggestions: false,
       }
     : null;
-  // Never hard-lock SEPA lines in the reconciliation view:
-  // users must always be able to adjust/manual edit when opening this workflow.
-  const sepaCurrentIsLocked = false;
+  const isSepaLineLocked = (operationId: string) => {
+    const decision = sepaLineDecisions[operationId];
+    if (decision?.status !== "approved") return false;
+    if (!(decision.selectedInvoiceIds?.length ?? 0)) return false;
+    return !sepaEditModeByOperation[operationId];
+  };
+
+  const sepaCurrentIsLocked = sepaCurrentOperation
+    ? isSepaLineLocked(sepaCurrentOperation.id)
+    : false;
+
+  const allSepaLinesApproved =
+    sepaOperations.length > 0 &&
+    sepaOperations.every((op) => sepaLineDecisions[op.id]?.status === "approved");
 
   const sepaCurrentCandidates = useMemo(() => {
     if (!sepaCurrentOperation) return [] as SepaOperationCandidate[];
@@ -1803,7 +2016,11 @@ export default function Banque() {
             partialPercent: 0,
             remaining: 0,
           },
-          reasons: ["Facture déjà sélectionnée manuellement"],
+          reasons: [
+            sepaCurrentDecision?.status === "approved"
+              ? "Rapprochement automatique"
+              : "Facture retenue pour cette ligne",
+          ],
         } as SepaOperationCandidate;
       });
 
@@ -1863,12 +2080,28 @@ export default function Banque() {
     }));
   };
 
+  const refreshRealInvoices = async () => {
+    try {
+      const res = await fetch("/api/invoices", { credentials: "include" });
+      const data = await res.json();
+      if (!res.ok) return;
+      const fetched: LocalInvoice[] = Array.isArray(data?.invoices) ? data.invoices : [];
+      setRealInvoices(fetched);
+      localInvoices.splice(0, localInvoices.length, ...fetched);
+    } catch (error) {
+      console.error("refreshRealInvoices error:", error);
+    }
+  };
+
   const persistTxnReconciliation = async (
     txnId: string,
     patch: Record<string, any>,
   ) => {
     const txn = transactions.find((t) => t.id === txnId);
-    if (!txn?.sourceDocumentId) return;
+    if (!txn?.sourceDocumentId) {
+      console.warn("persistTxnReconciliation: opération sans sourceDocumentId", txnId);
+      return;
+    }
     const cacheKey = makeRecoCacheKey(txn.sourceDocumentId, txn.id);
     const currentCache = readLocalReconciliationCache();
     writeLocalReconciliationCache({
@@ -1879,6 +2112,10 @@ export default function Banque() {
         updatedAt: new Date().toISOString(),
       },
     });
+
+    if (!canPersistToImportBackend(txn.sourceDocumentId)) {
+      return;
+    }
 
     try {
       if (backendRecoPersistenceUnavailable) {
@@ -1896,9 +2133,8 @@ export default function Banque() {
       if (!res.ok) {
         const payload = await res.json().catch(() => ({}));
         if (res.status === 404) {
-          // Endpoint not available on current backend runtime: keep local-only persistence.
           setBackendRecoPersistenceUnavailable(true);
-          console.warn("Backend reconciliation persistence endpoint not found (404). Using local cache only.");
+          console.warn("Endpoint /imports/:id/reconciliation introuvable (404). Cache local uniquement.");
           return;
         }
         throw new Error(payload?.error || `HTTP ${res.status}`);
@@ -1939,17 +2175,29 @@ export default function Banque() {
         const payload = await res.json().catch(() => ({}));
         throw new Error(payload?.error || `HTTP ${res.status}`);
       }
+      await refreshRealInvoices();
     } catch (error) {
       console.error("syncInvoicesStatusFromTxn error:", error);
       toast?.error?.("Statut facture non synchronisé côté backend.");
     }
   };
 
+  const resolveManualInvoiceIdsToApply = (): string[] => {
+    if (manualInvoiceSelection.length > 0) return manualInvoiceSelection;
+    const top = manualSuggestions[0];
+    return top?.invoice?.id ? [top.invoice.id] : [];
+  };
+
   const applyManualReconciliation = () => {
     if (!selectedDetailsTxn) return;
+    const invoiceIdsToApply = resolveManualInvoiceIdsToApply();
+    if (invoiceIdsToApply.length === 0) {
+      toast?.error?.("Cochez au moins une facture (ou attendez une proposition) avant de rapprocher.");
+      return;
+    }
     const previousMatched = selectedDetailsTxn.matchedInvoiceIds ?? [];
 
-    const noAiSuggestionAccepted = manualRejectAllSuggestions && manualInvoiceSelection.length === 0;
+    const noAiSuggestionAccepted = manualRejectAllSuggestions && invoiceIdsToApply.length === 0;
     const generatedComment = noAiSuggestionAccepted
       ? ["Aucune proposition IA retenue", manualComment.trim()].filter(Boolean).join(" — ")
       : manualComment.trim() || undefined;
@@ -1959,9 +2207,9 @@ export default function Banque() {
         txn.id === selectedDetailsTxn.id
           ? {
               ...txn,
-              reconciledStatus: manualInvoiceSelection.length > 0 ? "rapproché" : "non_rapproché",
-              matchedInvoiceIds: manualInvoiceSelection.length > 0 ? manualInvoiceSelection : [],
-              pendingInvoiceIds: manualInvoiceSelection.length > 0 ? [] : [],
+              reconciledStatus: invoiceIdsToApply.length > 0 ? "rapproché" : "non_rapproché",
+              matchedInvoiceIds: invoiceIdsToApply.length > 0 ? invoiceIdsToApply : [],
+              pendingInvoiceIds: invoiceIdsToApply.length > 0 ? [] : [],
               unreconciledCategory: manualCategory || undefined,
               unreconciledComment: generatedComment,
               reviewFlag: manualReviewFlag || noAiSuggestionAccepted,
@@ -1971,19 +2219,19 @@ export default function Banque() {
     );
 
     void persistTxnReconciliation(selectedDetailsTxn.id, {
-      reconciledStatus: manualInvoiceSelection.length > 0 ? "rapproché" : "non_rapproché",
-      matchedInvoiceIds: manualInvoiceSelection.length > 0 ? manualInvoiceSelection : [],
-      pendingInvoiceIds: manualInvoiceSelection.length > 0 ? [] : [],
+      reconciledStatus: invoiceIdsToApply.length > 0 ? "rapproché" : "non_rapproché",
+      matchedInvoiceIds: invoiceIdsToApply.length > 0 ? invoiceIdsToApply : [],
+      pendingInvoiceIds: invoiceIdsToApply.length > 0 ? [] : [],
       unreconciledCategory: manualCategory || null,
       unreconciledComment: generatedComment || null,
       reviewFlag: manualReviewFlag || noAiSuggestionAccepted,
     });
     void syncInvoicesStatusFromTxn(
-      manualInvoiceSelection.length > 0 ? manualInvoiceSelection : [],
-      previousMatched.filter((id) => !manualInvoiceSelection.includes(id)),
+      invoiceIdsToApply.length > 0 ? invoiceIdsToApply : [],
+      previousMatched.filter((id) => !invoiceIdsToApply.includes(id)),
     );
 
-    toast?.success?.("Opération mise à jour.");
+    toast?.success?.("Opération rapprochée.");
   };
 
   const resetManualReconciliation = () => {
@@ -2041,6 +2289,8 @@ export default function Banque() {
     const nextTxnStatus: "rapproché" | "non_rapproché" = allApproved
       ? "rapproché"
       : "non_rapproché";
+    const nextMatched = allApproved ? allMatched : [];
+    const nextPending = allApproved ? [] : allMatched;
 
     const previousMatched = selectedDetailsTxn.matchedInvoiceIds ?? [];
 
@@ -2067,7 +2317,8 @@ export default function Banque() {
         txn.id === selectedDetailsTxn.id
           ? {
               ...txn,
-              matchedInvoiceIds: allMatched,
+              matchedInvoiceIds: nextMatched,
+              pendingInvoiceIds: nextPending,
               reconciledStatus: nextTxnStatus,
               sepaLineDecisions: nextDecisions,
               unreconciledComment: markAsNoMatch
@@ -2085,12 +2336,13 @@ export default function Banque() {
 
     void persistTxnReconciliation(selectedDetailsTxn.id, {
       reconciledStatus: nextTxnStatus,
-      matchedInvoiceIds: allMatched,
+      matchedInvoiceIds: nextMatched,
+      pendingInvoiceIds: nextPending,
       sepaLineDecisions: nextDecisions,
     });
 
-    const added = allMatched.filter((id) => !previousMatched.includes(id));
-    const removed = previousMatched.filter((id) => !allMatched.includes(id));
+    const added = nextMatched.filter((id) => !previousMatched.includes(id));
+    const removed = previousMatched.filter((id) => !nextMatched.includes(id));
     if (added.length || removed.length) {
       void syncInvoicesStatusFromTxn(added, removed);
     }
@@ -2120,10 +2372,6 @@ export default function Banque() {
 
   const validateCurrentSepaOperation = (status: Exclude<SepaOperationDecisionStatus, "pending">) => {
     if (!sepaCurrentOperation) return;
-    if (status === "approved" && !(sepaCurrentDecision?.selectedInvoiceIds?.length)) {
-      toast?.error?.("Sélectionne une facture avant de valider la ligne en rapprochée.");
-      return;
-    }
     let nextDecisionsSnapshot: Record<string, SepaOperationDecision> | null = null;
     setSepaLineDecisions((prev) => {
       const current = prev[sepaCurrentOperation.id] ?? {
@@ -2131,11 +2379,22 @@ export default function Banque() {
         selectedInvoiceIds: [],
         rejectAllSuggestions: false,
       };
+      let selectedInvoiceIds = [...(current.selectedInvoiceIds || [])];
+      if (status === "approved" && selectedInvoiceIds.length === 0) {
+        const top = sepaCurrentCandidates[0];
+        if (top?.invoice?.id) selectedInvoiceIds = [top.invoice.id];
+      }
+      if (status === "approved" && selectedInvoiceIds.length === 0) {
+        toast?.error?.("Sélectionne une facture avant de valider la ligne en rapprochée.");
+        return prev;
+      }
       const next = {
         ...prev,
         [sepaCurrentOperation.id]: {
           ...current,
           status,
+          selectedInvoiceIds,
+          rejectAllSuggestions: false,
         },
       };
       nextDecisionsSnapshot = next;
@@ -2376,8 +2635,12 @@ export default function Banque() {
     setPayrollOnly(false);
   };
 
-  const reconciledCount = filteredTxns.filter((t) => t.reconciledStatus === "rapproché").length;
-  const unreconciledCount = filteredTxns.filter((t) => t.reconciledStatus === "non_rapproché").length;
+  const reconciledCount = filteredTxns.filter(
+    (t) => getTxnReconciliationBadgeStatus(t) === "rapproché"
+  ).length;
+  const unreconciledCount = filteredTxns.filter(
+    (t) => getTxnReconciliationBadgeStatus(t) !== "rapproché"
+  ).length;
   const currentViewCount = filteredTxns.length;
 
   return (
@@ -2599,9 +2862,9 @@ export default function Banque() {
                     </TableRow>
                   ) : (
                     filteredTxns.map((txn) => {
-                      const invoiceIds = getTxnInvoiceIds(txn);
                       const batch = findSepaBatchForTransaction(txn);
-                      const hasSuggestion = Boolean(aiSuggestionAvailableByTxn[txn.id]);
+                      const invoiceChips = getTxnInvoiceDisplayChips(txn, batch, realInvoices);
+                      const recoBadgeStatus = getTxnReconciliationBadgeStatus(txn, batch);
 
                       return (
                         <TableRow key={txn.id} className={detailsTxnId === txn.id ? "bg-sky-50/60" : ""}>
@@ -2643,16 +2906,6 @@ export default function Banque() {
                                     SEPA lié
                                   </button>
                                 ) : null}
-                                {hasSuggestion ? (
-                                  <button
-                                    type="button"
-                                    onClick={() => void handleSuggestionBadgeClick(txn)}
-                                    className="inline-flex items-center gap-1 rounded-full bg-amber-50 px-2 py-1 text-xs font-medium text-amber-700 ring-1 ring-amber-200 hover:bg-amber-100"
-                                    title="Suggestions de rapprochement disponibles"
-                                  >
-                                    Suggestion dispo
-                                  </button>
-                                ) : null}
                               </div>
                             </div>
                           </TableCell>
@@ -2662,27 +2915,26 @@ export default function Banque() {
                             </span>
                           </TableCell>
                           <TableCell>
-                            {invoiceIds.length === 0 ? (
+                            {invoiceChips.length === 0 ? (
                               <span className="text-xs text-slate-500">Aucune</span>
                             ) : (
                               <div className="flex max-w-full flex-wrap gap-1 overflow-hidden">
-                                {invoiceIds.slice(0, 3).map((invoiceId) => {
-                                  const invoice = resolveInvoicesByIds([invoiceId])[0];
-                                  if (!invoice) return null;
-                                  return (
-                                    <span key={invoiceId} className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-700">
-                                      {invoice.invoiceNumber}
-                                    </span>
-                                  );
-                                })}
-                                {invoiceIds.length > 3 ? (
-                                  <span className="text-xs text-slate-500">+{invoiceIds.length - 3}</span>
+                                {invoiceChips.slice(0, 3).map((chip) => (
+                                  <span
+                                    key={chip.key}
+                                    className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-700"
+                                  >
+                                    {chip.label}
+                                  </span>
+                                ))}
+                                {invoiceChips.length > 3 ? (
+                                  <span className="text-xs text-slate-500">+{invoiceChips.length - 3}</span>
                                 ) : null}
                               </div>
                             )}
                           </TableCell>
                           <TableCell>
-                            <StatusBadge status={txn.reconciledStatus} />
+                            <StatusBadge status={recoBadgeStatus} compact />
                           </TableCell>
                           <TableCell className="align-top text-right">
                             <div className="flex items-center justify-end gap-2">
@@ -2704,7 +2956,7 @@ export default function Banque() {
                                     <Link2 className="mr-2 h-4 w-4" />
                                     Ouvrir le rapprochement
                                   </DropdownMenuItem>
-                                  {txn.reconciledStatus === "rapproché" ? (
+                                  {recoBadgeStatus !== "non_rapproché" ? (
                                     <DropdownMenuItem onClick={() => handleUnreconcile(txn.id)}>
                                       <Undo2 className="mr-2 h-4 w-4" />
                                       Annuler le rapprochement
@@ -2733,11 +2985,33 @@ export default function Banque() {
             {selectedDetailsTxn && !selectedTxnIsSepa ? (
               <SectionCard title="Rapprochement" subtitle="Sélection manuelle des factures proposées">
                 <div className="space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-xs text-slate-500">
+                      {manualRecoLoading || manualRecoProcessing
+                        ? "Calcul des suggestions en cours (file IA serveur)…"
+                        : "Suggestions du moteur serveur (montant, dates, références, sens). Complément IA si cohérent."}
+                    </p>
+                    {selectedDetailsTxn.reconciledStatus !== "rapproché" ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={manualRecoLoading}
+                        onClick={() => void handleRecalculateReconciliation(selectedDetailsTxn)}
+                      >
+                        {manualRecoLoading ? "Recalcul…" : "Recalculer les suggestions"}
+                      </Button>
+                    ) : null}
+                  </div>
                   {manualSuggestions.length === 0 ? (
                     <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500">
                       {realInvoices.length === 0
                         ? "Aucune facture réelle chargée pour proposer un rapprochement."
-                        : "Aucune suggestion disponible pour cette opération."}
+                        : manualRecoLoading || manualRecoProcessing
+                          ? "Analyse en cours. Les propositions apparaîtront ici dès que le serveur aura terminé."
+                          : getOpenInvoices().length === 0
+                            ? "Toutes les factures sont déjà marquées rapprochées."
+                            : "Aucune proposition pour l'instant. Utilisez Recalculer les suggestions ou vérifiez le statut des factures."}
                     </div>
                   ) : (
                     manualSuggestions.map((candidate) => {
@@ -2759,9 +3033,6 @@ export default function Banque() {
                                 />
                                 {candidate.invoice.invoiceNumber}
                               </label>
-                              <span className="rounded-full bg-emerald-50 px-2 py-1 text-xs text-emerald-700 ring-1 ring-emerald-100">
-                                {candidate.score}% match
-                              </span>
                             </div>
                             <p className="text-sm text-slate-700">{candidate.invoice.vendorCustomer}</p>
                             <div className="flex flex-wrap gap-3 text-xs text-slate-500">
@@ -2796,70 +3067,17 @@ export default function Banque() {
                     })
                   )}
 
-                  <div className="rounded-2xl border border-slate-200 p-4">
-                    <div className="grid gap-3">
-                      <select
-                        className="h-10 rounded-md border border-slate-200 bg-white px-3 text-sm"
-                        value={manualCategory}
-                        onChange={(e) => setManualCategory(e.target.value as "" | UnreconciledCategory)}
+                  {selectedDetailsTxn.reconciledStatus !== "rapproché" ? (
+                    <div className="flex flex-wrap justify-end gap-2 border-t border-slate-200 pt-3">
+                      <Button
+                        type="button"
+                        onClick={applyManualReconciliation}
+                        disabled={resolveManualInvoiceIdsToApply().length === 0}
                       >
-                        <option value="">Aucune catégorie d'écart</option>
-                        {Object.entries(unreconciledCategoryLabels).map(([key, label]) => (
-                          <option key={key} value={key}>
-                            {label}
-                          </option>
-                        ))}
-                      </select>
-
-                      <Input
-                        value={manualComment}
-                        onChange={(e) => setManualComment(e.target.value)}
-                        placeholder="Commentaire / justification"
-                        className="bg-white"
-                      />
-
-                      <label className="flex items-center gap-2 text-sm text-slate-700">
-                        <input
-                          type="checkbox"
-                          checked={manualReviewFlag}
-                          onChange={(e) => setManualReviewFlag(e.target.checked)}
-                        />
-                        Marquer pour revue
-                      </label>
-
-                      <label className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
-                        <input
-                          type="checkbox"
-                          checked={manualRejectAllSuggestions}
-                          onChange={(e) => {
-                            const checked = e.target.checked;
-                            setManualRejectAllSuggestions(checked);
-                            if (checked) {
-                              setManualInvoiceSelection([]);
-                              setManualReviewFlag(true);
-                            }
-                          }}
-                        />
-                        Rejeter toutes les propositions IA
-                      </label>
-
-                      {manualRejectAllSuggestions ? (
-                        <p className="text-xs text-slate-500">
-                          Cas typique : aucune facture proposée n'est valable pour le moment, par exemple facture non encore reçue.
-                        </p>
-                      ) : null}
-
-                      <div className="flex flex-wrap gap-2 pt-2">
-                        <Button onClick={applyManualReconciliation}>
-                          <Check className="mr-1 h-4 w-4" />
-                          Enregistrer
-                        </Button>
-                        <Button variant="outline" onClick={resetManualReconciliation}>
-                          Réinitialiser
-                        </Button>
-                      </div>
+                        Rapprocher
+                      </Button>
                     </div>
-                  </div>
+                  ) : null}
                 </div>
               </SectionCard>
             ) : null}
@@ -2913,12 +3131,6 @@ export default function Banque() {
                           >
                             <div className="flex items-center justify-between gap-2 mb-2">
                               <div className="flex flex-wrap items-center gap-2">
-                                <span className={`rounded-full px-2 py-1 text-xs font-bold ring-1 ${
-                                  combo.score >= 95 ? "bg-emerald-100 text-emerald-800 ring-emerald-200"
-                                  : "bg-amber-100 text-amber-800 ring-amber-200"
-                                }`}>
-                                  {combo.score}%
-                                </span>
                                 {combo.matchType === "supplier" && (
                                   <span className="rounded-full bg-sky-100 px-2 py-1 text-xs font-medium text-sky-700 ring-1 ring-sky-200">
                                     Fournisseur identifié
@@ -3050,10 +3262,11 @@ export default function Banque() {
                         {sepaCurrentIsLocked ? (
                           <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
                             <p className="text-sm font-medium text-emerald-800">
-                              Cette sous-opération est déjà rapprochée.
+                              Cette sous-opération est déjà rapprochée
+                              {sepaCurrentDecision?.status === "approved" ? " (automatiquement ou manuellement)" : ""}.
                             </p>
                             <p className="mt-1 text-xs text-emerald-700">
-                              Le système ne repropose pas de nouvelles factures tant que tu ne demandes pas une modification.
+                              Aucune action requise. Utilisez « Modifier » pour changer la facture liée.
                             </p>
                             <div className="mt-3 flex flex-wrap gap-2">
                               {(sepaCurrentDecision?.selectedInvoiceIds || []).map((invoiceId) => {
@@ -3096,10 +3309,6 @@ export default function Banque() {
                                   sepaCurrentDecision?.selectedInvoiceIds.includes(id)
                                 );
                                 const isSupplierMatch = combo.reason.includes("Fournisseur SEPA");
-                                const scoreColor =
-                                  combo.score >= 95 ? "bg-emerald-100 text-emerald-800 ring-emerald-200"
-                                  : combo.score >= 80 ? "bg-sky-100 text-sky-800 ring-sky-200"
-                                  : "bg-violet-100 text-violet-800 ring-violet-200";
                                 const borderColor =
                                   allChecked ? "border-emerald-300 bg-emerald-50/40"
                                   : isSupplierMatch ? "border-sky-200 bg-sky-50/30"
@@ -3111,9 +3320,6 @@ export default function Banque() {
                                   >
                                     <div className="flex items-start justify-between gap-2 mb-3">
                                       <div className="flex flex-wrap items-center gap-2">
-                                        <span className={`rounded-full px-2.5 py-1 text-xs font-bold ring-1 ${scoreColor}`}>
-                                          {combo.score}%
-                                        </span>
                                         {isSupplierMatch && (
                                           <span className="rounded-full bg-sky-100 px-2 py-1 text-xs font-medium text-sky-700 ring-1 ring-sky-200">
                                             Fournisseur SEPA
@@ -3209,9 +3415,6 @@ export default function Banque() {
                                       />
                                       {candidate.invoice.invoiceNumber}
                                     </label>
-                                    <span className="rounded-full bg-emerald-50 px-2 py-1 text-xs text-emerald-700 ring-1 ring-emerald-100">
-                                      {candidate.score}% match
-                                    </span>
                                   </div>
                                   <p className="text-sm text-slate-700">{candidate.invoice.vendorCustomer}</p>
                                   <div className="flex flex-wrap gap-3 text-xs text-slate-500">
@@ -3333,8 +3536,11 @@ export default function Banque() {
                     <p className="mt-1 text-xs text-slate-500">{selectedDetailsTxn.reference}</p>
                   </div>
                   <div className="flex items-center gap-2">
-                    <StatusBadge status={selectedDetailsTxn.reconciledStatus} />
-                    {selectedDetailsTxn.reconciledStatus === "rapproché" ? (
+                    <StatusBadge
+                      status={getTxnReconciliationBadgeStatus(selectedDetailsTxn)}
+                      compact
+                    />
+                    {getTxnReconciliationBadgeStatus(selectedDetailsTxn) !== "non_rapproché" ? (
                       <Button
                         variant="outline"
                         size="sm"
@@ -3396,7 +3602,7 @@ export default function Banque() {
                           <p className="mt-1 font-semibold text-slate-900">{selectedSepaBatch.debtorName}</p>
                         </div>
                       </div>
-                      {selectedDetailsTxn.reconciledStatus === "rapproché" ? (
+                      {selectedDetailsTxn.reconciledStatus === "rapproché" || allSepaLinesApproved ? (
                         <div className="space-y-3">
                           {selectedSepaBatch.operations.map((op) => {
                             const decision = sepaLineDecisions[op.id] ?? {
@@ -3456,9 +3662,6 @@ export default function Banque() {
                                                   <div className="flex flex-wrap items-center gap-2">
                                                     <span className="text-sm font-semibold text-slate-900">
                                                       {candidate.invoice.invoiceNumber}
-                                                    </span>
-                                                    <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700 ring-1 ring-emerald-100">
-                                                      {candidate.score}% score
                                                     </span>
                                                     <button
                                                       type="button"
@@ -3613,12 +3816,6 @@ export default function Banque() {
                                   >
                                     <div className="flex items-center justify-between gap-2 mb-2">
                                       <div className="flex flex-wrap items-center gap-2">
-                                        <span className={`rounded-full px-2 py-1 text-xs font-bold ring-1 ${
-                                          combo.score >= 95 ? "bg-emerald-100 text-emerald-800 ring-emerald-200"
-                                          : "bg-amber-100 text-amber-800 ring-amber-200"
-                                        }`}>
-                                          {combo.score}%
-                                        </span>
                                         {combo.matchType === "supplier" && (
                                           <span className="rounded-full bg-sky-100 px-2 py-1 text-xs font-medium text-sky-700 ring-1 ring-sky-200">
                                             Fournisseur identifié
@@ -3726,7 +3923,44 @@ export default function Banque() {
                               </div>
 
                               <div className="space-y-3">
-                                {sepaCurrentCandidates.length === 0 ? (
+                                {sepaCurrentIsLocked ? (
+                                  <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
+                                    <p className="text-sm font-medium text-emerald-800">
+                                      Cette sous-opération a été rapprochée automatiquement.
+                                    </p>
+                                    <div className="mt-3 flex flex-wrap gap-2">
+                                      {(sepaCurrentDecision?.selectedInvoiceIds || []).map((invoiceId) => {
+                                        const inv = resolveInvoicesByIds([invoiceId])[0];
+                                        if (!inv) return null;
+                                        return (
+                                          <button
+                                            key={invoiceId}
+                                            type="button"
+                                            onClick={() => openInvoicePdf(inv)}
+                                            className="inline-flex items-center gap-1 rounded-full bg-white px-2 py-1 text-xs text-emerald-800 ring-1 ring-emerald-200 hover:bg-emerald-50"
+                                          >
+                                            <FileSearch className="h-3 w-3" />
+                                            {inv.invoiceNumber} · {inv.vendorCustomer}
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                    <div className="mt-3">
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() =>
+                                          setSepaEditModeByOperation((prev) => ({
+                                            ...prev,
+                                            [sepaCurrentOperation.id]: true,
+                                          }))
+                                        }
+                                      >
+                                        Modifier ce rapprochement
+                                      </Button>
+                                    </div>
+                                  </div>
+                                ) : sepaCurrentCandidates.length === 0 ? (
                                   <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500">
                                     Aucune suggestion pour cette sous-opération.
                                   </div>
@@ -3751,9 +3985,6 @@ export default function Banque() {
                                             <div className="flex flex-wrap items-center gap-2">
                                               <span className="text-sm font-semibold text-slate-900">
                                                 {candidate.invoice.invoiceNumber}
-                                              </span>
-                                              <span className="rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] text-emerald-700 ring-1 ring-emerald-100">
-                                                {candidate.score}% score
                                               </span>
                                               <button
                                                 type="button"
@@ -3814,8 +4045,9 @@ export default function Banque() {
                                 )}
                               </div>
 
-                              <div className="flex flex-wrap gap-2">
-                                <Button onClick={() => validateCurrentSepaOperation("approved")}>
+                              {!sepaCurrentIsLocked ? (
+                                <div className="flex flex-wrap gap-2">
+                                  <Button onClick={() => validateCurrentSepaOperation("approved")}>
                                   <Check className="mr-1 h-4 w-4" />
                                   Rapprocher
                                 </Button>
@@ -3827,6 +4059,7 @@ export default function Banque() {
                                   Rejeter
                                 </Button>
                               </div>
+                              ) : null}
                             </div>
                           ) : null}
 
@@ -3834,9 +4067,11 @@ export default function Banque() {
                             <Button variant="outline" onClick={() => setDetailsDialogOpen(false)}>
                               Fermer
                             </Button>
-                            <Button type="button" onClick={handleFinalizeSepaClick}>
-                              Appliquer le lot SEPA
-                            </Button>
+                            {!allSepaLinesApproved ? (
+                              <Button type="button" onClick={handleFinalizeSepaClick}>
+                                Appliquer le lot SEPA
+                              </Button>
+                            ) : null}
                           </div>
                         </>
                       )}
@@ -3845,13 +4080,30 @@ export default function Banque() {
                 </div>
               ) : (
                 <div className="space-y-3">
-                  <p className="text-sm font-medium text-slate-900">Suggestions de rapprochement</p>
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <p className="text-sm font-medium text-slate-900">Suggestions de rapprochement</p>
+                    {selectedDetailsTxn.reconciledStatus !== "rapproché" ? (
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        disabled={manualRecoLoading}
+                        onClick={() => void handleRecalculateReconciliation(selectedDetailsTxn)}
+                      >
+                        {manualRecoLoading ? "Recalcul…" : "Recalculer"}
+                      </Button>
+                    ) : null}
+                  </div>
                   <p className="text-xs text-slate-500">
-                    Score et texte viennent du moteur serveur (montant, dates, références, sens achat/vente), avec complément IA seulement si cohérent.
+                    {manualRecoLoading || manualRecoProcessing
+                      ? "Calcul en cours…"
+                      : "Moteur serveur (montant, dates, références, sens achat/vente). Complément IA si cohérent."}
                   </p>
                   {manualSuggestions.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-slate-300 p-6 text-sm text-slate-500">
-                      Aucune suggestion trouvée.
+                      {manualRecoLoading || manualRecoProcessing
+                        ? "Analyse en cours…"
+                        : "Aucune suggestion trouvée. Lancez un recalcul ou vérifiez le statut des factures."}
                     </div>
                   ) : (
                     <div className="space-y-3">
@@ -3876,9 +4128,6 @@ export default function Banque() {
                                   <div className="flex flex-wrap items-center gap-2">
                                     <span className="text-sm font-semibold text-slate-900">
                                       {candidate.invoice.invoiceNumber}
-                                    </span>
-                                    <span className="rounded-full bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-800 ring-1 ring-emerald-100">
-                                      {candidate.score}% score
                                     </span>
                                     <button
                                       type="button"
@@ -3929,7 +4178,12 @@ export default function Banque() {
                     </div>
                   )}
                   <div className="flex justify-end">
-                    <Button onClick={applyManualReconciliation}>Rapprocher</Button>
+                    <Button
+                      onClick={applyManualReconciliation}
+                      disabled={resolveManualInvoiceIdsToApply().length === 0}
+                    >
+                      Rapprocher
+                    </Button>
                   </div>
                 </div>
               )}
@@ -4064,3 +4318,5 @@ export default function Banque() {
     </div>
   );
 }
+
+export default Banque;

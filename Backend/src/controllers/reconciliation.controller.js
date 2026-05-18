@@ -1,14 +1,30 @@
+import { scoreSepaReconciliationWithAgent } from "../services/openai-agents.service.js";
+import { computeReconciliationForTransaction } from "../services/reconciliation-engine.service.js";
+import { computeEngineReconciliationForTransaction } from "../services/reconciliation-engine-deterministic.service.js";
 import {
-  runGlobalReconciliationAgent,
-  scoreReconciliationWithAgent,
-  scoreSepaReconciliationWithAgent,
-} from "../services/openai-agents.service.js";
+  findProposalByScope,
+  findProposalsByBankTransactionIds,
+  upsertScopeProposal,
+} from "../services/reconciliation-proposal.store.js";
+import { buildReconciliationSourceHash } from "../services/reconciliation-hash.service.js";
 import {
-  buildLocalSuggestion,
-  findInvoiceCombinations,
-  filterEligibleInvoices,
-  mergeAiWithLocal,
-} from "../services/reconciliation-scoring.service.js";
+  isProposalProcessingStuck,
+  isProposalScopeSatisfied,
+  isProposalScopeStale,
+  isStoredProposalCacheHit,
+} from "../services/reconciliation-proposal-content.js";
+import { RECONCILIATION_ENGINE_VERSION } from "../services/reconciliation-engine.service.js";
+import { buildCandidateInvoicesForTransaction } from "../services/reconciliation-candidates.service.js";
+import {
+  enqueueBankTransactionReconciliation,
+  enqueueInvoiceReconciliation,
+  ensureProposalsQueuedForBankTransactionIds,
+} from "../services/reconciliation-job.service.js";
+import {
+  listAllInvoicesForReconciliation,
+  listOpenInvoices,
+} from "../services/reconciliation-invoices.service.js";
+import { registerSseClient } from "../services/reconciliation-sse.service.js";
 import {
   listPurchaseInvoices as listPurchaseInvoicesFromStore,
   updatePurchaseInvoicesStatusByIds,
@@ -18,197 +34,277 @@ import {
   updateSalesInvoicesStatusByIds,
 } from "../modules/invoices/sales.store.js";
 
-export async function scoreReconciliation(req, res) {
+function scopeTypeForTransaction(transaction = {}) {
+  const id = String(transaction?.id || "");
+  if (id.includes("::")) return "sepa_line";
+  return "bank_transaction";
+}
+
+function proposalToApiResponse(row) {
+  if (!row) return null;
+  const data = row.proposalData || {};
+  return {
+    scopeId: row.scopeId,
+    bankTransactionId: row.bankTransactionId || row.scopeId,
+    processingStatus: row.processingStatus,
+    processingError: row.processingError || null,
+    sourceHash: row.sourceHash,
+    status: row.status,
+    score: row.score,
+    explanation: row.explanation,
+    suggestions: Array.isArray(data.suggestions) ? data.suggestions : [],
+    combinations: Array.isArray(data.combinations) ? data.combinations : [],
+    missingInvoices: Array.isArray(data.missingInvoices) ? data.missingInvoices : [],
+    scoring: data.scoring || row.scoring || null,
+    engineVersion: data.engineVersion || row.engineVersion || null,
+    updatedAt: row.updatedAt,
+  };
+}
+
+/**
+ * GET /api/reconciliation/proposals?bankTransactionIds=a,b,c
+ * Lecture DB immédiate. Si ensure=1 (défaut), planifie en arrière-plan les jobs manquants
+ * (pas d'OpenAI dans la réponse HTTP).
+ */
+export async function getReconciliationProposals(req, res) {
   try {
-    const engineVersion = "reco-v3-sepa-context-guard";
-    const { transaction, invoices } = req.body || {};
-    if (!transaction || !Array.isArray(invoices)) {
-      return res.status(400).json({ error: "transaction et invoices requis" });
-    }
-
-    const isSepaTxn =
-      Boolean(transaction?.sepaContext) ||
-      String(transaction?.paymentMethod || "").toUpperCase() === "SEPA" ||
-      /\bsepa\b/i.test(String(transaction?.label || "")) ||
-      /\bsepa\b/i.test(String(transaction?.reference || "")) ||
-      String(transaction?.id || "").startsWith("batch::") ||
-      String(transaction?.id || "").includes("::");
-
-    // 1. Filtrer les factures éligibles : non rapprochées + plage 12 mois
-    const eligible = filterEligibleInvoices(transaction, invoices);
-
-    // 2. Combinaisons uniquement pour SEPA.
-    //    Pour les opérations classiques, on garde le comportement ai-only/local sans combos.
-    const combinations = isSepaTxn
-      ? findInvoiceCombinations(transaction, eligible.length > 0 ? eligible : invoices)
-      : [];
-
-    const candidateInvoices = eligible.length > 0 ? eligible : invoices;
-
-    // 3. Suggestions individuelles locales (fallback + garde-fous)
-    const localSuggestions = candidateInvoices
-      .map((inv) => buildLocalSuggestion(transaction, inv))
-      .filter((s) => s.score >= 15)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, 8);
-
-    // 4. Suggestions IA (prioritaires), fusionnées avec le scoring local pour rester explicables.
-    const validInvoiceIds = new Set(candidateInvoices.map((inv) => String(inv.id || inv._id || "")));
-    const localById = new Map(localSuggestions.map((s) => [String(s.invoiceId), s]));
-    const invoiceById = new Map(
-      candidateInvoices.map((inv) => [String(inv.id || inv._id || ""), inv])
+    const raw = String(req.query.bankTransactionIds || req.query.ids || "");
+    const ids = raw
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean);
+    const rows = await findProposalsByBankTransactionIds(ids);
+    const byId = Object.fromEntries(
+      rows.map((row) => {
+        const apiRow = proposalToApiResponse(row);
+        const key = String(row.scopeId || row.bankTransactionId);
+        if (
+          isProposalScopeStale(apiRow, RECONCILIATION_ENGINE_VERSION) ||
+          isProposalProcessingStuck(apiRow)
+        ) {
+          return [
+            key,
+            {
+              ...apiRow,
+              processingStatus: "processing",
+              suggestions: [],
+              combinations: [],
+              stale: true,
+            },
+          ];
+        }
+        return [key, apiRow];
+      })
     );
 
-    let aiSuggestions = null;
-    try {
-      aiSuggestions = await scoreReconciliationWithAgent({
-        transaction,
-        invoices: candidateInvoices,
+    const shouldEnsure = String(req.query.ensure ?? "1") !== "0";
+    let ensureMeta = null;
+    if (shouldEnsure && ids.length) {
+      const missingIds = ids.filter((id) => {
+        const dbRow = rows.find(
+          (r) => String(r.scopeId || r.bankTransactionId) === String(id)
+        );
+        const apiRow = dbRow ? proposalToApiResponse(dbRow) : null;
+        if (!apiRow) return true;
+        if (isProposalScopeStale(apiRow, RECONCILIATION_ENGINE_VERSION)) return true;
+        if (apiRow.processingStatus === "processing") {
+          return isProposalProcessingStuck(apiRow);
+        }
+        if (isProposalScopeSatisfied(apiRow, RECONCILIATION_ENGINE_VERSION)) return false;
+        if (apiRow.processingStatus === "processed") {
+          return String(apiRow.engineVersion || "") !== RECONCILIATION_ENGINE_VERSION;
+        }
+        return (
+          apiRow.processingStatus === "not_processed" || apiRow.processingStatus === "failed"
+        );
       });
-    } catch (error) {
-      console.warn("scoreReconciliationWithAgent fallback local:", error?.message || error);
-      aiSuggestions = null;
-    }
-
-    let suggestions = localSuggestions;
-    if (Array.isArray(aiSuggestions) && aiSuggestions.length > 0) {
-      const merged = aiSuggestions
-        .map((ai) => {
-          const invoiceId = String(ai?.invoiceId || "");
-          if (!invoiceId || !validInvoiceIds.has(invoiceId)) return null;
-          const baseLocal =
-            localById.get(invoiceId) ||
-            buildLocalSuggestion(transaction, invoiceById.get(invoiceId));
-          if (!baseLocal) return null;
-
-          const blended = mergeAiWithLocal(
-            baseLocal,
-            Number(ai?.score || 0),
-            String(ai?.reason || "")
-          );
-          const aiSignals = Array.isArray(ai?.signals)
-            ? ai.signals.map((s) => String(s)).filter(Boolean)
-            : [];
-
-          return {
-            invoiceId,
-            score: blended.score,
-            reason: blended.reason,
-            signals: [...new Set([...(baseLocal.signals || []), ...aiSignals])],
-          };
-        })
-        .filter(Boolean)
-        .filter((s) => s.score >= 20)
-        .sort((a, b) => b.score - a.score)
-        .slice(0, 8);
-
-      if (merged.length > 0) suggestions = merged;
-    }
-
-    // Strict production guardrail:
-    // Never suggest absurd matches (huge amount gap + unrelated supplier name).
-    const stopWords = new Set([
-      "consult",
-      "consulting",
-      "groupe",
-      "holding",
-      "services",
-      "service",
-      "solutions",
-      "solution",
-      "company",
-      "societe",
-      "société",
-      "entreprise",
-      "international",
-      "france",
-      "europe",
-      "eurl",
-      "sarl",
-      "sas",
-      "sasu",
-      "sa",
-      "ei",
-      "it",
-    ]);
-    const norm = (s) =>
-      String(s || "")
-        .toLowerCase()
-        .normalize("NFD")
-        .replace(/[\u0300-\u036f]/g, "")
-        .replace(/[^a-z0-9 ]/g, " ")
-        .replace(/\s+/g, " ")
-        .trim();
-    const tokenize = (s) => norm(s).split(/\s+/).filter((w) => w.length >= 4 && !stopWords.has(w));
-    const similarSupplier = (a, b) => {
-      const ta = tokenize(a);
-      const tb = tokenize(b);
-      if (ta.length === 0 || tb.length === 0) return false;
-      return ta.some((w) => tb.includes(w));
-    };
-
-    const txnAbs = Math.abs(Number(transaction?.amount || 0));
-    const txnCounterparty =
-      transaction?.counterpartyName ||
-      transaction?.bankMeta?.beneficiary ||
-      transaction?.bankMeta?.debtor ||
-      "";
-    suggestions = suggestions.filter((s) => {
-      const inv = invoiceById.get(String(s.invoiceId));
-      if (!inv) return false;
-      const invAbs = Math.abs(Number(inv.amountGross || 0));
-      const amountDiff = Math.abs(txnAbs - invAbs);
-      const sameSupplier = similarSupplier(txnCounterparty, inv.vendorCustomer || "");
-      const hasCounterparty = tokenize(txnCounterparty).length > 0;
-      const hasRefSignal =
-        String(s.reason || "").toLowerCase().includes("référence") ||
-        String(s.reason || "").toLowerCase().includes("reference") ||
-        (Array.isArray(s.signals) &&
-          s.signals.some((sig) =>
-            String(sig || "")
-              .toLowerCase()
-              .includes("référence") ||
-            String(sig || "")
-              .toLowerCase()
-              .includes("reference")
-          ));
-
-      // Hard constraints requested by business, but keep valid cases:
-      // - If counterparty exists: enforce similar supplier name.
-      // - Amount should be exact/quasi exact (<= 1€), except exact reference signal (<= 20€).
-      // - For SEPA, individual suggestions stay strict; sums are handled by combinations.
-      if (hasCounterparty && !sameSupplier) return false;
-      if (amountDiff > 1 && !(hasRefSignal && amountDiff <= 20 && !isSepaTxn)) return false;
-      if (isSepaTxn && amountDiff > 1) return false;
-      return true;
-    });
-
-    // Dédupliquer : les factures déjà dans une combinaison 100% n'ont pas besoin d'apparaître seules.
-    const exactComboIds = new Set(
-      combinations
-        .filter((c) => c.score === 100)
-        .flatMap((c) => c.invoiceIds)
-    );
-    suggestions = suggestions.filter((s) => !exactComboIds.has(s.invoiceId));
-
-    // For non-SEPA flows: keep response minimal and compatible with prior ai-only behavior.
-    if (!isSepaTxn) {
-      return res.json({
-        success: true,
-        suggestions,
-        scoring: Array.isArray(aiSuggestions) && aiSuggestions.length > 0 ? "ai-only" : "local-only",
-        engineVersion,
-      });
+      if (missingIds.length) {
+        ensureMeta = await ensureProposalsQueuedForBankTransactionIds(missingIds, {
+          forceRecalc: false,
+        });
+      }
     }
 
     return res.json({
       success: true,
-      suggestions,
-      combinations,
-      scoring: Array.isArray(aiSuggestions) && aiSuggestions.length > 0
-        ? "ai+local+combinations"
-        : "local+combinations",
-      engineVersion,
+      proposals: byId,
+      items: rows.map(proposalToApiResponse).filter(Boolean),
+      ensure: ensureMeta,
+    });
+  } catch (error) {
+    console.error("getReconciliationProposals error:", error);
+    return res.status(500).json({
+      error: "Erreur lecture propositions",
+      details: String(error),
+    });
+  }
+}
+
+/**
+ * GET /api/reconciliation/events — SSE
+ */
+export function streamReconciliationEvents(req, res) {
+  registerSseClient(res);
+}
+
+/**
+ * POST /api/reconciliation/engine-match
+ * Moteur serveur synchrone (montant, dates, références, sens) — sans OpenAI.
+ */
+export async function engineMatchReconciliation(req, res) {
+  try {
+    const { transaction, invoices: bodyInvoices } = req.body || {};
+    if (!transaction?.id) {
+      return res.status(400).json({ error: "transaction.id requis" });
+    }
+    const allInvoices =
+      Array.isArray(bodyInvoices) && bodyInvoices.length > 0
+        ? bodyInvoices
+        : await listAllInvoicesForReconciliation();
+    const result = computeEngineReconciliationForTransaction(transaction, allInvoices);
+    return res.json({
+      success: true,
+      cached: false,
+      processingStatus: "processed",
+      ...result,
+    });
+  } catch (error) {
+    console.error("engineMatchReconciliation error:", error);
+    return res.status(500).json({
+      error: "Erreur moteur rapprochement",
+      details: String(error),
+    });
+  }
+}
+
+/**
+ * POST /api/reconciliation/recalculate
+ * Recalcul explicite pour une opération (job async).
+ */
+export async function recalculateReconciliation(req, res) {
+  try {
+    const { transaction, invoices: bodyInvoices } = req.body || {};
+    if (!transaction?.id) {
+      return res.status(400).json({ error: "transaction.id requis" });
+    }
+    const allInvoices =
+      Array.isArray(bodyInvoices) && bodyInvoices.length > 0
+        ? bodyInvoices
+        : await listAllInvoicesForReconciliation();
+
+    const result = await enqueueBankTransactionReconciliation(transaction, {
+      invoices: allInvoices,
+      force: true,
+    });
+
+    return res.json({
+      success: true,
+      message: "Recalcul planifié",
+      ...result,
+      processingStatus: "processing",
+    });
+  } catch (error) {
+    console.error("recalculateReconciliation error:", error);
+    return res.status(500).json({
+      error: "Erreur recalcul",
+      details: String(error),
+    });
+  }
+}
+
+/**
+ * POST /api/reconciliation/score
+ * Ne lance plus OpenAI de façon synchrone au chargement de page.
+ * - Retourne le cache si source_hash identique.
+ * - Sinon enqueue un job et répond processing (sauf ?sync=true pour debug).
+ */
+export async function scoreReconciliation(req, res) {
+  try {
+    const { transaction, invoices: bodyInvoices, force } = req.body || {};
+    if (!transaction || !Array.isArray(bodyInvoices)) {
+      return res.status(400).json({ error: "transaction et invoices requis" });
+    }
+
+    const scopeType = scopeTypeForTransaction(transaction);
+    const scopeId = String(transaction.id);
+    const allInvoices =
+      Array.isArray(bodyInvoices) && bodyInvoices.length > 0
+        ? bodyInvoices
+        : await listAllInvoicesForReconciliation();
+    const openInvoices = listOpenInvoices(allInvoices);
+    const candidates = buildCandidateInvoicesForTransaction(transaction, allInvoices);
+    const sourceHash = buildReconciliationSourceHash(
+      transaction,
+      candidates,
+      RECONCILIATION_ENGINE_VERSION
+    );
+
+    const existing = await findProposalByScope(scopeType, scopeId);
+    const cacheValid =
+      !force &&
+      isStoredProposalCacheHit(existing, {
+        sourceHash,
+        engineVersion: RECONCILIATION_ENGINE_VERSION,
+      });
+
+    if (cacheValid) {
+      const cached = proposalToApiResponse(existing);
+      return res.json({
+        success: true,
+        cached: true,
+        processingStatus: "processed",
+        ...cached,
+      });
+    }
+
+    if (existing?.processingStatus === "processing" && !force) {
+      return res.json({
+        success: true,
+        cached: false,
+        processingStatus: "processing",
+        scopeId,
+        suggestions: [],
+        combinations: [],
+      });
+    }
+
+    const sync = String(req.query.sync || "") === "true" || Boolean(req.body?.sync);
+    if (sync && force) {
+      const computed = await computeReconciliationForTransaction(transaction, openInvoices);
+      await upsertScopeProposal({
+        scopeType,
+        scopeId,
+        bankTransactionId: scopeId,
+        sourceHash: computed.sourceHash,
+        processingStatus: "processed",
+        proposalData: computed.proposalData,
+        score: computed.topScore,
+        explanation: computed.topExplanation,
+        scoring: computed.scoring,
+        engineVersion: computed.engineVersion,
+      });
+      return res.json({
+        success: true,
+        cached: false,
+        processingStatus: "processed",
+        ...computed,
+      });
+    }
+
+    await enqueueBankTransactionReconciliation(transaction, {
+      invoices: allInvoices,
+      force: Boolean(force),
+    });
+
+    return res.json({
+      success: true,
+      cached: false,
+      processingStatus: "processing",
+      scopeId,
+      sourceHash,
+      suggestions: [],
+      combinations: [],
+      message: "Calcul IA en file d'attente. Les propositions seront poussées via SSE.",
     });
   } catch (error) {
     console.error("scoreReconciliation error:", error);
@@ -242,27 +338,9 @@ export async function scoreSepaReconciliation(req, res) {
 }
 
 export async function runGlobalReconciliation(req, res) {
-  try {
-    const { operations, invoices, sepaBatches } = req.body || {};
-    if (!Array.isArray(operations) || !Array.isArray(invoices)) {
-      return res.status(400).json({ error: "operations et invoices requis" });
-    }
-    const ai = await runGlobalReconciliationAgent({
-      operations,
-      invoices,
-      sepaBatches: Array.isArray(sepaBatches) ? sepaBatches : [],
-    });
-    if (!ai) {
-      return res.status(503).json({ error: "Agent IA indisponible pour le rapprochement global" });
-    }
-    return res.json({ success: true, ...ai, scoring: "ai-only" });
-  } catch (error) {
-    console.error("runGlobalReconciliation error:", error);
-    return res.status(500).json({
-      error: "Erreur rapprochement global",
-      details: String(error),
-    });
-  }
+  return res.status(410).json({
+    error: "Endpoint déprécié. Utiliser GET /reconciliation/proposals et POST /reconciliation/recalculate.",
+  });
 }
 
 export async function syncReconciliationInvoiceStatus(req, res) {
@@ -313,5 +391,15 @@ export async function syncReconciliationInvoiceStatus(req, res) {
       error: "Erreur synchronisation statuts factures",
       details: String(error),
     });
+  }
+}
+
+/** Appelé après création / modification facture */
+export async function triggerInvoiceReconciliationJobs(invoiceId) {
+  try {
+    return await enqueueInvoiceReconciliation(invoiceId);
+  } catch (error) {
+    console.warn("triggerInvoiceReconciliationJobs:", error?.message || error);
+    return { enqueued: 0 };
   }
 }

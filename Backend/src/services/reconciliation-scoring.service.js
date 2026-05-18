@@ -98,6 +98,43 @@ function referenceScore(txn, inv) {
 }
 
 /**
+ * Montant dans le libellé : uniquement si cohérent avec le montant BANCAIRE et la facture.
+ * (Évite de lier une ligne de -8,75 € à une facture de 48 000 € car le libellé cite le prélèvement principal.)
+ */
+function labelAmountHintScore(txn, inv) {
+  const hay = String(txnHaystack(txn) || "");
+  const txnAbs = Math.abs(Number(txn?.amount || 0));
+  const invAbs = Math.abs(Number(inv?.amountGross || 0));
+  if (txnAbs < 0.01 || invAbs < 1) return { pts: 0, label: null };
+
+  const txnTolerance = Math.max(1.5, txnAbs * 0.08);
+  const invTolerance = Math.max(1.5, invAbs * 0.01);
+
+  const tokens = hay.match(/\d[\d\s.,]{0,14}\d|\d[\d\s.,]{2,}/g) || [];
+  for (const raw of tokens) {
+    const normalized = raw.replace(/\s/g, "").replace(",", ".");
+    const value = Number.parseFloat(normalized);
+    if (!Number.isFinite(value) || value < 0.01) continue;
+    if (Math.abs(value - invAbs) > invTolerance) continue;
+    if (Math.abs(value - txnAbs) > txnTolerance) continue;
+    return {
+      pts: 28,
+      label: `Montant ${value.toLocaleString("fr-FR", { minimumFractionDigits: 2, maximumFractionDigits: 2 })} € aligné opération / facture`,
+    };
+  }
+  return { pts: 0, label: null };
+}
+
+/** Le montant facture doit correspondre au montant de la ligne bancaire (±1,50 € ou 8 %). */
+export function amountCoherentWithTransaction(transaction, invoice) {
+  const txnAbs = Math.abs(Number(transaction?.amount || 0));
+  const invAbs = Math.abs(Number(invoice?.amountGross || 0));
+  if (txnAbs < 0.01 || invAbs < 0.01) return false;
+  const diff = Math.abs(txnAbs - invAbs);
+  return diff <= Math.max(1.5, txnAbs * 0.08);
+}
+
+/**
  * @returns {{ invoiceId: string, score: number, reason: string, signals: string[] }}
  */
 export function buildLocalSuggestion(transaction, invoice) {
@@ -128,6 +165,16 @@ export function buildLocalSuggestion(transaction, invoice) {
   const ref = referenceScore(transaction, invoice);
   score += ref.pts;
   if (ref.label) signals.push(ref.label);
+
+  const labelAmt = labelAmountHintScore(transaction, invoice);
+  score += labelAmt.pts;
+  if (labelAmt.label) signals.push(labelAmt.label);
+
+  const counterparty = extractTransactionCounterparty(transaction);
+  if (supplierNameMatch(counterparty, invoice?.vendorCustomer || "")) {
+    score += 16;
+    signals.push("Fournisseur reconnu");
+  }
 
   score = Math.max(0, Math.min(100, Math.round(score)));
   const reason = signals.length ? signals.join(" · ") : "Peu de signaux communs";
@@ -192,7 +239,7 @@ export function filterEligibleInvoices(transaction, invoices) {
  * Vérifie si deux noms de société se correspondent (matching souple par mots).
  * ex: "FADLAOUI Zouhair EI" ↔ "FADLAOUI" → true
  */
-function supplierNameMatch(nameA, nameB) {
+export function supplierNameMatch(nameA, nameB) {
   const a = norm(nameA || "");
   const b = norm(nameB || "");
   if (!a || !b) return false;
@@ -238,6 +285,144 @@ function supplierNameMatch(nameA, nameB) {
 
   // Match if at least one discriminant token overlaps.
   return wordsA.some((w) => wordsB.includes(w));
+}
+
+/** Nom du tiers bancaire (créancier SEPA, bénéficiaire, libellé). */
+export function extractTransactionCounterparty(transaction = {}) {
+  const meta = transaction?.bankMeta || {};
+  return String(
+    transaction?.counterpartyName ||
+      meta.beneficiary ||
+      meta.debtor ||
+      transaction?.label ||
+      ""
+  ).trim();
+}
+
+export const RECONCILIATION_AMOUNT_TOLERANCE_EUR = 1.5;
+/** ±3 mois (aligné consignes agent IA). */
+export const RECONCILIATION_DATE_TOLERANCE_DAYS = 92;
+
+export function invoiceNumbersMatch(reference, invoiceNumber) {
+  const wanted = compactAlnum(reference || "");
+  const invNo = compactAlnum(invoiceNumber || "");
+  if (wanted.length < 3 || invNo.length < 3) return false;
+  if (wanted === invNo) return true;
+  if (invNo.includes(wanted) || wanted.includes(invNo)) return true;
+  return false;
+}
+
+export function findOpenInvoiceByReference(reference, invoices = []) {
+  const wanted = String(reference || "").trim();
+  if (!wanted) return null;
+  return (
+    invoices.find((inv) => {
+      const status = String(inv?.status || "").toLowerCase();
+      if (["rapprochée", "rapprochee", "rapproché", "reconciled"].includes(status)) {
+        return false;
+      }
+      return invoiceNumbersMatch(wanted, inv?.invoiceNumber);
+    }) || null
+  );
+}
+
+export function invoiceReferenceMatchesTransaction(transaction, invoice) {
+  const invNo = compactAlnum(invoice?.invoiceNumber || "");
+  if (invNo.length < 3) return false;
+  const hay = compactAlnum(txnHaystack(transaction));
+  if (hay.includes(invNo)) return true;
+  if (invNo.length >= 4 && hay.length >= 4 && (hay.includes(invNo) || invNo.includes(hay))) {
+    return true;
+  }
+  const sepaRef = compactAlnum(transaction?.sepaOperation?.remittanceInfo || "");
+  const sepaE2e = compactAlnum(transaction?.sepaOperation?.endToEndId || "");
+  if (sepaRef && (sepaRef.includes(invNo) || invNo.includes(sepaRef))) return true;
+  if (sepaE2e && (sepaE2e.includes(invNo) || invNo.includes(sepaE2e))) return true;
+  if (invoiceNumbersMatch(transaction?.reference, invoice?.invoiceNumber)) return true;
+  return false;
+}
+
+export function amountMatchesTransaction(
+  transaction,
+  invoice,
+  toleranceEur = RECONCILIATION_AMOUNT_TOLERANCE_EUR
+) {
+  const txnAbs = Math.abs(Number(transaction?.amount || 0));
+  const invAbs = Math.abs(Number(invoice?.amountGross || 0));
+  if (txnAbs < 0.01 || invAbs < 0.01) return false;
+  return Math.abs(txnAbs - invAbs) <= toleranceEur;
+}
+
+export function dateMatchesTransaction(
+  transaction,
+  invoice,
+  maxDays = RECONCILIATION_DATE_TOLERANCE_DAYS
+) {
+  const txnDateMs = new Date(transaction?.txnDate || 0).getTime();
+  if (!Number.isFinite(txnDateMs) || txnDateMs <= 0) return true;
+
+  const invDate = parseInvoiceDate(invoice?.invoiceDate);
+  const dueDate = parseInvoiceDate(invoice?.dueDate);
+  const candidates = [invDate, dueDate].filter((d) => Number.isFinite(d) && d > 0);
+  if (!candidates.length) return true;
+
+  const minDays =
+    Math.min(...candidates.map((d) => Math.abs(txnDateMs - d) / 86400000));
+  return minDays <= maxDays;
+}
+
+export function supplierMatchesTransaction(transaction, invoice) {
+  const counterparty = extractTransactionCounterparty(transaction);
+  return supplierNameMatch(counterparty, invoice?.vendorCustomer || "");
+}
+
+/** Fournisseur + montant + date (référence facture non requise). */
+export function supplierAmountDateMatch(transaction, invoice) {
+  return (
+    supplierMatchesTransaction(transaction, invoice) &&
+    amountMatchesTransaction(transaction, invoice) &&
+    dateMatchesTransaction(transaction, invoice)
+  );
+}
+
+/** Fournisseur + montant + date + n° facture dans le SEPA / libellé → rapprochement direct. */
+export function exactReconciliationMatch(transaction, invoice) {
+  return (
+    supplierAmountDateMatch(transaction, invoice) &&
+    invoiceReferenceMatchesTransaction(transaction, invoice)
+  );
+}
+
+/**
+ * True si l'opération et la facture partagent un lien fournisseur ou une référence explicite.
+ */
+export function transactionMatchesInvoice(transaction, invoice) {
+  const counterparty = extractTransactionCounterparty(transaction);
+  if (supplierNameMatch(counterparty, invoice?.vendorCustomer || "")) {
+    return true;
+  }
+  const hay = compactAlnum(txnHaystack(transaction));
+  const invNo = compactAlnum(invoice?.invoiceNumber || "");
+  if (invNo.length >= 4 && hay.includes(invNo)) {
+    return true;
+  }
+  const parts = norm(invoice?.vendorCustomer || "")
+    .split(/\s+/)
+    .filter((w) => w.length >= 4);
+  for (const w of parts) {
+    const c = compactAlnum(w);
+    if (c.length >= 5 && hay.includes(c)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Toutes les factures d'une combinaison doivent être du même fournisseur. */
+export function invoicesShareSupplierFamily(invoices = []) {
+  if (invoices.length <= 1) return true;
+  const anchor = invoices[0]?.vendorCustomer || "";
+  return invoices.every((inv) => supplierNameMatch(anchor, inv?.vendorCustomer || ""));
 }
 
 /**
