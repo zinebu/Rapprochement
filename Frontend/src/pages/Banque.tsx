@@ -3091,10 +3091,10 @@ function Banque() {
 
         
 
-        <div className="grid gap-6 xl:grid-cols-[minmax(0,1.6fr)_460px]">
+        <div className="grid gap-6 2xl:grid-cols-[minmax(760px,1fr)_460px]">
           <SectionCard title="Opérations bancaires" subtitle={`${filteredTxns.length} ligne(s) affichée(s)`}>
             <div className="rounded-2xl border border-slate-200 overflow-hidden bg-white">
-              <Table className="table-fixed w-full">
+              <Table className="min-w-[900px] table-fixed w-full">
                 <TableHeader>
                   <TableRow className="bg-slate-50">
                     <TableHead className="w-[110px]">Date</TableHead>
@@ -3120,6 +3120,7 @@ function Banque() {
                         duplicateInvoiceAssignments.has(chip.key)
                       );
                       const recoBadgeStatus = getTxnReconciliationBadgeStatus(txn, batch);
+                      const linkedSepaBadge = batch ? getSepaBadgeConfig(batch.type) : null;
 
                       return (
                         <TableRow key={txn.id} className={detailsTxnId === txn.id ? "bg-sky-50/60" : ""}>
@@ -3150,15 +3151,15 @@ function Banque() {
                                     {getCounterpartyDisplay(txn)?.role}: {getCounterpartyDisplay(txn)?.value}
                                   </span>
                                 ) : null}
-                                {batch ? (
+                                {batch && linkedSepaBadge ? (
                                   <button
                                     type="button"
                                     onClick={() => setLinkedSepaPopupRef(batch.id || txn.reference)}
-                                    className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-1 text-xs text-emerald-700 ring-1 ring-emerald-100 hover:bg-emerald-100"
+                                    className={`inline-flex items-center gap-1 rounded-full px-2 py-1 text-xs ${linkedSepaBadge.className} hover:brightness-95`}
                                     title={`Voir le lot SEPA ${batch.id || txn.reference}`}
                                   >
                                     <Link2 className="h-3 w-3" />
-                                    SEPA lié
+                                    {batch.type === "payroll" ? linkedSepaBadge.label : "SEPA lié"}
                                   </button>
                                 ) : null}
                               </div>
@@ -3246,7 +3247,7 @@ function Banque() {
             </div>
           </SectionCard>
 
-          <div id="reconciliation-editor" className="space-y-6 xl:sticky xl:top-6 xl:self-start">
+          <div id="reconciliation-editor" className="space-y-6 2xl:sticky 2xl:top-6 2xl:self-start">
 
             {selectedDetailsTxn && !selectedTxnIsSepa ? (
               <SectionCard title="Rapprochement" subtitle="Sélection manuelle des factures proposées">
@@ -4742,7 +4743,7 @@ function Banque() {
       </Dialog>
 
       <Dialog open={Boolean(linkedSepaPopupBatch)} onOpenChange={(open) => !open && setLinkedSepaPopupRef(null)}>
-        <DialogContent className="max-w-4xl">
+        <DialogContent className="max-w-4xl max-h-[88vh] overflow-y-auto">
           <DialogHeader>
             <div className="flex items-center justify-between gap-3">
               <DialogTitle>
@@ -4798,7 +4799,7 @@ function Banque() {
                 </div>
               </div>
 
-              <div className="rounded-2xl border border-slate-200 overflow-hidden bg-white">
+              <div className="max-h-[56vh] rounded-2xl border border-slate-200 overflow-auto bg-white">
                 <Table className="table-fixed w-full">
                   <TableHeader>
                     <TableRow className="bg-slate-50">

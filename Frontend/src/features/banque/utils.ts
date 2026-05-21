@@ -96,8 +96,8 @@ export function getCurrencyBadgeClass(currency: CurrencyCode) {
 export function getSepaBadgeConfig(batchType: SepaBatchType) {
   if (batchType === "payroll") {
     return {
-      label: "SEPA salaires",
-      className: "bg-violet-50 text-violet-700 ring-1 ring-violet-100",
+      label: "SEPA BS",
+      className: "bg-teal-50 text-teal-700 ring-1 ring-teal-100",
       icon: Briefcase,
     };
   }
