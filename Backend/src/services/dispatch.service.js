@@ -19,5 +19,9 @@ export function resolveDestination(label, confidence) {
     return "factures";
   }
 
+  if (label === "payroll_bulk") {
+    return "bulletins_paie";
+  }
+
   return "a_valider";
 }

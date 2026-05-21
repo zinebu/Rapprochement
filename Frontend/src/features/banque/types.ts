@@ -117,7 +117,11 @@ export type SepaBatchOperation = {
   endToEndId: string;
   remittanceInfo: string;
   payrollSlipRef?: string;
+  payrollSlipDocumentId?: string;
+  /** Raisons du rapprochement automatique bulletin ↔ virement (rempli à l'import SEPA). */
+  payrollSlipMatchReasons?: string[];
   employeeId?: string;
+  employeeName?: string;
   linkedInvoiceIds?: string[];
 };
 
@@ -133,6 +137,8 @@ export type SepaBatchTemplate = {
   debtorIban: string;
   debtorCurrency: CurrencyCode;
   periodLabel?: string;
+  payrollBatchId?: string;
+  payrollBatchDocumentId?: string;
   operations: SepaBatchOperation[];
   payrollSlips?: PayrollSlip[];
   payrollExport?: PayrollExportLine[];
@@ -144,14 +150,23 @@ export type SepaOperationDecisionStatus = "pending" | "approved" | "rejected" | 
 export type SepaOperationDecision = {
   status: SepaOperationDecisionStatus;
   selectedInvoiceIds: string[];
+  /** Fiche de paie liée (lot SEPA salaires) */
+  selectedPayrollSlipRef?: string;
   reviewNote?: string;
   rejectAllSuggestions?: boolean;
+  /** Ligne clôturée sans facture (comptabilité : facture introuvable). */
+  invoiceNotFound?: boolean;
 };
 
 export type SepaOperationCandidate = {
   invoice: LocalInvoice;
   score: number;
+  /** Score brut moteur (avant garde-fous UI) — non affiché. */
+  serverScore?: number;
   reasons: string[];
+  /** Pourquoi le rapprochement automatique n'a pas été appliqué. */
+  notAutoReasons?: string[];
+  requiresManualValidation?: boolean;
   details: {
     amountDiff: number;
     daysDiffInvoice: number;

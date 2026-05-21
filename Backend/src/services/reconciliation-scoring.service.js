@@ -385,6 +385,66 @@ export function supplierAmountDateMatch(transaction, invoice) {
   );
 }
 
+/** Seuil au-dessus duquel une proposition peut être rapprochée sans validation manuelle. */
+export const AUTO_RECONCILE_THRESHOLD = 78;
+
+/**
+ * Montant cohérent + date dans la fenêtre + sens achat/vente + devise.
+ * Permet d'afficher une suggestion même sans référence fournisseur.
+ */
+export function isAmountDateDisplayCandidate(transaction, invoice) {
+  if (!amountCoherentWithTransaction(transaction, invoice)) return false;
+  if (!dateMatchesTransaction(transaction, invoice)) return false;
+  const amt = Number(transaction?.amount || 0);
+  const expected = amt < 0 ? "purchase" : "sales";
+  const invType = String(invoice?.type || expected).toLowerCase();
+  if (invType !== expected) return false;
+  const tc = norm(transaction?.currency || "eur");
+  const ic = norm(invoice?.currency || tc);
+  if (invoice?.currency && ic !== tc) return false;
+  return true;
+}
+
+/**
+ * Raisons affichées lorsque la proposition reste en validation manuelle.
+ */
+export function buildNotAutoReconcileReasons(
+  transaction,
+  invoice,
+  score,
+  threshold = AUTO_RECONCILE_THRESHOLD
+) {
+  const reasons = [];
+  const s = Math.round(Number(score || 0));
+  if (s >= threshold) return reasons;
+
+  if (!amountCoherentWithTransaction(transaction, invoice)) {
+    const txnAbs = Math.abs(Number(transaction?.amount || 0));
+    const invAbs = Math.abs(Number(invoice?.amountGross || 0));
+    reasons.push(`Écart de montant : ${Math.abs(txnAbs - invAbs).toFixed(2)} €`);
+  }
+  if (!dateMatchesTransaction(transaction, invoice)) {
+    reasons.push(
+      `Dates à plus de ${RECONCILIATION_DATE_TOLERANCE_DAYS} jours de l'opération`
+    );
+  }
+  if (!supplierMatchesTransaction(transaction, invoice)) {
+    reasons.push("Fournisseur / tiers non reconnu dans le libellé");
+  }
+  if (!invoiceReferenceMatchesTransaction(transaction, invoice)) {
+    reasons.push("N° de facture absent du libellé bancaire");
+  }
+  const amt = Number(transaction?.amount || 0);
+  const expected = amt < 0 ? "purchase" : "sales";
+  if (String(invoice?.type || expected).toLowerCase() !== expected) {
+    reasons.push("Sens achat / vente différent");
+  }
+  if (reasons.length === 0) {
+    reasons.push("Correspondance insuffisante pour rapprochement automatique");
+  }
+  return reasons;
+}
+
 /** Fournisseur + montant + date + n° facture dans le SEPA / libellé → rapprochement direct. */
 export function exactReconciliationMatch(transaction, invoice) {
   return (

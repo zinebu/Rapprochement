@@ -1,0 +1,23 @@
+{
+  "id": "6a0c7c06049cd1b61",
+  "numero": "NDF-000246",
+  "date": "2026-04-30",
+  "status": "En attente",
+  "montantTTC": 10,
+  "tva": "0",
+  "tvaMontant": 0,
+  "montantHT": 10,
+  "moyenPaiement": "Carte de crédit personnelle ( Remboursable )",
+  "montantTTCCurrency": "EUR",
+  "montantHTCurrency": "EUR",
+  "typesFraisName": "Frais professionnels",
+  "justificatifIds": ["6a0c7c0603e48425b"],
+  "justificatifNames": {
+    "6a0c7c0603e48425b": "2026-05-19_14-21-53.png"
+  },
+  "justificatifTypes": {
+    "6a0c7c0603e48425b": "image/png"
+  },
+  "demandeurName": "Zakaria ABID",
+  "demandesFraisName": "Demande frais - Zakaria ABID - 4/2026"
+}

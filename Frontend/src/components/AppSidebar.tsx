@@ -9,6 +9,7 @@ import {
   HandCoins,
   Plug,
   SendHorizontal,
+  Wallet,
 } from "lucide-react";
 import {
   Sidebar,
@@ -32,6 +33,7 @@ const mainNav = [
   { title: "Banque", url: "/banque", icon: Landmark },
   { title: "Factures", url: "/factures", icon: FileText },
   { title: "SEPA", url: "/sepa", icon: SendHorizontal },
+  { title: "Bulletins de paie", url: "/bulletins", icon: Wallet },
   { title: "Affacturage", url: "/affacturage", icon: HandCoins },
   { title: "TVA", url: "/tva", icon: Receipt },
 ];

@@ -25,6 +25,16 @@ import {
 import { inferInvoiceNatureHints } from "../services/invoice-nature.service.js";
 import { classifyWithOpenAI } from "../services/openai.service.js";
 import { resolveDestination } from "../services/dispatch.service.js";
+import {
+  parsePayrollBulletinFromText,
+  isStrongPayrollStructuredData,
+  nameLooksLikePayrollFile,
+} from "../services/payroll-parser.service.js";
+import { getPdfPageCount } from "../services/payroll-pdf.service.js";
+import {
+  linkPayrollSepaBatch,
+  listPayrollBatchesFromDocuments,
+} from "../services/payroll-sepa-link.service.js";
 
 console.log("LOADED import.controller.js VERSION FINAL");
 
@@ -104,10 +114,66 @@ function chooseBestSepaData(localData, agentData) {
   const agentOps = agentData?.sepaBatch?.operations;
   const localCount = Array.isArray(localOps) ? localOps.length : 0;
   const agentCount = Array.isArray(agentOps) ? agentOps.length : 0;
-  if (localCount > 0 && agentCount === 0) return localData;
-  if (agentCount > 0 && localCount === 0) return agentData;
-  if (localCount >= agentCount) return localData || agentData || null;
-  return agentData || localData || null;
+  let chosen = null;
+  if (localCount > 0 && agentCount === 0) chosen = localData;
+  else if (agentCount > 0 && localCount === 0) chosen = agentData;
+  else if (localCount >= agentCount) chosen = localData || agentData || null;
+  else chosen = agentData || localData || null;
+
+  if (localData?.sepaBatch?.type === "payroll" && chosen?.sepaBatch) {
+    return {
+      ...chosen,
+      sepaBatch: {
+        ...chosen.sepaBatch,
+        type: "payroll",
+        label: localData.sepaBatch.label || chosen.sepaBatch.label,
+        periodLabel: localData.sepaBatch.periodLabel || chosen.sepaBatch.periodLabel,
+        msgId: localData.sepaBatch.msgId || chosen.sepaBatch.msgId,
+      },
+      summarizedOperation: {
+        ...(chosen.summarizedOperation || localData.summarizedOperation || {}),
+        label:
+          localData.sepaBatch?.label ||
+          chosen.summarizedOperation?.label ||
+          `SEPA salaires — ${chosen.sepaBatch.id}`,
+        counterpartyName:
+          chosen.sepaBatch.debtorName ||
+          localData.summarizedOperation?.counterpartyName ||
+          "Salaires",
+      },
+    };
+  }
+  return chosen;
+}
+
+async function applyPayrollSepaLinks(structuredData) {
+  if (!structuredData?.sepaBatch || structuredData.sepaBatch.type !== "payroll") {
+    return structuredData;
+  }
+  const docs = await listImportedDocuments();
+  const payrollBatches = listPayrollBatchesFromDocuments(docs);
+  return {
+    ...structuredData,
+    sepaBatch: linkPayrollSepaBatch(structuredData.sepaBatch, payrollBatches),
+  };
+}
+
+/** Recalcule les liens SEPA salaires ↔ fiches de paie après import bulletin ou XML paie. */
+async function relinkAllPayrollSepaBatches() {
+  const docs = await listImportedDocuments();
+  const payrollBatches = listPayrollBatchesFromDocuments(docs);
+  if (!payrollBatches.length) return;
+
+  for (const doc of docs) {
+    const structured = doc.structuredData || {};
+    if (structured?.sepaBatch?.type !== "payroll") continue;
+    const docId = String(doc._id?.toString?.() || doc.id || "");
+    if (!docId) continue;
+    const linked = linkPayrollSepaBatch(structured.sepaBatch, payrollBatches);
+    await updateImportedDocument(docId, {
+      structuredData: { ...structured, sepaBatch: linked },
+    });
+  }
 }
 
 function isStrongBankStatementStructuredData(data) {
@@ -138,6 +204,10 @@ function isStrongInvoiceStructuredData(data) {
     typeof data.vatAmount === "number";
   const hasParty = Boolean(String(data.vendorCustomer || "").trim());
   return hasNumber || (hasAmounts && hasParty);
+}
+
+function isStrongPayrollBulkStructuredData(data) {
+  return isStrongPayrollStructuredData(data);
 }
 
 function mapInvoiceStructuredToFields(data) {
@@ -269,6 +339,7 @@ export async function runImportPipelineForFile(file) {
       file.originalname || ""
     );
     const nameLooksLikeInvoice = nameLooksLikeInvoiceFile(file.originalname || "");
+    const nameLooksLikePayroll = nameLooksLikePayrollFile(file.originalname || "");
     const looksLikeSepaXml =
       file.mimetype === "application/xml" ||
       file.mimetype === "text/xml" ||
@@ -345,7 +416,27 @@ export async function runImportPipelineForFile(file) {
       }
     }
 
-    if (bankStructuredData) {
+    let payrollStructuredData = null;
+    if (
+      file.mimetype === "application/pdf" &&
+      (nameLooksLikePayroll || /BULLETIN DE PAIE du/i.test(extracted.text || ""))
+    ) {
+      let pageCount = 0;
+      try {
+        const raw = await fs.readFile(file.path);
+        pageCount = await getPdfPageCount(raw);
+      } catch {
+        pageCount = 0;
+      }
+      payrollStructuredData = parsePayrollBulletinFromText(extracted.text, {
+        originalName: file.originalname,
+        pageCount,
+      });
+    }
+
+    if (payrollStructuredData && isStrongPayrollBulkStructuredData(payrollStructuredData)) {
+      structuredData = payrollStructuredData;
+    } else if (bankStructuredData) {
       structuredData = bankStructuredData;
     } else if (nameLooksLikeBankStatement) {
       structuredData = {
@@ -399,6 +490,7 @@ export async function runImportPipelineForFile(file) {
     const strongBankData = isStrongBankStatementStructuredData(structuredData);
     const strongSepaData = isStrongSepaStructuredData(structuredData);
     const strongInvoiceData = isStrongInvoiceStructuredData(structuredData);
+    const strongPayrollData = isStrongPayrollBulkStructuredData(structuredData);
 
     console.log("[import] diagnostic", {
       file: file.originalname,
@@ -409,8 +501,10 @@ export async function runImportPipelineForFile(file) {
       strongInvoiceData,
       strongBankData,
       strongSepaData,
+      strongPayrollData,
       nameLooksLikeBankStatement,
       nameLooksLikeInvoice,
+      nameLooksLikePayroll,
       looksLikeSepaXml,
       invoiceNumber: structuredData?.invoiceNumber || null,
       vendorCustomer: structuredData?.vendorCustomer || null,
@@ -457,7 +551,18 @@ export async function runImportPipelineForFile(file) {
       );
     }
 
-    if (!strongInvoiceData && (strongBankData || strongSepaData)) {
+    if (strongPayrollData) {
+      classification.label = "payroll_bulk";
+      classification.confidence = Math.max(
+        Number(classification.confidence || 0),
+        0.95
+      );
+    }
+
+    if (strongPayrollData) {
+      destination = "bulletins_paie";
+      status = "sent";
+    } else if (!strongInvoiceData && (strongBankData || strongSepaData)) {
       destination = "banque";
       status = "sent";
     } else if (strongInvoiceData || nameLooksLikeInvoice) {
@@ -499,6 +604,10 @@ export async function runImportPipelineForFile(file) {
   const finalDocumentType =
     structuredData?.documentType || classification.label || null;
 
+  if (structuredData?.sepaBatch?.type === "payroll") {
+    structuredData = await applyPayrollSepaLinks(structuredData);
+  }
+
   // Read file bytes so they can be stored in MongoDB (no local disk dependency).
   let fileData = null;
   try {
@@ -539,8 +648,27 @@ export async function runImportPipelineForFile(file) {
     await document.save();
   }
 
+  let savedDocument = document;
+  if (
+    structuredData?.documentType === "payroll_bulk" ||
+    structuredData?.sepaBatch?.type === "payroll"
+  ) {
+    try {
+      await relinkAllPayrollSepaBatches();
+      const refreshed = document?._id
+        ? await getImportedDocumentById(String(document._id))
+        : null;
+      if (refreshed) {
+        savedDocument = refreshed;
+        structuredData = refreshed.structuredData || structuredData;
+      }
+    } catch (err) {
+      console.warn("relinkAllPayrollSepaBatches:", err);
+    }
+  }
+
   return {
-    document,
+    document: savedDocument,
     extraction: extracted,
     structuredData,
     natureHints,
@@ -591,12 +719,25 @@ export async function dispatchImportedDocumentById(id) {
   const strongBankData = isStrongBankStatementStructuredData(structured);
   const strongSepaData = isStrongSepaStructuredData(structured);
   const strongInvoiceData = isStrongInvoiceStructuredData(structured);
+  const strongPayrollData = isStrongPayrollBulkStructuredData(structured);
   const invoiceLikeName = nameLooksLikeInvoiceFile(originalName);
   const fileLooksLikeBankStatement = /relev|releve|extrait.*compte|statement/.test(
     originalName
   );
   const fileLooksLikeSepa =
     mimeType.includes("xml") || originalName.endsWith(".xml");
+
+  if (strongPayrollData) {
+    await updateImportedDocument(id, {
+      destination: "bulletins_paie",
+      status: "sent",
+    });
+    const refreshed = await getImportedDocumentById(id);
+    return {
+      document: refreshed,
+      business: { target: "bulletins_paie", duplicated: false },
+    };
+  }
 
   if (
     !strongInvoiceData &&
@@ -717,7 +858,11 @@ export async function sendImportToFactures(req, res) {
     }
     if (existing.status === "sent") {
       const destinationLabel =
-        existing.destination === "banque" ? "Banque" : "Factures";
+        existing.destination === "banque"
+          ? "Banque"
+          : existing.destination === "bulletins_paie"
+            ? "Bulletins de paie"
+            : "Factures";
       return res.status(400).json({
         error: `Ce document a déjà été envoyé vers ${destinationLabel}`,
       });
@@ -728,7 +873,9 @@ export async function sendImportToFactures(req, res) {
     const message =
       target === "banque"
         ? "Document envoyé vers Banque"
-        : "Document envoyé vers Factures";
+        : target === "bulletins_paie"
+          ? "Document envoyé vers Bulletins de paie"
+          : "Document envoyé vers Factures";
 
     return res.status(200).json({
       success: true,
@@ -828,6 +975,57 @@ export async function deleteImportById(req, res) {
  * Serve the original file bytes stored in MongoDB.
  * Falls back to disk if fileData is not in DB (legacy documents).
  */
+export async function servePayslipFile(req, res) {
+  try {
+    const { id, slipId } = req.params;
+    const document = await getImportedDocumentWithFileById(id);
+
+    if (!document) {
+      return res.status(404).json({ error: "Document introuvable" });
+    }
+
+    const batch = document.structuredData?.payrollBatch;
+    const slips = Array.isArray(batch?.slips) ? batch.slips : [];
+    const slip = slips.find((s) => String(s.id) === String(slipId));
+    if (!slip) {
+      return res.status(404).json({ error: "Fiche de paie introuvable" });
+    }
+
+    let sourceBuffer = null;
+    if (document.fileData?.length) {
+      sourceBuffer = document.fileData;
+    } else if (document.filePath) {
+      try {
+        sourceBuffer = await fs.readFile(document.filePath);
+      } catch {
+        sourceBuffer = null;
+      }
+    }
+
+    if (!sourceBuffer) {
+      return res.status(404).json({ error: "Fichier source non disponible" });
+    }
+
+    const { extractPdfPageRange } = await import("../services/payroll-pdf.service.js");
+    const pageStart = slip.pageStart || 1;
+    const pageEnd = slip.pageEnd || pageStart;
+    const pdfBytes = await extractPdfPageRange(sourceBuffer, pageStart, pageEnd);
+
+    const safeName = encodeURIComponent(
+      `bulletin-${slip.matricule || slipId}-${slip.employeeName || "salarie"}.pdf`
+        .replace(/[^\w\-]+/g, "_")
+        .slice(0, 80)
+    );
+
+    res.setHeader("Content-Type", "application/pdf");
+    res.setHeader("Content-Disposition", `inline; filename="${safeName}"`);
+    return res.send(pdfBytes);
+  } catch (error) {
+    console.error("servePayslipFile error:", error);
+    return res.status(500).json({ error: "Erreur lors de l'extraction de la fiche de paie" });
+  }
+}
+
 export async function serveImportFile(req, res) {
   try {
     const { id } = req.params;

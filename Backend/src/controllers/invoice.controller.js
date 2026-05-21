@@ -3,13 +3,16 @@ import {
   listPurchaseInvoices as listPurchaseInvoicesFromStore,
   updatePurchaseInvoicesStatusByIds,
   updatePurchaseInvoiceById,
+  resetAllPurchaseInvoicesToUnreconciled,
 } from "../modules/invoices/purchase.store.js";
 import {
   deleteSalesInvoiceById,
   listSalesInvoices as listSalesInvoicesFromStore,
   updateSalesInvoicesStatusByIds,
   updateSalesInvoiceById,
+  resetAllSalesInvoicesToUnreconciled,
 } from "../modules/invoices/sales.store.js";
+import { ImportedDocument } from "../models/ImportedDocument.js";
 import { parseMoneyToNumber } from "../utils/amount.js";
 
 function toFrontInvoice(invoice, type) {
@@ -248,6 +251,66 @@ export async function updateInvoice(req, res) {
     console.error("updateInvoice error:", error);
     return res.status(500).json({
       error: "Erreur pendant la mise à jour de la facture",
+      details: String(error),
+    });
+  }
+}
+
+/** Remet toutes les factures en « non rapprochée » et efface les liens rapprochement bancaires persistés. */
+export async function resetAllInvoicesReconciliation(req, res) {
+  try {
+    const purchase = await resetAllPurchaseInvoicesToUnreconciled();
+    const sales = await resetAllSalesInvoicesToUnreconciled();
+
+    const importDocs = await ImportedDocument.find({
+      $or: [
+        { "structuredData.reconciliation": { $exists: true } },
+        { "structuredData.sepaBatch": { $exists: true } },
+      ],
+    });
+
+    let importsCleared = 0;
+    for (const doc of importDocs) {
+      const structured = doc.structuredData || {};
+      let changed = false;
+      const next = { ...structured };
+
+      if (structured.reconciliation?.operations) {
+        next.reconciliation = { ...structured.reconciliation, operations: {} };
+        changed = true;
+      }
+
+      if (structured.sepaBatch?.operations?.length) {
+        next.sepaBatch = {
+          ...structured.sepaBatch,
+          operations: structured.sepaBatch.operations.map((op) => ({
+            ...op,
+            linkedInvoiceIds: [],
+          })),
+        };
+        changed = true;
+      }
+
+      if (changed) {
+        doc.structuredData = next;
+        await doc.save();
+        importsCleared += 1;
+      }
+    }
+
+    return res.json({
+      success: true,
+      message: "Toutes les factures sont repassées en non rapprochées",
+      stats: {
+        purchase,
+        sales,
+        importsCleared,
+      },
+    });
+  } catch (error) {
+    console.error("resetAllInvoicesReconciliation error:", error);
+    return res.status(500).json({
+      error: "Erreur pendant la réinitialisation des rapprochements",
       details: String(error),
     });
   }

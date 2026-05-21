@@ -39,7 +39,7 @@ export async function classifyImportDocumentAgent({ fileName, mimeType, extracte
     properties: {
       documentType: {
         type: "string",
-        enum: ["invoice", "bank_statement", "sepa_xml", "receipt", "unknown"],
+        enum: ["invoice", "bank_statement", "sepa_xml", "receipt", "payroll_bulk", "unknown"],
       },
       confidence: { type: "number" },
       reason: { type: "string" },

@@ -25,11 +25,14 @@ type SepaOperation = {
   currency: string;
   endToEndId: string;
   remittanceInfo: string;
+  payrollSlipRef?: string;
+  employeeName?: string;
 };
 
 type SepaBatch = {
   id: string;
   sourceDocumentId?: string;
+  type?: "invoice" | "payroll";
   label?: string;
   executionDate?: string | null;
   totalAmount?: number;
@@ -37,6 +40,8 @@ type SepaBatch = {
   debtorName?: string | null;
   debtorIban?: string | null;
   debtorCurrency?: string | null;
+  periodLabel?: string | null;
+  linkedSlipCount?: number;
   operations: SepaOperation[];
 };
 
@@ -63,14 +68,29 @@ function batchTotal(batch: SepaBatch): number | null {
   return sum > 0 ? sum : null;
 }
 
+function ListLoading() {
+  return (
+    <div className="flex items-center justify-center gap-2 py-12 text-sm text-muted-foreground">
+      <span
+        className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-muted-foreground/25 border-t-muted-foreground"
+        aria-hidden
+      />
+      Chargement…
+    </div>
+  );
+}
+
 export default function SepaPage() {
   const navigate = useNavigate();
   const [params] = useSearchParams();
   const [batches, setBatches] = useState<SepaBatch[]>([]);
   const [openIds, setOpenIds] = useState<Record<string, boolean>>({});
+  const [loading, setLoading] = useState(true);
 
   useEffect(() => {
     const load = async () => {
+      setLoading(true);
+      try {
       const importsRes = await fetch("/api/imports", { credentials: "include" });
       const importsData = await importsRes.json().catch(() => ({}));
       if (!importsRes.ok) return;
@@ -102,6 +122,9 @@ export default function SepaPage() {
         const wanted = normalizeRef(ref);
         const match = importedBatches.find((b) => normalizeRef(b.id) === wanted);
         if (match) setOpenIds({ [match.id]: true });
+      }
+      } finally {
+        setLoading(false);
       }
     };
     void load();
@@ -141,8 +164,10 @@ export default function SepaPage() {
         </Button>
       </div>
 
-      {batches.length === 0 ? (
-        <p className="text-sm text-muted-foreground">Aucun lot.</p>
+      {loading ? (
+        <ListLoading />
+      ) : batches.length === 0 ? (
+        <p className="text-sm text-muted-foreground">Aucun lot SEPA importé.</p>
       ) : (
         <ul className="space-y-2">
           {sortedBatches.map((batch) => {
@@ -168,8 +193,15 @@ export default function SepaPage() {
                             )}
                           />
                           <div className="min-w-0 flex-1">
-                            <div className="truncate font-mono text-sm font-medium text-foreground">{batch.id}</div>
+                            <div className="truncate text-sm font-medium text-foreground">
+                              {batch.label || batch.id}
+                            </div>
                             <div className="mt-0.5 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-foreground">
+                              {batch.type === "payroll" ? (
+                                <span className="rounded-full bg-violet-100 px-1.5 py-0.5 text-violet-800">
+                                  Salaires
+                                </span>
+                              ) : null}
                               {batch.executionDate ? <span>{batch.executionDate}</span> : null}
                               <span>
                                 {n} × {total != null ? formatCurrency(total, cur) : "—"}

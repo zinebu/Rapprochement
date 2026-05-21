@@ -12,6 +12,8 @@ import {
 
   supplierNameMatch,
 
+  amountCoherentWithTransaction,
+
   findOpenInvoiceByReference,
 
 } from "./reconciliation-scoring.service.js";
@@ -380,7 +382,14 @@ export function applyStrictProposalGates(transaction, mapped, candidateInvoices 
 
     if (!inv) continue;
 
-    if (!supplierAmountDateMatch(transaction, inv)) continue;
+    const aiScore = Math.round(Number(row.score || 0));
+    const refHit = invoiceReferenceMatchesTransaction(transaction, inv);
+    const supplierHit = anySupplierNameMatch(transaction, inv?.vendorCustomer || "");
+    const mediumTier =
+      aiScore >= 55 &&
+      (refHit || (supplierHit && amountCoherentWithTransaction(transaction, inv)));
+
+    if (!supplierAmountDateMatch(transaction, inv) && !mediumTier) continue;
 
 
 

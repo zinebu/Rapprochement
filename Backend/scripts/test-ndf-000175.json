@@ -1,0 +1,26 @@
+{
+  "id": "6a0c67fe69cb01952",
+  "externalId": "6a0c67fe69cb01952",
+  "invoiceNature": "purchase",
+  "fournisseur": "A definir",
+  "justificatifIds": ["6a0c67fdb013875b8"],
+  "justificatifNames": {
+    "6a0c67fdb013875b8": "db1d830a-b191-486f-bf89-ad6a0c6cbd6c_signed_21.pdf"
+  },
+  "nomfichierId": "6a0c67fdb013875b8",
+  "nomfichierName": "db1d830a-b191-486f-bf89-ad6a0c6cbd6c_signed_21.pdf",
+  "pdfViewUrl": "https://intra.consult-it.com/?entryPoint=download&id=6a0c67fdb013875b8",
+  "resultats": {
+    "Header": {
+      "numero": "NDF-000175",
+      "date": "2025-12-29",
+      "fournisseur": "A definir"
+    },
+    "Amount": {
+      "devise": "EUR",
+      "montant_ht": 19.03,
+      "montant_ttc": 22.84,
+      "tva": [{ "taux": "20", "montant": 3.81 }]
+    }
+  }
+}

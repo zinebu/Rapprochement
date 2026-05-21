@@ -19,6 +19,7 @@ const SalesInvoiceSchema = new mongoose.Schema(
     iban: String,
     swift: String,
     pdfUrl: String,
+    crmDownloadUrl: String,
     issuerName: String,
     issuerSiret: String,
     recipientName: String,

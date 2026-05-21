@@ -19,9 +19,46 @@ import {
 type DetectedCategory =
   | "Relevé bancaire"
   | "Facture"
+  | "Bulletin de paie"
   | "Quittance"
   | "SEPA XML"
+  | "SEPA salaires"
   | "Document inconnu";
+
+type PayrollImportSummary = {
+  numberOfSlips?: number;
+  periodLabel?: string | null;
+  companyName?: string | null;
+  totalNet?: number | null;
+  currency?: string;
+};
+
+function mapPayrollSummary(structured: unknown): PayrollImportSummary | undefined {
+  const batch = (structured as { payrollBatch?: PayrollImportSummary & { slips?: unknown[] } })
+    ?.payrollBatch;
+  if (!batch) return undefined;
+  return {
+    numberOfSlips: batch.numberOfSlips ?? (Array.isArray(batch.slips) ? batch.slips.length : undefined),
+    periodLabel: batch.periodLabel ?? null,
+    companyName: batch.companyName ?? null,
+    totalNet: batch.totalNet ?? null,
+    currency: batch.currency ?? "EUR",
+  };
+}
+
+function destinationSuccessMessage(destination?: string | null) {
+  if (destination === "banque") return "Le document a été envoyé dans Banque.";
+  if (destination === "bulletins_paie") {
+    return "Le document a été envoyé dans Bulletins de paie (fiches salariés extraites).";
+  }
+  return "Le document a été envoyé dans Factures.";
+}
+
+function destinationSentToast(destination?: string | null) {
+  if (destination === "banque") return "Document envoyé dans Banque.";
+  if (destination === "bulletins_paie") return "Document envoyé dans Bulletins de paie.";
+  return "Document envoyé dans Factures.";
+}
 
 type ExtractedFields = {
   issuerName?: string | null;
@@ -125,6 +162,8 @@ type ImportedFileItem = {
   extractedType?: string | null;
   invoiceNature?: string | null;
   extractedFields?: ExtractedFields;
+  payrollSummary?: PayrollImportSummary;
+  sepaSummary?: SepaImportSummary;
 };
 
 const API_BASE_URL = "";
@@ -191,7 +230,30 @@ function formatBackendType(value?: string | null) {
   if (value === "bank_statement") return "Relevé bancaire";
   if (value === "receipt") return "Quittance";
   if (value === "sepa_xml") return "SEPA XML";
+  if (value === "payroll_bulk") return "Bulletin de paie";
   return value;
+}
+
+type SepaImportSummary = {
+  batchType?: string;
+  label?: string;
+  numberOfTransactions?: number;
+  totalAmount?: number | null;
+  linkedSlipCount?: number;
+  periodLabel?: string | null;
+};
+
+function mapSepaSummary(structured: unknown): SepaImportSummary | undefined {
+  const batch = (structured as { sepaBatch?: SepaImportSummary & { type?: string } })?.sepaBatch;
+  if (!batch?.label && !batch?.numberOfTransactions) return undefined;
+  return {
+    batchType: batch.type,
+    label: batch.label,
+    numberOfTransactions: batch.numberOfTransactions,
+    totalAmount: batch.totalAmount ?? null,
+    linkedSlipCount: (batch as { linkedSlipCount?: number }).linkedSlipCount,
+    periodLabel: batch.periodLabel ?? null,
+  };
 }
 
 function parseAmount(value: unknown): number | null {
@@ -251,6 +313,7 @@ function getDocumentStatusLabel(item: ImportedFileItem) {
   if (item.error) return "Erreur";
   if (item.sent) {
     if (item.destination === "banque") return "Envoyé vers Banque";
+    if (item.destination === "bulletins_paie") return "Envoyé vers Bulletins de paie";
     return "Envoyé vers Factures";
   }
   if (item.sending) return "Envoi en cours";
@@ -276,8 +339,14 @@ export default function ImportPage() {
     const name = file.name.toLowerCase();
 
     if (name.endsWith(".csv")) return "Relevé bancaire";
-    if (name.endsWith(".xml")) return "SEPA XML";
+    if (name.endsWith(".xml")) {
+      if (/salaire|paie|payroll|menisys|PAIE-/i.test(name)) return "SEPA salaires";
+      return "SEPA XML";
+    }
     if (name.includes("quittance")) return "Quittance";
+    if (/bulletin|menisys|paie|payroll|fiche.?paie|salari|bulletins/i.test(name)) {
+      return "Bulletin de paie";
+    }
     if (
       name.includes("facture") ||
       name.endsWith(".pdf") ||
@@ -342,6 +411,8 @@ export default function ImportPage() {
 
       const serverDocumentId = data?.document?.id ?? data?.document?._id ?? null;
       const destination = data?.document?.destination ?? data?.destination ?? null;
+      const payrollSummary = mapPayrollSummary(data?.structuredData);
+      const sepaSummary = mapSepaSummary(data?.structuredData);
 
       updateFile(id, (current) => ({
         ...current,
@@ -355,6 +426,8 @@ export default function ImportPage() {
         extractedType,
         invoiceNature,
         extractedFields: fields,
+        payrollSummary,
+        sepaSummary,
       }));
     } catch (error) {
       const message = error instanceof Error ? error.message : "Erreur pendant l'analyse";
@@ -411,12 +484,9 @@ export default function ImportPage() {
         error: null,
       }));
 
-      toast.success(
-        data?.document?.destination === "banque"
-          ? "Document envoyé dans Banque."
-          : "Document envoyé dans Factures."
-      );
-      if (data?.document?.destination !== "banque") {
+      const dest = data?.document?.destination ?? null;
+      toast.success(destinationSentToast(dest));
+      if (dest !== "banque" && dest !== "bulletins_paie") {
         notifyInvoicesChanged();
       }
     } catch (error) {
@@ -516,6 +586,8 @@ export default function ImportPage() {
 
           const serverDocumentId = data?.document?.id ?? data?.document?._id ?? null;
           const destination = data?.document?.destination ?? data?.destination ?? null;
+          const payrollSummary = mapPayrollSummary(data?.structuredData);
+          const sepaSummary = mapSepaSummary(data?.structuredData);
 
           setFiles((prev) =>
             prev.map((current) =>
@@ -532,6 +604,8 @@ export default function ImportPage() {
                     extractedType,
                     invoiceNature,
                     extractedFields: fields,
+                    payrollSummary,
+                    sepaSummary,
                   }
                 : current
             )
@@ -601,7 +675,7 @@ export default function ImportPage() {
     <div className="max-w-6xl mx-auto space-y-6">
       <div className="flex justify-between items-center gap-4">
         <div>
-          <h1 className="text-2xl font-bold">Import de factures</h1>
+          <h1 className="text-2xl font-bold">Import de documents</h1>
          
         </div>
 
@@ -617,9 +691,10 @@ export default function ImportPage() {
               <Cloud className="h-10 w-10" />
             </div>
 
-            <h2 className="text-lg font-semibold">Déposer vos factures</h2>
+            <h2 className="text-lg font-semibold">Déposer vos documents</h2>
             <p className="text-sm text-muted-foreground mt-2">
-              PDF ou images. Les données extraites s'affichent automatiquement après l'import.
+              Factures, bulletins de paie (PDF multi-salariés), relevés ou SEPA. Les données
+              extraites s&apos;affichent automatiquement après l&apos;import.
             </p>
 
             <div className="max-w-md mx-auto mt-6 space-y-2">
@@ -679,11 +754,72 @@ export default function ImportPage() {
                             <span className="font-medium">Type détecté :</span>{" "}
                             {formatBackendType(item.extractedType)}
                           </p>
-                          <p>
-                            <span className="font-medium">Nature détectée :</span>{" "}
-                            {formatNature(item.invoiceNature)}
-                          </p>
+                          {item.extractedType !== "payroll_bulk" ? (
+                            <p>
+                              <span className="font-medium">Nature détectée :</span>{" "}
+                              {formatNature(item.invoiceNature)}
+                            </p>
+                          ) : null}
                         </div>
+
+                        {item.sepaSummary ? (
+                          <div
+                            className={`rounded-lg border p-3 text-sm space-y-1 ${
+                              item.sepaSummary.batchType === "payroll"
+                                ? "border-violet-200 bg-violet-50/80 text-violet-950"
+                                : "border-sky-200 bg-sky-50/80 text-sky-950"
+                            }`}
+                          >
+                            <p className="font-medium">
+                              {item.sepaSummary.batchType === "payroll"
+                                ? "SEPA salaires"
+                                : "Fichier SEPA"}
+                            </p>
+                            <p>{item.sepaSummary.label}</p>
+                            <p>
+                              {item.sepaSummary.numberOfTransactions ?? "—"} virement
+                              {(item.sepaSummary.numberOfTransactions ?? 0) > 1 ? "s" : ""}
+                              {item.sepaSummary.periodLabel
+                                ? ` • ${item.sepaSummary.periodLabel}`
+                                : ""}
+                              {item.sepaSummary.totalAmount != null
+                                ? ` • Total ${formatMoney(item.sepaSummary.totalAmount)} EUR`
+                                : ""}
+                            </p>
+                            {item.sepaSummary.batchType === "payroll" ? (
+                              <p className="text-xs opacity-90">
+                                {typeof item.sepaSummary.linkedSlipCount === "number"
+                                  ? `${item.sepaSummary.linkedSlipCount} fiche(s) reliée(s) aux bulletins de paie`
+                                  : "Importez les bulletins du même mois pour relier automatiquement les salariés."}
+                              </p>
+                            ) : null}
+                          </div>
+                        ) : null}
+
+                        {item.payrollSummary ? (
+                          <div className="rounded-lg border border-violet-200 bg-violet-50/80 p-3 text-sm text-violet-950 space-y-1">
+                            <p className="font-medium">Bulletin de paie éclaté</p>
+                            <p>
+                              {item.payrollSummary.numberOfSlips ?? "—"} fiche
+                              {(item.payrollSummary.numberOfSlips ?? 0) > 1 ? "s" : ""} salarié
+                              {(item.payrollSummary.numberOfSlips ?? 0) > 1 ? "s" : ""}
+                              {item.payrollSummary.periodLabel
+                                ? ` • Période ${item.payrollSummary.periodLabel}`
+                                : ""}
+                            </p>
+                            {item.payrollSummary.companyName ? (
+                              <p className="text-violet-800">{item.payrollSummary.companyName}</p>
+                            ) : null}
+                            {item.payrollSummary.totalNet != null ? (
+                              <p>
+                                Net total : {formatMoney(item.payrollSummary.totalNet)}
+                                {item.payrollSummary.currency
+                                  ? ` ${item.payrollSummary.currency}`
+                                  : ""}
+                              </p>
+                            ) : null}
+                          </div>
+                        ) : null}
 
                         <div className="grid gap-2 text-sm md:grid-cols-2">
                           {extractedEntries.length > 0 ? (
@@ -703,11 +839,7 @@ export default function ImportPage() {
                         {item.sent && (
                           <div className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-800 flex gap-2">
                             <CheckCircle2 className="h-4 w-4 mt-0.5" />
-                            <p>
-                              {item.destination === "banque"
-                                ? "Le document a été envoyé dans Banque."
-                                : "Le document a été envoyé dans Factures."}
-                            </p>
+                            <p>{destinationSuccessMessage(item.destination)}</p>
                           </div>
                         )}
                       </div>
@@ -747,9 +879,12 @@ export default function ImportPage() {
               Réinitialiser
             </Button>
 
-            <div className="flex gap-2">
+            <div className="flex flex-wrap gap-2">
               <Button variant="outline" onClick={() => navigate("/factures")}>
                 Ouvrir Factures
+              </Button>
+              <Button variant="outline" onClick={() => navigate("/bulletins")}>
+                Ouvrir Bulletins de paie
               </Button>
             </div>
           </CardFooter>

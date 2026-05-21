@@ -131,25 +131,53 @@ function extractCrmInvoicePayload(body = {}) {
   const vatFromList = Array.isArray(amount?.tva)
     ? amount.tva.reduce((sum, t) => sum + parseFrNumber(t?.montant), 0)
     : 0;
-  const amountNet = parseFrNumber(amount?.montant_ht || body?.total || body?.montant);
-  const amountGross = parseFrNumber(amount?.montant_ttc || body?.ttc || body?.montant);
+  const amountNet = parseFrNumber(
+    amount?.montant_ht ||
+      body?.montantHT ||
+      body?.montantHTConverted ||
+      normalized?.montantHT ||
+      body?.total ||
+      body?.montant
+  );
+  const amountGross = parseFrNumber(
+    amount?.montant_ttc ||
+      body?.montantTTC ||
+      body?.montantTTCConverted ||
+      normalized?.montantTTC ||
+      body?.ttc ||
+      body?.montant
+  );
   const vatRatePercent = parseFrNumber(body?.tva);
   const vatFromRate =
     vatRatePercent > 0 && amountNet > 0 ? amountNet * (vatRatePercent / 100) : 0;
-  const vatAmount =
-    vatFromList > 0
+  const vatExplicit = parseFrNumber(body?.tvaMontant ?? body?.tvaMontantConverted);
+  const hasExplicitVat =
+    body?.tvaMontant !== undefined &&
+    body?.tvaMontant !== null &&
+    String(body.tvaMontant).trim() !== "";
+  let vatAmount = hasExplicitVat
+    ? vatExplicit
+    : vatFromList > 0
       ? vatFromList
       : vatFromRate > 0
         ? vatFromRate
         : Math.max(0, amountGross - amountNet);
 
   const invoiceNumberRaw =
-    String(header?.numero || body?.facture || body?.numro || body?.name || "").trim() || null;
+    String(
+      header?.numero ||
+        body?.numero ||
+        normalized?.numero ||
+        body?.facture ||
+        body?.numro ||
+        body?.name ||
+        ""
+    ).trim() || null;
   const invoiceNumber = invoiceNumberRaw
     ? invoiceNumberRaw.split(" - ")[0].trim()
     : null;
 
-  const pdfViewUrl =
+  let pdfViewUrl =
     String(
       body?.pdfViewUrl ||
         body?.previewUrl ||
@@ -159,34 +187,70 @@ function extractCrmInvoicePayload(body = {}) {
         ""
     ).trim() || null;
 
+  const justificatifIds = body?.justificatifIds || normalized?.justificatifIds;
+  const firstJustificatifId = Array.isArray(justificatifIds)
+    ? String(justificatifIds[0] || "").trim()
+    : "";
+
+  const justificatifNames = body?.justificatifNames || normalized?.justificatifNames;
+  const justificatifFileName =
+    firstJustificatifId && justificatifNames && typeof justificatifNames === "object"
+      ? String(justificatifNames[firstJustificatifId] || "").trim()
+      : "";
+
   const explicitFileId =
     String(
       body?.nomfichierId ||
         normalized?.nomfichierId ||
         body?.attachmentId ||
         body?.fileId ||
+        firstJustificatifId ||
         ""
     ).trim() || null;
 
   const crmFileId = explicitFileId || attachmentIdFromCrmPdfUrl(pdfViewUrl);
 
+  if (!pdfViewUrl && crmFileId) {
+    const bases = getEspoCrmBases();
+    if (bases[0]) {
+      pdfViewUrl = `${bases[0]}/?entryPoint=download&id=${encodeURIComponent(crmFileId)}`;
+    }
+  }
+
   return {
     externalId: body?.id ? String(body.id) : body?.externalId ? String(body.externalId) : null,
     invoiceNature: pickInvoiceNature({ ...body, ...normalized }),
     invoiceNumber,
-    invoiceDate: normalizeDate(header?.date || body?.dateF || body?.dateFacture || body?.createdAt),
+    invoiceDate: normalizeDate(
+      header?.date ||
+        body?.date ||
+        normalized?.date ||
+        body?.dateF ||
+        body?.dateFacture ||
+        body?.createdAt
+    ),
     dueDate: normalizeDate(header?.date_echeance || body?.dateEcheance),
     amountNet,
     vatAmount,
     amountGross,
     currency:
-      String(amount?.devise || body?.ttcCurrency || body?.totalCurrency || "EUR").trim() || "EUR",
+      String(
+        amount?.devise ||
+          body?.montantTTCCurrency ||
+          body?.montantHTCurrency ||
+          body?.ttcCurrency ||
+          body?.totalCurrency ||
+          "EUR"
+      ).trim() || "EUR",
     vendorCustomer:
       String(
         header?.fournisseur ||
           body?.fournisseur ||
           body?.accountName ||
           body?.account1Name ||
+          body?.raisonFrais ||
+          body?.referenceJustificatif ||
+          body?.typesFraisName ||
           ""
       ).trim() || null,
     siret: String(header?.siret || body?.numrcs || "").trim() || null,
@@ -197,9 +261,11 @@ function extractCrmInvoicePayload(body = {}) {
         body?.nomfichierName ||
           normalized?.nomfichierName ||
           body?.fileName ||
+          justificatifFileName ||
           `${invoiceNumber || "facture"}.pdf`
       ).trim() || null,
     pdfViewUrl,
+    crmDownloadUrl: pdfViewUrl,
     raw: normalized,
   };
 }
@@ -208,6 +274,194 @@ function buildPartnerPdfUrlFromCrmFields(fileId, fileName) {
   if (!fileId) return null;
   const safeName = String(fileName || "facture.pdf");
   return `/api/partner/crm-files/${encodeURIComponent(fileId)}/${encodeURIComponent(safeName)}`;
+}
+
+/** Bases EspoCRM : ESPO_CRM_URL, ESPO_CRM_URL_ALT, ESPO_CRM_URLS (séparées par des virgules). */
+function getEspoCrmBases() {
+  const bases = [];
+  for (const raw of String(process.env.ESPO_CRM_URLS || "").split(",")) {
+    const b = raw.trim().replace(/\/+$/, "");
+    if (b) bases.push(b);
+  }
+  for (const key of ["ESPO_CRM_URL", "ESPO_CRM_URL_ALT", "ESPO_CRM_PUBLIC_URL"]) {
+    const b = String(process.env[key] || "")
+      .trim()
+      .replace(/\/+$/, "");
+    if (b) bases.push(b);
+  }
+  return [...new Set(bases)];
+}
+
+function getEspoAuthHeaders() {
+  const headers = {
+    Accept: "application/pdf,application/octet-stream,image/*,*/*",
+  };
+  const apiKey = String(process.env.ESPO_CRM_API_KEY || "").trim();
+  if (apiKey) headers["X-Api-Key"] = apiKey;
+  const basicUser = String(process.env.ESPO_CRM_BASIC_USER || "").trim();
+  const basicPass = String(process.env.ESPO_CRM_BASIC_PASSWORD || "").trim();
+  if (basicUser && basicPass) {
+    headers.Authorization = `Basic ${Buffer.from(`${basicUser}:${basicPass}`).toString("base64")}`;
+  }
+  return headers;
+}
+
+const ESPO_FILE_ID_FIELDS = [
+  "fileId",
+  "attachmentId",
+  "nomfichierId",
+  "fichierId",
+  "documentId",
+  "idFichier",
+];
+
+const ESPO_ENTITY_RESOLVE_TYPES = [
+  "Justificatif",
+  "justificatif",
+  "CJustificatif",
+  "Nomfichier",
+  "nomfichier",
+  "Attachment",
+  "attachment",
+  "NoteDeFrais",
+  "noteDeFrais",
+  "CNdf",
+  "Ndf",
+  "SupplierInvoice",
+  "SuppliersInvoice",
+  "Document",
+  "document",
+  "File",
+  "file",
+];
+
+function collectIdsFromJson(input, set) {
+  if (!input || typeof input !== "object") return;
+  if (Array.isArray(input)) {
+    input.forEach((item) => collectIdsFromJson(item, set));
+    return;
+  }
+  for (const field of ESPO_FILE_ID_FIELDS) {
+    const v = input[field];
+    if (typeof v === "string" && v.trim()) set.add(v.trim());
+    if (Array.isArray(v)) {
+      v.forEach((x) => {
+        if (typeof x === "string" && x.trim()) set.add(x.trim());
+      });
+    }
+  }
+  for (const [key, value] of Object.entries(input)) {
+    if (typeof value === "string") {
+      const v = value.trim();
+      const keyLc = key.toLowerCase();
+      const likelyKey =
+        keyLc.includes("attachment") ||
+        keyLc.includes("file") ||
+        keyLc.includes("fichier") ||
+        keyLc.endsWith("id");
+      const idLike = /^[a-f0-9]{12,32}$/i.test(v);
+      if (likelyKey && idLike) set.add(v);
+    } else if (value && typeof value === "object") {
+      collectIdsFromJson(value, set);
+    }
+  }
+}
+
+async function resolveEspoFileIds(bases, rootId, headers, attempts) {
+  const resolved = new Set();
+  const jsonHeaders = { ...headers, Accept: "application/json" };
+  for (const base of bases) {
+    for (const entity of ESPO_ENTITY_RESOLVE_TYPES) {
+      const url = `${base}/api/v1/${entity}/${encodeURIComponent(rootId)}`;
+      const r = await fetch(url, { method: "GET", headers: jsonHeaders });
+      let snippet = "";
+      if (r.ok) {
+        try {
+          collectIdsFromJson(await r.json(), resolved);
+        } catch {
+          /* ignore */
+        }
+      } else {
+        try {
+          snippet = (await r.text()).slice(0, 220);
+        } catch {
+          snippet = "";
+        }
+      }
+      attempts.push({
+        phase: "resolve-entity",
+        url,
+        status: r.status,
+        ok: r.ok,
+        contentType: r.headers.get("content-type") || null,
+        snippet,
+      });
+    }
+  }
+  return Array.from(resolved);
+}
+
+function buildEspoDownloadUrls(bases, ids) {
+  const downloadTypes = [
+    null,
+    "Attachment",
+    "attachment",
+    "Justificatif",
+    "justificatif",
+    "Nomfichier",
+    "nomfichier",
+    "Document",
+    "document",
+    "File",
+    "file",
+  ];
+  const urls = [];
+  for (const base of bases) {
+    for (const id of ids) {
+      for (const type of downloadTypes) {
+        if (type) {
+          urls.push(
+            `${base}/?entryPoint=download&id=${encodeURIComponent(id)}&type=${encodeURIComponent(type)}`
+          );
+        } else {
+          urls.push(`${base}/?entryPoint=download&id=${encodeURIComponent(id)}`);
+        }
+      }
+      urls.push(`${base}/api/v1/Attachment/${encodeURIComponent(id)}/file`);
+      urls.push(`${base}/api/v1/Attachment/file/${encodeURIComponent(id)}`);
+      urls.push(`${base}/api/v1/Nomfichier/${encodeURIComponent(id)}/file`);
+      urls.push(`${base}/api/v1/nomfichier/${encodeURIComponent(id)}/file`);
+      urls.push(`${base}/api/v1/Justificatif/${encodeURIComponent(id)}/file`);
+      urls.push(`${base}/api/v1/justificatif/${encodeURIComponent(id)}/file`);
+      urls.push(`${base}/api/v1/Document/${encodeURIComponent(id)}/file`);
+      urls.push(`${base}/api/v1/File/${encodeURIComponent(id)}/file`);
+    }
+  }
+  return urls;
+}
+
+async function fetchFirstOkUrl(urls, headers, attempts, phase = "download") {
+  for (const url of urls) {
+    const attempt = await fetch(url, { method: "GET", headers });
+    let snippet = "";
+    if (!attempt.ok) {
+      try {
+        snippet = (await attempt.text()).slice(0, 240);
+      } catch {
+        snippet = "";
+      }
+    }
+    attempts.push({
+      phase,
+      url,
+      status: attempt.status,
+      ok: attempt.ok,
+      contentType: attempt.headers.get("content-type") || null,
+      snippet,
+    });
+    if (attempt.ok) return attempt;
+  }
+  return null;
 }
 
 /**
@@ -365,7 +619,7 @@ export async function ingestPartnerInvoice(req, res) {
     if (!mapped.invoiceNumber) {
       return res.status(400).json({
         success: false,
-        error: "Champ facture manquant: Header.numero (ou name) requis.",
+        error: "Champ facture manquant: numero / Header.numero / name requis.",
       });
     }
 
@@ -382,8 +636,10 @@ export async function ingestPartnerInvoice(req, res) {
       issuerSiret: mapped.siret,
       recipientSiret: null,
       counterpartyRole: mapped.invoiceNature === "purchase" ? "supplier" : "customer",
-      // CRM flow: only keep explicit preview/view URLs, never force download links.
-      pdfUrl: mapped.pdfViewUrl || null,
+      pdfUrl: mapped.crmFileId
+        ? buildPartnerPdfUrlFromCrmFields(mapped.crmFileId, mapped.crmFileName)
+        : mapped.pdfViewUrl || null,
+      crmDownloadUrl: mapped.crmDownloadUrl || mapped.pdfViewUrl || null,
     };
 
     const created =
@@ -466,144 +722,53 @@ export async function streamPartnerCrmFile(req, res) {
       });
     }
 
-    const base = String(process.env.ESPO_CRM_URL || "").trim().replace(/\/+$/, "");
-    if (!base) {
+    const bases = getEspoCrmBases();
+    if (!bases.length) {
       return res.status(503).json({
         success: false,
-        error: "ESPO_CRM_URL non configuré.",
+        error: "ESPO_CRM_URL (ou ESPO_CRM_URLS) non configuré.",
       });
     }
 
-    const headers = {
-      Accept: "application/pdf,application/octet-stream,*/*",
-    };
-    const apiKey = String(process.env.ESPO_CRM_API_KEY || "").trim();
-    if (apiKey) headers["X-Api-Key"] = apiKey;
-    const basicUser = String(process.env.ESPO_CRM_BASIC_USER || "").trim();
-    const basicPass = String(process.env.ESPO_CRM_BASIC_PASSWORD || "").trim();
-    if (basicUser && basicPass) {
-      headers.Authorization = `Basic ${Buffer.from(`${basicUser}:${basicPass}`).toString("base64")}`;
-    }
-
-    const possibleTypes = [
-      "Attachment",
-      "attachment",
-      "Nomfichier",
-      "nomfichier",
-      "Document",
-      "document",
-      "File",
-      "file",
-    ];
+    const headers = getEspoAuthHeaders();
     const attempts = [];
-    const collectIdsFromJson = (input, set) => {
-      if (!input || typeof input !== "object") return;
-      if (Array.isArray(input)) {
-        input.forEach((item) => collectIdsFromJson(item, set));
-        return;
-      }
-      for (const [key, value] of Object.entries(input)) {
-        if (typeof value === "string") {
-          const v = value.trim();
-          const keyLc = key.toLowerCase();
-          const likelyKey =
-            keyLc.includes("attachment") ||
-            keyLc.includes("file") ||
-            keyLc.includes("fichier") ||
-            keyLc.endsWith("id");
-          const idLike = /^[a-z0-9]{12,32}$/i.test(v);
-          if (likelyKey && idLike) set.add(v);
-        } else if (value && typeof value === "object") {
-          collectIdsFromJson(value, set);
-        }
-      }
-    };
 
-    const resolveEntityIds = async (rootId) => {
-      const resolved = new Set();
-      const jsonHeaders = { ...headers, Accept: "application/json" };
-      const entityUrls = [
-        `${base}/api/v1/Nomfichier/${encodeURIComponent(rootId)}`,
-        `${base}/api/v1/nomfichier/${encodeURIComponent(rootId)}`,
-        `${base}/api/v1/SupplierInvoice/${encodeURIComponent(rootId)}`,
-        `${base}/api/v1/SuppliersInvoice/${encodeURIComponent(rootId)}`,
-      ];
-      for (const url of entityUrls) {
-        const r = await fetch(url, { method: "GET", headers: jsonHeaders });
-        let snippet = "";
-        let json = null;
-        if (r.ok) {
-          try {
-            json = await r.json();
-            collectIdsFromJson(json, resolved);
-          } catch {
-            json = null;
-          }
-        } else {
-          try {
-            snippet = (await r.text()).slice(0, 220);
-          } catch {
-            snippet = "";
-          }
-        }
-        attempts.push({
-          phase: "resolve-entity",
-          url,
-          status: r.status,
-          ok: r.ok,
-          contentType: r.headers.get("content-type") || null,
-          snippet,
-        });
-      }
-      return Array.from(resolved);
-    };
-
-    const resolvedIds = await resolveEntityIds(attachmentId);
-    const candidateIds = Array.from(new Set([attachmentId, ...resolvedIds]));
-    const candidates = candidateIds.flatMap((id) => [
-      ...possibleTypes.map(
-        (type) =>
-          `${base}/?entryPoint=download&id=${encodeURIComponent(id)}&type=${encodeURIComponent(type)}`
-      ),
-      `${base}/api/v1/Attachment/${encodeURIComponent(id)}/file`,
-      `${base}/api/v1/Attachment/file/${encodeURIComponent(id)}`,
-      `${base}/api/v1/Nomfichier/${encodeURIComponent(id)}/file`,
-      `${base}/api/v1/nomfichier/${encodeURIComponent(id)}/file`,
-      `${base}/api/v1/Document/${encodeURIComponent(id)}/file`,
-      `${base}/api/v1/File/${encodeURIComponent(id)}/file`,
-    ]);
+    let directUrl = String(req.query?.downloadUrl || req.query?.crmUrl || "").trim();
+    if (!directUrl) {
+      const { PurchaseInvoice } = await import("../models/PurchaseInvoice.js");
+      const { SalesInvoice } = await import("../models/SalesInvoice.js");
+      const idRegex = new RegExp(attachmentId.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+      const inv =
+        (await PurchaseInvoice.findOne({
+          $or: [{ crmDownloadUrl: idRegex }, { pdfUrl: idRegex }],
+        }).lean()) ||
+        (await SalesInvoice.findOne({
+          $or: [{ crmDownloadUrl: idRegex }, { pdfUrl: idRegex }],
+        }).lean());
+      directUrl = String(inv?.crmDownloadUrl || "").trim();
+    }
 
     let upstreamRes = null;
-    for (const url of candidates) {
-      const attempt = await fetch(url, { method: "GET", headers });
-      let snippet = "";
-      if (!attempt.ok) {
-        try {
-          snippet = (await attempt.text()).slice(0, 240);
-        } catch {
-          snippet = "";
-        }
-      }
-      attempts.push({
-        phase: "download",
-        url,
-        status: attempt.status,
-        ok: attempt.ok,
-        contentType: attempt.headers.get("content-type") || null,
-        snippet,
-      });
-      if (attempt.ok) {
-        upstreamRes = attempt;
-        break;
-      }
+    if (directUrl) {
+      upstreamRes = await fetchFirstOkUrl([directUrl], headers, attempts, "direct-url");
+    }
+
+    const resolvedIds = await resolveEspoFileIds(bases, attachmentId, headers, attempts);
+    const candidateIds = Array.from(new Set([attachmentId, ...resolvedIds]));
+    if (!upstreamRes) {
+      const candidates = buildEspoDownloadUrls(bases, candidateIds);
+      upstreamRes = await fetchFirstOkUrl(candidates, headers, attempts, "download");
     }
 
     if (!upstreamRes) {
       return res.status(404).json({
         success: false,
         error: "Fichier CRM introuvable ou inaccessible.",
+        hint:
+          "Vérifiez ESPO_CRM_URL (ex. https://dev.consult-it.com), que justificatifIds pointe bien vers un fichier, ou envoyez pdfViewUrl à l'ingestion.",
         attachmentId,
         resolvedIds,
+        crmBasesTried: bases,
         attempts,
       });
     }

@@ -301,6 +301,118 @@ export type BankSuggestionDisplayOptions = {
   trustBackend?: boolean;
 };
 
+/** Afficher les propositions à partir de ~55–60 % (sans auto-rapprocher). */
+export const SUGGESTION_DISPLAY_MIN_SCORE = 55;
+
+/** Propositions « moyennes » (~60 %) : affichées même si le montant n’est pas parfait. */
+export const SUGGESTION_MEDIUM_SCORE = 58;
+
+/** Au-dessus de ce score, le rapprochement peut être appliqué automatiquement. */
+export const AUTO_RECONCILE_THRESHOLD = 78;
+
+/** Montant + date dans la fenêtre + sens comptable (sans exiger le fournisseur). */
+export function isAmountDateDisplayCandidate(txn: LocalTransaction, inv: LocalInvoice): boolean {
+  const txnAbs = Math.abs(txn.amount);
+  if (txnAbs < 0.01) return false;
+  const details = getMatchDetails(txn, inv);
+  const amountOk =
+    details.amountDiff <=
+    Math.max(BANK_AMOUNT_TOLERANCE_EUR, txnAbs * BANK_SINGLE_LINE_MAX_RATIO);
+  const daysDiff = minDaysBetweenTxnAndInvoice(txn, inv);
+  const dateOk =
+    daysDiff <= BANK_DATE_TOLERANCE_DAYS || !Number.isFinite(parseDateMs(txn.txnDate));
+  if (!amountOk || !dateOk || !details.directionMatch) return false;
+  if ((inv.currency ?? txn.currency) !== txn.currency) return false;
+  return true;
+}
+
+/** Pourquoi cette proposition n'a pas été rapprochée automatiquement. */
+export function buildNotAutoReconcileReasons(
+  txn: LocalTransaction,
+  inv: LocalInvoice,
+  score: number,
+  threshold = AUTO_RECONCILE_THRESHOLD
+): string[] {
+  const s = Math.round(score);
+  if (s >= threshold) return [];
+
+  const reasons: string[] = [];
+  const details = getMatchDetails(txn, inv);
+  const txnAbs = Math.abs(txn.amount);
+  const amountOk =
+    details.amountDiff <=
+    Math.max(BANK_AMOUNT_TOLERANCE_EUR, txnAbs * BANK_SINGLE_LINE_MAX_RATIO);
+
+  if (!amountOk) {
+    reasons.push(`Écart de montant : ${formatMoney(details.amountDiff, txn.currency)}`);
+  }
+  const daysDiff = minDaysBetweenTxnAndInvoice(txn, inv);
+  if (daysDiff > BANK_DATE_TOLERANCE_DAYS) {
+    reasons.push(`Dates à plus de ${BANK_DATE_TOLERANCE_DAYS} jours`);
+  }
+  if (!supplierMatchesTransaction(txn, inv)) {
+    reasons.push("Fournisseur / tiers non reconnu dans le libellé");
+  }
+  if (!invoiceReferenceMatchesTransaction(txn, inv)) {
+    reasons.push("N° de facture absent du libellé bancaire");
+  }
+  if (!details.directionMatch) {
+    reasons.push("Sens achat / vente différent");
+  }
+  if (reasons.length === 0) {
+    reasons.push("Correspondance insuffisante pour rapprochement automatique");
+  }
+  return reasons;
+}
+
+export function enrichSepaOperationCandidate(
+  txn: LocalTransaction,
+  invoice: LocalInvoice,
+  input: {
+    score: number;
+    serverScore?: number;
+    reasons?: string[];
+    serverNotAutoReasons?: string[];
+    requiresManualValidation?: boolean;
+  }
+): SepaOperationCandidate {
+  const score = Math.round(input.score);
+  const serverScore = input.serverScore ?? score;
+  const effectiveScore = Math.max(score, serverScore);
+  const matchReasons = input.reasons?.length
+    ? input.reasons
+    : buildCandidateReasons(txn, invoice, score);
+  const notAutoReasons = input.serverNotAutoReasons?.length
+    ? input.serverNotAutoReasons
+    : buildNotAutoReconcileReasons(txn, invoice, effectiveScore);
+  const requiresManualValidation =
+    input.requiresManualValidation ?? effectiveScore < AUTO_RECONCILE_THRESHOLD;
+
+  return {
+    invoice,
+    score,
+    serverScore,
+    details: getMatchDetails(txn, invoice),
+    reasons: matchReasons,
+    notAutoReasons,
+    requiresManualValidation,
+  };
+}
+
+export function shouldShowReconciliationSuggestion(
+  txn: LocalTransaction,
+  inv: LocalInvoice,
+  score: number,
+  options?: BankSuggestionDisplayOptions & { serverScore?: number }
+): boolean {
+  const effective = Math.max(score, Number(options?.serverScore ?? 0));
+  if (isObviousBadBankMatch(txn, inv, effective)) return false;
+  if (isAmountDateDisplayCandidate(txn, inv)) return true;
+  if (effective < SUGGESTION_DISPLAY_MIN_SCORE) return false;
+  if (effective >= SUGGESTION_MEDIUM_SCORE) return true;
+  return shouldDisplayBankSuggestion(txn, inv, score, options);
+}
+
 export function shouldDisplayBankSuggestion(
   txn: LocalTransaction,
   inv: LocalInvoice,
@@ -308,7 +420,7 @@ export function shouldDisplayBankSuggestion(
   options?: BankSuggestionDisplayOptions
 ): boolean {
   if (options?.trustBackend) {
-    return score >= 35 && !isObviousBadBankMatch(txn, inv, score);
+    return score >= SUGGESTION_DISPLAY_MIN_SCORE && !isObviousBadBankMatch(txn, inv, score);
   }
 
   const txnAbs = Math.abs(txn.amount);

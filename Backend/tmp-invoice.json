@@ -1,0 +1,1 @@
+﻿{"id":"test-curl-003","invoiceNature":"purchase","Header":{"numero":"NDF-TEST-997","date":"2026-04-30","fournisseur":"VIRPRO SAS"},"Amount":{"montant_ht":10,"montant_ttc":10,"devise":"EUR"}}

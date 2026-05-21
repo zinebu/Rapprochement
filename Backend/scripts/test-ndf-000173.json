@@ -1,0 +1,45 @@
+{
+  "id": "6a0c6706900fc61f7",
+  "externalId": "6a0c6706900fc61f7",
+  "invoiceNature": "purchase",
+  "fournisseur": "GROUPE MIND7",
+  "numero": "NDF-000173",
+  "date": "2026-05-12",
+  "status": "En attente",
+  "montantTTC": 21,
+  "montantHT": 21,
+  "tva": "0",
+  "tvaMontant": 0,
+  "montantTTCCurrency": "EUR",
+  "montantHTCurrency": "EUR",
+  "typesFraisName": "Repas et hébergement",
+  "typesFraisCode": "RESTAURANT",
+  "accountName": "GROUPE MIND7",
+  "missionName": "Ghassen SAKOUHI",
+  "contactName": "Ghassen SAKOUHI",
+  "createdByName": "Ghassen SAKOUHI",
+  "demandesFraisName": "Demande frais - Ghassen SAKOUHI - 5/2026",
+  "justificatifIds": ["6a0c66f89b7a72af7"],
+  "justificatifNames": {
+    "6a0c66f89b7a72af7": "IMG_6171.png"
+  },
+  "justificatifTypes": {
+    "6a0c66f89b7a72af7": "image/png"
+  },
+  "nomfichierId": "6a0c66f89b7a72af7",
+  "nomfichierName": "IMG_6171.png",
+  "pdfViewUrl": "https://intra.consult-it.com/?entryPoint=download&id=6a0c66f89b7a72af7",
+  "resultats": {
+    "Header": {
+      "numero": "NDF-000173",
+      "date": "2026-05-12",
+      "fournisseur": "GROUPE MIND7"
+    },
+    "Amount": {
+      "devise": "EUR",
+      "montant_ht": 21,
+      "montant_ttc": 21,
+      "tva": [{ "taux": "0", "montant": 0 }]
+    }
+  }
+}

@@ -11,6 +11,7 @@ import {
   deleteImportById,
   saveImportReconciliation,
   serveImportFile,
+  servePayslipFile,
   migrateFilesToDb,
 } from "../controllers/import.controller.js";
 
@@ -60,6 +61,7 @@ router.post("/imports/migrate-files", requireAuth, migrateFilesToDb);
 router.post("/imports/:id/send", requireAuth, sendImportToFactures);
 router.get("/imports", requireAuth, listImports);
 router.get("/imports/:id/file", requireAuth, serveImportFile);
+router.get("/imports/:id/payslip/:slipId/file", requireAuth, servePayslipFile);
 router.get("/imports/:id", requireAuth, getImportById);
 router.delete("/imports/:id", requireAuth, deleteImportById);
 router.post("/imports/:id/reconciliation", requireAuth, saveImportReconciliation);

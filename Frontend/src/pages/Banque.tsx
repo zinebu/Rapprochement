@@ -55,13 +55,20 @@ import type {
   SepaOperationDecisionStatus,
   UnreconciledCategory,
   SepaBatchTemplate,
+  SepaBatchOperation,
 } from "@/features/banque/types";
 
+import { ReconciliationSuggestionChips } from "@/features/banque/reconciliation-suggestion-ui";
 import {
   amountMatchesRange,
+  AUTO_RECONCILE_THRESHOLD,
   buildCandidateReasons,
   computeMatchScore,
+  enrichSepaOperationCandidate,
+  isAmountDateDisplayCandidate,
   shouldDisplayBankSuggestion,
+  shouldShowReconciliationSuggestion,
+  SUGGESTION_MEDIUM_SCORE,
   isObviousBadBankMatch,
   formatCompactAmount,
   formatDisplayDate,
@@ -84,6 +91,10 @@ import {
   type StoredReconciliationProposal,
 } from "@/features/banque/reconciliation-proposals-api";
 import {
+  getPayrollSlipMatchReasonsForOperation,
+  type PayrollSlipIndexEntry,
+} from "@/features/banque/payroll-match-reasons";
+import {
   filterSepaCandidateReasons,
   getTxnReconciliationBadgeStatus,
   getTxnDisplayInvoiceIds,
@@ -91,6 +102,12 @@ import {
   collectInvoiceIdsFromSepaDecisions,
   applySepaDecisionsToBatch,
   proposalPayloadFromRow,
+  isInvoiceLinkedToOtherTransactions,
+  findDuplicateInvoiceAssignments,
+  isSepaLineResolved,
+  isSepaBatchFullyResolved,
+  isSepaLineInvoiceNotFound,
+  getSepaLineStatusLabel,
 } from "@/features/banque/reconciliation-display";
 
 type ImportedBankOperation = {
@@ -140,6 +157,7 @@ function Banque() {
   const [transactions, setTransactions] = useState<LocalTransaction[]>(initialTransactions);
   const [realInvoices, setRealInvoices] = useState<LocalInvoice[]>([]);
   const [sepaBatchesByReference, setSepaBatchesByReference] = useState<Record<string, SepaBatchTemplate>>({});
+  const [payrollSlipsByRef, setPayrollSlipsByRef] = useState<Record<string, PayrollSlipIndexEntry>>({});
   const [recentStatementImports, setRecentStatementImports] = useState<
     Array<{ id: string; originalName: string; createdAt?: string }>
   >([]);
@@ -170,6 +188,7 @@ function Banque() {
   const [manualComment, setManualComment] = useState("");
   const [manualReviewFlag, setManualReviewFlag] = useState(false);
   const [manualRejectAllSuggestions, setManualRejectAllSuggestions] = useState(false);
+  const [manualInvoiceNotFound, setManualInvoiceNotFound] = useState(false);
 
   const [sepaLineDecisions, setSepaLineDecisions] = useState<Record<string, SepaOperationDecision>>({});
   const [sepaEditModeByOperation, setSepaEditModeByOperation] = useState<Record<string, boolean>>({});
@@ -445,9 +464,26 @@ function Banque() {
         const importedDocs: ImportedDocumentDto[] = Array.isArray(payload?.documents) ? payload.documents : [];
         const scannedTransactions: LocalTransaction[] = [];
         const scannedSepaBatches: Record<string, SepaBatchTemplate> = {};
+        const slipIndex: Record<string, PayrollSlipIndexEntry> = {};
 
         importedDocs.forEach((doc) => {
           const docId = doc.id || doc._id || "";
+          const payrollBatch = doc.structuredData?.payrollBatch;
+          if (payrollBatch?.slips?.length) {
+            const batchId = payrollBatch.id || docId;
+            for (const slip of payrollBatch.slips) {
+              if (!slip?.id) continue;
+              slipIndex[slip.id] = {
+                employeeName: slip.employeeName || slip.id,
+                matricule: slip.matricule,
+                sourceDocumentId: docId,
+                batchId,
+                netPay: slip.netPay ?? null,
+                iban: slip.iban ?? null,
+                periodLabel: payrollBatch.periodLabel ?? null,
+              };
+            }
+          }
           const structured = doc.structuredData;
           const docType = structured?.documentType || doc.documentType;
           const persistedOps = structured?.reconciliation?.operations || {};
@@ -612,6 +648,7 @@ function Banque() {
 
         // Replace with scanned imports only to avoid stale/mock SEPA linkage.
         setSepaBatchesByReference(scannedSepaBatches);
+        setPayrollSlipsByRef(slipIndex);
 
         // Load Bridge transactions from Connecteurs sync and merge them into Banque operations.
         try {
@@ -796,6 +833,7 @@ function Banque() {
     setManualRejectAllSuggestions(
       (selectedDetailsTxn.unreconciledComment ?? "").includes("Aucune proposition IA retenue")
     );
+    setManualInvoiceNotFound(selectedDetailsTxn.unreconciledCategory === "facture_introuvable");
     setSepaCurrentOperationIndex(0);
 
     const linkedBatch = findSepaBatchForTransaction(selectedDetailsTxn);
@@ -816,21 +854,38 @@ function Banque() {
       selectedDetailsTxn.sepaLineDecisions && typeof selectedDetailsTxn.sepaLineDecisions === "object"
         ? selectedDetailsTxn.sepaLineDecisions
         : {};
+    const isPayrollSepa = selectedSepaBatch.type === "payroll";
     selectedSepaBatch.operations.forEach((op) => {
       const persistedDecision = persistedLineDecisions[op.id];
       const linkedIds = Array.isArray(op.linkedInvoiceIds) ? op.linkedInvoiceIds : [];
+      const slipRef = op.payrollSlipRef || persistedDecision?.selectedPayrollSlipRef;
       const isTxnReconciled = selectedDetailsTxn.reconciledStatus === "rapproché";
+      if (isPayrollSepa) {
+        seededDecisions[op.id] = {
+          status:
+            persistedDecision?.status ||
+            (slipRef ? "approved" : isTxnReconciled ? "approved" : "pending"),
+          selectedInvoiceIds: [],
+          selectedPayrollSlipRef: slipRef || undefined,
+          rejectAllSuggestions: Boolean(persistedDecision?.rejectAllSuggestions),
+          invoiceNotFound: Boolean(persistedDecision?.invoiceNotFound),
+        };
+        return;
+      }
       seededDecisions[op.id] = {
         status:
           persistedDecision?.status
             ? persistedDecision.status
-            : isTxnReconciled && linkedIds.length > 0
+            : persistedDecision?.invoiceNotFound
               ? "approved"
-              : "pending",
+              : isTxnReconciled && linkedIds.length > 0
+                ? "approved"
+                : "pending",
         selectedInvoiceIds: Array.isArray(persistedDecision?.selectedInvoiceIds)
           ? persistedDecision.selectedInvoiceIds
           : linkedIds,
         rejectAllSuggestions: Boolean(persistedDecision?.rejectAllSuggestions),
+        invoiceNotFound: Boolean(persistedDecision?.invoiceNotFound),
       };
     });
 
@@ -939,11 +994,21 @@ function Banque() {
   ]);
 
 
-  const linkedInvoiceIdsAcrossDecisions = useMemo(() => {
-    return (Object.values(sepaLineDecisions) as SepaOperationDecision[]).flatMap(
-      (decision) => decision.selectedInvoiceIds
-    );
-  }, [sepaLineDecisions]);
+  const duplicateInvoiceAssignments = useMemo(
+    () => findDuplicateInvoiceAssignments(transactions, findSepaBatchForTransaction),
+    [transactions, sepaBatchesByReference]
+  );
+
+  const isInvoiceUsedOnAnotherTxn = useCallback(
+    (invoiceId: string, currentTxnId: string) =>
+      isInvoiceLinkedToOtherTransactions(
+        invoiceId,
+        currentTxnId,
+        transactions,
+        findSepaBatchForTransaction
+      ),
+    [transactions, sepaBatchesByReference]
+  );
 
   const [manualSuggestions, setManualSuggestions] = useState<SepaOperationCandidate[]>([]);
   const [aiScoreCacheByTxn, setAiScoreCacheByTxn] = useState<Record<string, any>>({});
@@ -960,7 +1025,6 @@ function Banque() {
   const manualSuggestionsReqRef = useRef(0);
   const manualEngineRowsRef = useRef<SepaOperationCandidate[]>([]);
   const manualRecoPollTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const AUTO_RECONCILE_THRESHOLD = 78;
 
   const realInvoiceIdSet = useMemo(
     () => new Set(realInvoices.map((inv) => String(inv.id))),
@@ -1008,6 +1072,7 @@ function Banque() {
           try {
             const batch = findSepaBatchForTransaction(txn);
             if (!batch || !Array.isArray(batch.operations) || batch.operations.length === 0) return;
+            if (batch.type === "payroll") return;
             const firstOp = batch.operations[0];
             const res = await fetch("/api/reconciliation/score", {
               method: "POST",
@@ -1058,6 +1123,70 @@ function Banque() {
     return ids
       .map((id) => byId.get(id) || localInvoices.find((invoice) => invoice.id === id))
       .filter(Boolean) as LocalInvoice[];
+  };
+
+  const resolvePayrollSlipLabel = (ref?: string | null) => {
+    if (!ref) return null;
+    const slip = payrollSlipsByRef[ref];
+    if (!slip) return ref;
+    return slip.matricule ? `${slip.employeeName} (${slip.matricule})` : slip.employeeName;
+  };
+
+  const getPayrollMatchReasons = useCallback(
+    (op: SepaBatchOperation, slipRef?: string | null) =>
+      getPayrollSlipMatchReasonsForOperation(op, payrollSlipsByRef, slipRef),
+    [payrollSlipsByRef]
+  );
+
+  const renderPayrollMatchReasons = (
+    reasons: string[],
+    tone: "violet" | "emerald" = "violet"
+  ) => {
+    if (!reasons.length) return null;
+    const chipClass =
+      tone === "emerald"
+        ? "rounded-full bg-white/90 px-2 py-1 text-[11px] text-emerald-800 ring-1 ring-emerald-200"
+        : "rounded-full bg-violet-100/90 px-2 py-1 text-[11px] text-violet-800";
+    return (
+      <div className="flex flex-wrap gap-2 mt-2">
+        {reasons.map((reason) => (
+          <span key={reason} className={chipClass}>
+            {reason}
+          </span>
+        ))}
+      </div>
+    );
+  };
+
+  const getPayrollSlipFileUrl = (
+    op: SepaBatchOperation,
+    slipRef?: string | null
+  ): string | null => {
+    const ref = slipRef || op.payrollSlipRef;
+    if (!ref) return null;
+    const slip = payrollSlipsByRef[ref];
+    const docId =
+      op.payrollSlipDocumentId ||
+      slip?.sourceDocumentId ||
+      selectedSepaBatch?.payrollBatchDocumentId ||
+      null;
+    if (!docId) return null;
+    return `/api/imports/${encodeURIComponent(docId)}/payslip/${encodeURIComponent(ref)}/file`;
+  };
+
+  const openPayrollSlipPdf = (op: SepaBatchOperation, slipRef?: string | null) => {
+    const ref = slipRef || op.payrollSlipRef;
+    const url = getPayrollSlipFileUrl(op, ref);
+    if (!url) {
+      toast?.error?.(
+        "Impossible d'ouvrir la fiche. Vérifiez que le bulletin du mois est importé (Bulletins de paie)."
+      );
+      return;
+    }
+    setPreviewPdfTitle(
+      `Bulletin — ${resolvePayrollSlipLabel(ref) || op.creditorName || "Salarié"}`
+    );
+    setPreviewPdfUrl(url);
   };
 
   const getFullPdfUrl = (pdfUrl?: string | null) => {
@@ -1159,28 +1288,52 @@ function Banque() {
         if (hasCreditorSupplierHit) score += 18;
         score = Math.max(0, Math.min(100, Math.round(score)));
 
-        const passesBusinessGate = hasRefHit || hasCreditorSupplierHit || strongAmountMatch;
+        const amountDateOnly = isAmountDateDisplayCandidate(pseudoTxn as any, invoice);
+        const passesBusinessGate =
+          hasRefHit ||
+          hasCreditorSupplierHit ||
+          strongAmountMatch ||
+          aiScore >= SUGGESTION_MEDIUM_SCORE ||
+          amountDateOnly;
         if (!passesBusinessGate) return null;
-        if (!hasCreditorSupplierHit && !hasRefHit && !amountLooksPlausible) return null;
+        if (
+          !hasCreditorSupplierHit &&
+          !hasRefHit &&
+          !amountLooksPlausible &&
+          aiScore < SUGGESTION_MEDIUM_SCORE &&
+          !amountDateOnly
+        ) {
+          return null;
+        }
 
-        const reasons = [];
+        const displayScore = Math.max(aiScore, score);
+        if (
+          !shouldShowReconciliationSuggestion(pseudoTxn as any, invoice, score, {
+            trustBackend: true,
+            serverScore: aiScore,
+          })
+        ) {
+          return null;
+        }
+
+        const reasons: string[] = [];
         if (Array.isArray(srv?.signals)) reasons.push(...srv.signals);
         if (srv?.reason) reasons.push(String(srv.reason));
         reasons.unshift(`Écart montant ligne: ${formatMoney(amountDiff, invoice.currency ?? pseudoTxn.currency)}`);
         if (hasRefHit) reasons.unshift("Référence exacte détectée");
         if (hasVendorHit) reasons.unshift("Tiers cohérent");
         if (hasCreditorSupplierHit) reasons.unshift("Créancier SEPA cohérent avec le fournisseur");
-        return {
-          invoice,
-          score,
-          details: getMatchDetails(pseudoTxn as any, invoice),
-          reasons: reasons.length ? reasons : buildCandidateReasons(pseudoTxn as any, invoice, score),
-        } as SepaOperationCandidate;
+        return enrichSepaOperationCandidate(pseudoTxn as any, invoice, {
+          score: displayScore,
+          serverScore: aiScore,
+          reasons: reasons.length ? reasons : undefined,
+          serverNotAutoReasons: Array.isArray(srv?.notAutoReasons) ? srv.notAutoReasons : undefined,
+          requiresManualValidation: srv?.requiresManualValidation,
+        });
       })
       .filter((x): x is SepaOperationCandidate => Boolean(x))
-      .filter((x) => x.score >= 35)
       .sort((a, b) => b.score - a.score)
-      .slice(0, 5);
+      .slice(0, 8);
 
     return {
       opId: op.id,
@@ -1236,18 +1389,21 @@ function Banque() {
         const reasons = parts.length
           ? filterSepaCandidateReasons(parts)
           : buildCandidateReasons(txn, invoice as LocalInvoice, score);
-        return {
-          invoice: invoice as LocalInvoice,
+        return enrichSepaOperationCandidate(txn, invoice as LocalInvoice, {
           score,
-          details: getMatchDetails(txn, invoice as LocalInvoice),
+          serverScore: score,
           reasons: reasons.length ? reasons : [s.reason || "Correspondance moteur serveur"],
-        };
+          serverNotAutoReasons: Array.isArray(s.notAutoReasons) ? s.notAutoReasons : undefined,
+          requiresManualValidation: s.requiresManualValidation,
+        });
       })
       .filter((row): row is SepaOperationCandidate => Boolean(row))
-      .filter((item) => {
-        if (isEnginePayload) return item.score >= 35 && !isObviousBadBankMatch(txn, item.invoice, item.score);
-        return shouldDisplayBankSuggestion(txn, item.invoice, item.score, { trustBackend: true });
-      })
+      .filter((item) =>
+        shouldShowReconciliationSuggestion(txn, item.invoice, item.score, {
+          trustBackend: isEnginePayload,
+          serverScore: item.serverScore ?? item.score,
+        })
+      )
       .sort((a, b) => b.score - a.score)
       .slice(0, 8);
   };
@@ -1261,17 +1417,12 @@ function Banque() {
           currency: (invoice.currency || txnCurrency) as CurrencyCode,
         };
         const score = computeMatchScore(txn, invForScore);
-        if (!shouldDisplayBankSuggestion(txn, invForScore, score)) return null;
-        return {
-          invoice,
-          score,
-          details: getMatchDetails(txn, invoice),
-          reasons: buildCandidateReasons(txn, invForScore, score),
-        } as SepaOperationCandidate;
+        if (!shouldShowReconciliationSuggestion(txn, invForScore, score)) return null;
+        return enrichSepaOperationCandidate(txn, invForScore, { score });
       })
       .filter((row): row is SepaOperationCandidate => Boolean(row))
       .sort((a, b) => b.score - a.score)
-      .slice(0, 5);
+      .slice(0, 8);
   };
 
   const applyManualSuggestionsFromStoredRow = (
@@ -1534,7 +1685,13 @@ function Banque() {
   useEffect(() => {
     const loadDialogSepaSuggestions = async () => {
       console.log("[SEPA-SUGGEST] open=", detailsDialogOpen, "txn=", selectedDetailsTxn?.id, "isSepa=", selectedTxnIsSepa, "batch=", selectedSepaBatch?.id, "invoices=", realInvoices.length, "reconciledStatus=", selectedDetailsTxn?.reconciledStatus);
-      if (!detailsDialogOpen || !selectedDetailsTxn || !selectedTxnIsSepa || !selectedSepaBatch) {
+      if (
+        !detailsDialogOpen ||
+        !selectedDetailsTxn ||
+        !selectedTxnIsSepa ||
+        !selectedSepaBatch ||
+        selectedSepaBatch.type === "payroll"
+      ) {
         setDialogSepaSuggestions({});
         setDialogSepaCombinations({});
         setBatchLevelCombinations([]);
@@ -1656,31 +1813,53 @@ function Banque() {
                 //  - creditor name matches supplier, OR
                 //  - very close amount.
                 // This removes "n'importe quoi" suggestions.
+                const amountDateOnly = isAmountDateDisplayCandidate(pseudoTxn as any, invoice);
                 const passesBusinessGate =
-                  hasRefHit || hasCreditorSupplierHit || strongAmountMatch;
+                  hasRefHit ||
+                  hasCreditorSupplierHit ||
+                  strongAmountMatch ||
+                  aiScore >= SUGGESTION_MEDIUM_SCORE ||
+                  amountDateOnly;
                 if (!passesBusinessGate) return null;
 
-                // If creditor/supplier does not match, require very plausible amount.
-                if (!hasCreditorSupplierHit && !hasRefHit && !amountLooksPlausible) return null;
+                if (
+                  !hasCreditorSupplierHit &&
+                  !hasRefHit &&
+                  !amountLooksPlausible &&
+                  aiScore < SUGGESTION_MEDIUM_SCORE &&
+                  !amountDateOnly
+                ) {
+                  return null;
+                }
 
-                const reasons = [];
+                const displayScore = Math.max(aiScore, score);
+                if (
+                  !shouldShowReconciliationSuggestion(pseudoTxn as any, invoice, score, {
+                    trustBackend: true,
+                    serverScore: aiScore,
+                  })
+                ) {
+                  return null;
+                }
+
+                const reasons: string[] = [];
                 if (Array.isArray(srv?.signals)) reasons.push(...srv.signals);
                 if (srv?.reason) reasons.push(String(srv.reason));
                 reasons.unshift(`Écart montant ligne: ${formatMoney(amountDiff, invoice.currency ?? pseudoTxn.currency)}`);
                 if (hasRefHit) reasons.unshift("Référence exacte détectée");
                 if (hasVendorHit) reasons.unshift("Tiers cohérent");
                 if (hasCreditorSupplierHit) reasons.unshift("Créancier SEPA cohérent avec le fournisseur");
-                return {
-                  invoice,
-                  score,
-                  details: getMatchDetails(pseudoTxn as any, invoice),
-                  reasons: reasons.length ? reasons : buildCandidateReasons(pseudoTxn as any, invoice, score),
-                } as SepaOperationCandidate;
+                return enrichSepaOperationCandidate(pseudoTxn as any, invoice, {
+                  score: displayScore,
+                  serverScore: aiScore,
+                  reasons: reasons.length ? reasons : undefined,
+                  serverNotAutoReasons: Array.isArray(srv?.notAutoReasons) ? srv.notAutoReasons : undefined,
+                  requiresManualValidation: srv?.requiresManualValidation,
+                });
               })
               .filter((x): x is SepaOperationCandidate => Boolean(x))
-              .filter((x) => x.score >= 35)
               .sort((a, b) => b.score - a.score)
-              .slice(0, 5);
+              .slice(0, 8);
 
             return [op.id, enriched, finalCombos] as const;
           };
@@ -1699,7 +1878,7 @@ function Banque() {
         const firstEntry = await fetchSepaOpSuggestions(firstOp);
 
         setDialogSepaCombinations({ [firstEntry[0]]: firstEntry[2] });
-        setDialogSepaSuggestions({ [firstEntry[0]]: firstEntry[1].slice(0, 5) });
+        setDialogSepaSuggestions({ [firstEntry[0]]: firstEntry[1].slice(0, 8) });
         if (operations.length === 1) {
           // For single-line SEPA (like 49k case), show global block immediately
           // from first available combos, then refine with batch request later.
@@ -1720,7 +1899,7 @@ function Banque() {
             setDialogSepaSuggestions((prev) => {
               const next = { ...prev };
               restEntries.forEach(([opId, suggestions]) => {
-                next[opId] = suggestions.slice(0, 5);
+                next[opId] = suggestions.slice(0, 8);
               });
               return next;
             });
@@ -1821,6 +2000,21 @@ function Banque() {
       // Priorité : combinaison à score ≥ 95
       const topCombo = (dialogSepaCombinations[op.id] || []).find((c) => c.score >= AUTO_RECONCILE_THRESHOLD);
       if (topCombo) {
+        const batchUsed = new Set<string>();
+        for (const otherOp of selectedSepaBatch.operations) {
+          if (otherOp.id === op.id) continue;
+          const otherDecision = updates[otherOp.id];
+          (otherDecision?.selectedInvoiceIds ?? otherOp.linkedInvoiceIds ?? []).forEach((id) =>
+            batchUsed.add(String(id))
+          );
+        }
+        const comboIds = topCombo.invoiceIds.map(String);
+        if (
+          comboIds.some((id) => batchUsed.has(id)) ||
+          comboIds.some((id) => isInvoiceUsedOnAnotherTxn(id, selectedDetailsTxn.id))
+        ) {
+          return;
+        }
         autoReconciledRef.current.add(autoKey);
         updates[op.id] = {
           ...(current ?? { status: "pending", selectedInvoiceIds: [], rejectAllSuggestions: false }),
@@ -1835,6 +2029,16 @@ function Banque() {
       // Sinon : suggestion individuelle à score ≥ 95
       const top = (dialogSepaSuggestions[op.id] || [])[0];
       if (!top || top.score < AUTO_RECONCILE_THRESHOLD) return;
+      const invId = String(top.invoice.id);
+      const batchUsed = new Set<string>();
+      for (const otherOp of selectedSepaBatch.operations) {
+        if (otherOp.id === op.id) continue;
+        const otherDecision = updates[otherOp.id];
+        (otherDecision?.selectedInvoiceIds ?? otherOp.linkedInvoiceIds ?? []).forEach((id) =>
+          batchUsed.add(String(id))
+        );
+      }
+      if (batchUsed.has(invId) || isInvoiceUsedOnAnotherTxn(invId, selectedDetailsTxn.id)) return;
       autoReconciledRef.current.add(autoKey);
       updates[op.id] = {
         ...(current ?? { status: "pending", selectedInvoiceIds: [], rejectAllSuggestions: false }),
@@ -1926,10 +2130,12 @@ function Banque() {
     if (autoReconciledRef.current.has(autoKey)) return;
     const top = manualSuggestions[0];
     if (!top || top.score < AUTO_RECONCILE_THRESHOLD) return;
+    const invId = String(top.invoice.id);
+    if (isInvoiceUsedOnAnotherTxn(invId, selectedDetailsTxn.id)) return;
     autoReconciledRef.current.add(autoKey);
 
     const previousMatched = selectedDetailsTxn.matchedInvoiceIds ?? [];
-    const nextMatched = [top.invoice.id];
+    const nextMatched = [invId];
 
     setTransactions((prev) =>
       prev.map((txn) =>
@@ -1970,8 +2176,9 @@ function Banque() {
     : null;
   const isSepaLineLocked = (operationId: string) => {
     const decision = sepaLineDecisions[operationId];
-    if (decision?.status !== "approved") return false;
-    if (!(decision.selectedInvoiceIds?.length ?? 0)) return false;
+    const op = sepaOperations.find((o) => o.id === operationId);
+    if (!decision || !op) return false;
+    if (!isSepaLineResolved(decision, op, selectedSepaBatch?.type)) return false;
     return !sepaEditModeByOperation[operationId];
   };
 
@@ -1979,9 +2186,10 @@ function Banque() {
     ? isSepaLineLocked(sepaCurrentOperation.id)
     : false;
 
-  const allSepaLinesApproved =
-    sepaOperations.length > 0 &&
-    sepaOperations.every((op) => sepaLineDecisions[op.id]?.status === "approved");
+  const allSepaLinesResolved =
+    selectedSepaBatch && sepaOperations.length > 0
+      ? isSepaBatchFullyResolved(sepaOperations, sepaLineDecisions, selectedSepaBatch.type)
+      : false;
 
   const sepaCurrentCandidates = useMemo(() => {
     if (!sepaCurrentOperation) return [] as SepaOperationCandidate[];
@@ -2073,6 +2281,7 @@ function Banque() {
     updateSepaDecision(operationId, (current) => ({
       ...current,
       rejectAllSuggestions: false,
+      invoiceNotFound: false,
       selectedInvoiceIds: current.selectedInvoiceIds.includes(invoiceId)
         ? current.selectedInvoiceIds.filter((id) => id !== invoiceId)
         : [...current.selectedInvoiceIds, invoiceId],
@@ -2182,6 +2391,117 @@ function Banque() {
     }
   };
 
+  const applySepaBatchFromDecisions = (decisions: Record<string, SepaOperationDecision>) => {
+    if (!selectedDetailsTxn || !selectedSepaBatch) return;
+
+    const operations = selectedSepaBatch.operations;
+    const batchType = selectedSepaBatch.type;
+    const allResolved = isSepaBatchFullyResolved(operations, decisions, batchType);
+    const isPayrollSepa = batchType === "payroll";
+
+    const selectedInvoiceIds = isPayrollSepa
+      ? []
+      : Array.from(
+          new Set(
+            operations.flatMap((op) => {
+              const d = decisions[op.id];
+              if (!d || d.invoiceNotFound || d.status !== "approved") return [];
+              return d.selectedInvoiceIds ?? [];
+            })
+          )
+        );
+
+    const notFoundLines = operations.filter((op) => decisions[op.id]?.invoiceNotFound);
+    const notFoundComment =
+      notFoundLines.length > 0
+        ? notFoundLines
+            .map((op) => `${op.creditorName || op.endToEndId} : facture introuvable`)
+            .join(" | ")
+        : undefined;
+
+    setSepaBatchesByReference((prev) => {
+      const currentBatch = prev[selectedSepaBatch.id];
+      if (!currentBatch) return prev;
+      const nextOps = currentBatch.operations.map((op) => {
+        const d = decisions[op.id];
+        if (!d || d.invoiceNotFound) {
+          return { ...op, linkedInvoiceIds: [] };
+        }
+        const ids = d.selectedInvoiceIds ?? [];
+        return { ...op, linkedInvoiceIds: ids.length > 0 ? ids : op.linkedInvoiceIds || [] };
+      });
+      return { ...prev, [selectedSepaBatch.id]: { ...currentBatch, operations: nextOps } };
+    });
+
+    const previousMatched = selectedDetailsTxn.matchedInvoiceIds ?? [];
+
+    setTransactions((prev) =>
+      prev.map((txn) =>
+        txn.id === selectedDetailsTxn.id
+          ? {
+              ...txn,
+              reconciledStatus: allResolved ? "rapproché" : txn.reconciledStatus,
+              matchedInvoiceIds: allResolved ? selectedInvoiceIds : txn.matchedInvoiceIds ?? [],
+              pendingInvoiceIds: allResolved ? [] : txn.pendingInvoiceIds ?? [],
+              sepaLineDecisions: decisions,
+              unreconciledCategory:
+                allResolved && notFoundLines.length > 0 ? "facture_introuvable" : txn.unreconciledCategory,
+              unreconciledComment: allResolved
+                ? notFoundComment || txn.unreconciledComment
+                : txn.unreconciledComment,
+              reviewFlag: allResolved && notFoundLines.length > 0 ? true : txn.reviewFlag,
+            }
+          : txn
+      )
+    );
+
+    void persistTxnReconciliation(selectedDetailsTxn.id, {
+      reconciledStatus: allResolved ? "rapproché" : selectedDetailsTxn.reconciledStatus,
+      matchedInvoiceIds: allResolved ? selectedInvoiceIds : selectedDetailsTxn.matchedInvoiceIds ?? [],
+      pendingInvoiceIds: allResolved ? [] : selectedDetailsTxn.pendingInvoiceIds ?? [],
+      sepaLineDecisions: decisions,
+      unreconciledCategory: allResolved && notFoundLines.length > 0 ? "facture_introuvable" : null,
+      unreconciledComment: allResolved ? notFoundComment || null : null,
+      reviewFlag: allResolved && notFoundLines.length > 0,
+    });
+
+    if (allResolved) {
+      const added = selectedInvoiceIds.filter((id) => !previousMatched.includes(id));
+      const removed = previousMatched.filter((id) => !selectedInvoiceIds.includes(id));
+      if (added.length || removed.length) {
+        void syncInvoicesStatusFromTxn(added, removed);
+      }
+      toast?.success?.(
+        notFoundLines.length > 0
+          ? "Lot SEPA clôturé (dont ligne(s) sans facture)."
+          : "Lot SEPA entièrement rapproché."
+      );
+    }
+  };
+
+  const setSepaInvoiceNotFound = (operationId: string, checked: boolean) => {
+    if (!selectedSepaBatch || selectedSepaBatch.type === "payroll") return;
+    const nextDecisions: Record<string, SepaOperationDecision> = {
+      ...sepaLineDecisions,
+      [operationId]: {
+        ...(sepaLineDecisions[operationId] ?? {
+          status: "pending",
+          selectedInvoiceIds: [],
+          rejectAllSuggestions: false,
+        }),
+        invoiceNotFound: checked,
+        rejectAllSuggestions: false,
+        selectedInvoiceIds: checked ? [] : sepaLineDecisions[operationId]?.selectedInvoiceIds ?? [],
+        status: checked ? "approved" : "pending",
+      },
+    };
+    setSepaLineDecisions(nextDecisions);
+    applySepaBatchFromDecisions(nextDecisions);
+    if (checked && !isSepaBatchFullyResolved(selectedSepaBatch.operations, nextDecisions, selectedSepaBatch.type)) {
+      toast?.success?.("Ligne marquée facture introuvable. Traitez les autres lignes du lot.");
+    }
+  };
+
   const resolveManualInvoiceIdsToApply = (): string[] => {
     if (manualInvoiceSelection.length > 0) return manualInvoiceSelection;
     const top = manualSuggestions[0];
@@ -2190,9 +2510,50 @@ function Banque() {
 
   const applyManualReconciliation = () => {
     if (!selectedDetailsTxn) return;
+
+    if (manualInvoiceNotFound) {
+      const previousMatched = selectedDetailsTxn.matchedInvoiceIds ?? [];
+      setTransactions((prev) =>
+        prev.map((txn) =>
+          txn.id === selectedDetailsTxn.id
+            ? {
+                ...txn,
+                reconciledStatus: "rapproché",
+                matchedInvoiceIds: [],
+                pendingInvoiceIds: [],
+                unreconciledCategory: "facture_introuvable",
+                unreconciledComment:
+                  manualComment.trim() || "Facture introuvable — clôture sans pièce.",
+                reviewFlag: true,
+              }
+            : txn
+        )
+      );
+      void persistTxnReconciliation(selectedDetailsTxn.id, {
+        reconciledStatus: "rapproché",
+        matchedInvoiceIds: [],
+        pendingInvoiceIds: [],
+        unreconciledCategory: "facture_introuvable",
+        unreconciledComment: manualComment.trim() || "Facture introuvable — clôture sans pièce.",
+        reviewFlag: true,
+      });
+      void syncInvoicesStatusFromTxn([], previousMatched);
+      toast?.success?.("Opération clôturée (facture introuvable).");
+      return;
+    }
+
     const invoiceIdsToApply = resolveManualInvoiceIdsToApply();
     if (invoiceIdsToApply.length === 0) {
-      toast?.error?.("Cochez au moins une facture (ou attendez une proposition) avant de rapprocher.");
+      toast?.error?.("Cochez au moins une facture, ou cochez « Facture introuvable ».");
+      return;
+    }
+    const alreadyUsed = invoiceIdsToApply.find((id) =>
+      isInvoiceUsedOnAnotherTxn(id, selectedDetailsTxn.id)
+    );
+    if (alreadyUsed) {
+      toast?.error?.(
+        "Cette facture est déjà rapprochée sur une autre opération bancaire. Retirez le lien sur l'autre ligne avant de la réutiliser."
+      );
       return;
     }
     const previousMatched = selectedDetailsTxn.matchedInvoiceIds ?? [];
@@ -2243,6 +2604,7 @@ function Banque() {
     setManualRejectAllSuggestions(
       (selectedDetailsTxn.unreconciledComment ?? "").includes("Aucune proposition IA retenue")
     );
+    setManualInvoiceNotFound(selectedDetailsTxn.unreconciledCategory === "facture_introuvable");
   };
 
   const commitSepaLineEdit = (operationId: string) => {
@@ -2251,107 +2613,49 @@ function Banque() {
     if (!decision) return;
 
     const markAsNoMatch = Boolean(decision.rejectAllSuggestions);
-    if (!markAsNoMatch && !(decision.selectedInvoiceIds?.length > 0)) {
+    const markAsNotFound = Boolean(decision.invoiceNotFound);
+    if (!markAsNoMatch && !markAsNotFound && !(decision.selectedInvoiceIds?.length > 0)) {
       toast?.error?.(
-        "Sélectionne une facture ou coche « Aucune facture correspondante »."
+        "Sélectionne une facture, coche « Facture introuvable » ou « Aucune facture correspondante »."
       );
       return;
     }
 
     const nextDecisions: Record<string, SepaOperationDecision> = {
       ...sepaLineDecisions,
-      [operationId]: markAsNoMatch
+      [operationId]: markAsNotFound
         ? {
-            status: "review",
-            selectedInvoiceIds: [],
-            rejectAllSuggestions: true,
-            reviewNote: "En attente de la facture correspondante",
-          }
-        : {
-            ...decision,
             status: "approved",
+            selectedInvoiceIds: [],
             rejectAllSuggestions: false,
-          },
+            invoiceNotFound: true,
+          }
+        : markAsNoMatch
+          ? {
+              status: "review",
+              selectedInvoiceIds: [],
+              rejectAllSuggestions: true,
+              invoiceNotFound: false,
+              reviewNote: "En attente de la facture correspondante",
+            }
+          : {
+              ...decision,
+              status: "approved",
+              rejectAllSuggestions: false,
+              invoiceNotFound: false,
+            },
     };
 
-    const operations = selectedSepaBatch.operations;
-    const allMatched = Array.from(
-      new Set(
-        operations.flatMap((op) => {
-          const d = nextDecisions[op.id];
-          return d?.status === "approved" ? d.selectedInvoiceIds : [];
-        })
-      )
-    );
-    const allApproved =
-      operations.length > 0 &&
-      operations.every((op) => nextDecisions[op.id]?.status === "approved");
-    const nextTxnStatus: "rapproché" | "non_rapproché" = allApproved
-      ? "rapproché"
-      : "non_rapproché";
-    const nextMatched = allApproved ? allMatched : [];
-    const nextPending = allApproved ? [] : allMatched;
-
-    const previousMatched = selectedDetailsTxn.matchedInvoiceIds ?? [];
-
-    setSepaBatchesByReference((prev) => {
-      const currentBatch = prev[selectedSepaBatch.id];
-      if (!currentBatch) return prev;
-      const nextOps = currentBatch.operations.map((op) => {
-        if (op.id !== operationId) return op;
-        return {
-          ...op,
-          linkedInvoiceIds: markAsNoMatch ? [] : [...decision.selectedInvoiceIds],
-        };
-      });
-      return {
-        ...prev,
-        [selectedSepaBatch.id]: { ...currentBatch, operations: nextOps },
-      };
-    });
-
     setSepaLineDecisions(nextDecisions);
-
-    setTransactions((prev) =>
-      prev.map((txn) =>
-        txn.id === selectedDetailsTxn.id
-          ? {
-              ...txn,
-              matchedInvoiceIds: nextMatched,
-              pendingInvoiceIds: nextPending,
-              reconciledStatus: nextTxnStatus,
-              sepaLineDecisions: nextDecisions,
-              unreconciledComment: markAsNoMatch
-                ? [
-                    txn.unreconciledComment || "",
-                    `${operations.find((op) => op.id === operationId)?.creditorName || "Sous-opération"} : en attente de la facture correspondante`,
-                  ]
-                    .filter(Boolean)
-                    .join(" | ")
-                : txn.unreconciledComment,
-            }
-          : txn
-      )
-    );
-
-    void persistTxnReconciliation(selectedDetailsTxn.id, {
-      reconciledStatus: nextTxnStatus,
-      matchedInvoiceIds: nextMatched,
-      pendingInvoiceIds: nextPending,
-      sepaLineDecisions: nextDecisions,
-    });
-
-    const added = nextMatched.filter((id) => !previousMatched.includes(id));
-    const removed = previousMatched.filter((id) => !nextMatched.includes(id));
-    if (added.length || removed.length) {
-      void syncInvoicesStatusFromTxn(added, removed);
-    }
+    applySepaBatchFromDecisions(nextDecisions);
 
     setSepaEditModeByOperation((prev) => ({ ...prev, [operationId]: false }));
     toast?.success?.(
-      markAsNoMatch
-        ? "Ligne marquée : aucune facture correspondante. La ligne sera rapprochée quand la facture arrivera."
-        : "Rapprochement modifié pour cette sous-opération."
+      markAsNotFound
+        ? "Ligne marquée facture introuvable."
+        : markAsNoMatch
+          ? "Ligne marquée : aucune facture correspondante. La ligne sera rapprochée quand la facture arrivera."
+          : "Rapprochement modifié pour cette sous-opération."
     );
   };
 
@@ -2384,17 +2688,39 @@ function Banque() {
         const top = sepaCurrentCandidates[0];
         if (top?.invoice?.id) selectedInvoiceIds = [top.invoice.id];
       }
-      if (status === "approved" && selectedInvoiceIds.length === 0) {
-        toast?.error?.("Sélectionne une facture avant de valider la ligne en rapprochée.");
+      if (
+        status === "approved" &&
+        selectedInvoiceIds.length === 0 &&
+        !current.invoiceNotFound &&
+        selectedSepaBatch?.type !== "payroll"
+      ) {
+        toast?.error?.(
+          "Sélectionne une facture ou coche « Facture introuvable » avant de valider."
+        );
         return prev;
       }
+      if (
+        status === "approved" &&
+        selectedSepaBatch?.type === "payroll" &&
+        !current.selectedPayrollSlipRef &&
+        !sepaCurrentOperation.payrollSlipRef
+      ) {
+        toast?.error?.("Aucune fiche de paie liée à cette ligne SEPA salaires.");
+        return prev;
+      }
+      const slipRef =
+        current.selectedPayrollSlipRef || sepaCurrentOperation.payrollSlipRef || undefined;
       const next = {
         ...prev,
         [sepaCurrentOperation.id]: {
           ...current,
           status,
-          selectedInvoiceIds,
+          selectedInvoiceIds: selectedSepaBatch?.type === "payroll" ? [] : selectedInvoiceIds,
+          selectedPayrollSlipRef:
+            selectedSepaBatch?.type === "payroll" ? slipRef : current.selectedPayrollSlipRef,
           rejectAllSuggestions: false,
+          invoiceNotFound:
+            selectedSepaBatch?.type === "payroll" ? false : Boolean(current.invoiceNotFound),
         },
       };
       nextDecisionsSnapshot = next;
@@ -2402,121 +2728,47 @@ function Banque() {
     });
 
     if (selectedDetailsTxn && nextDecisionsSnapshot) {
-      void persistTxnReconciliation(selectedDetailsTxn.id, {
-        sepaLineDecisions: nextDecisionsSnapshot,
-      });
+      applySepaBatchFromDecisions(nextDecisionsSnapshot);
     }
     setSepaEditModeByOperation((prev) => ({ ...prev, [sepaCurrentOperation.id]: false }));
-    toast?.success?.("Sous-opération SEPA mise à jour.");
+    toast?.success?.(
+      selectedSepaBatch?.type === "payroll"
+        ? "Ligne SEPA salaires validée avec la fiche de paie."
+        : "Sous-opération SEPA mise à jour."
+    );
   };
 
   const validateWholeSepaBatch = () => {
     try {
       if (!selectedDetailsTxn || !selectedSepaBatch) return;
-      const previousMatched = selectedDetailsTxn.matchedInvoiceIds ?? [];
 
       const operations = Array.isArray(selectedSepaBatch.operations)
         ? selectedSepaBatch.operations
         : [];
+      const batchType = selectedSepaBatch.type;
 
-      const selectedInvoiceIds = Array.from(
-        new Set(
-          operations.flatMap(
-            (op) => sepaLineDecisions[op.id]?.selectedInvoiceIds ?? [],
-          ),
-        ),
+      const unresolved = operations.filter(
+        (op) => !isSepaLineResolved(sepaLineDecisions[op.id], op, batchType)
       );
-
-      const statuses = operations.map(
-        (op) => sepaLineDecisions[op.id]?.status ?? "pending",
-      );
-      const approvedCount = statuses.filter((s) => s === "approved").length;
-      const pendingCount = statuses.filter((s) => s === "pending").length;
-      const allApproved = approvedCount === operations.length && approvedCount > 0;
-
-      if (pendingCount > 0) {
-        toast?.error?.("Il reste des lignes SEPA non traitées. Valide/Rejette/À revoir chaque ligne.");
+      if (unresolved.length > 0) {
+        toast?.error?.(
+          `Il reste ${unresolved.length} ligne(s) SEPA à traiter (facture, facture introuvable, ou bulletin paie).`
+        );
         return;
       }
 
-      const rejectedAllCount = operations.filter(
-        (op) => Boolean(sepaLineDecisions[op.id]?.rejectAllSuggestions),
-      ).length;
-
-      // Keep linked invoices on SEPA lines in sync with current decisions for display.
-      setSepaBatchesByReference((prev) => {
-        const currentBatch = prev[selectedSepaBatch.id];
-        if (!currentBatch) return prev;
-        const nextOps = currentBatch.operations.map((op) => {
-          const decision = sepaLineDecisions[op.id];
-          const selectedIds = decision?.selectedInvoiceIds ?? [];
-          return {
-            ...op,
-            linkedInvoiceIds: selectedIds.length > 0 ? selectedIds : (op.linkedInvoiceIds || []),
-          };
-        });
-        return {
-          ...prev,
-          [selectedSepaBatch.id]: {
-            ...currentBatch,
-            operations: nextOps,
-          },
-        };
+      const reviewOnly = operations.filter((op) => {
+        const d = sepaLineDecisions[op.id];
+        return d?.status === "review" && !d?.invoiceNotFound;
       });
-
-      setTransactions((prev) =>
-        prev.map((txn) =>
-          txn.id === selectedDetailsTxn.id
-            ? {
-                ...txn,
-                // Mark transaction as fully reconciled only if every SEPA line is approved.
-                reconciledStatus: allApproved ? "rapproché" : "non_rapproché",
-                matchedInvoiceIds: allApproved ? selectedInvoiceIds : [],
-                pendingInvoiceIds: allApproved ? [] : selectedInvoiceIds,
-                sepaLineDecisions,
-                reviewFlag:
-                  operations.some(
-                    (op) => (sepaLineDecisions[op.id]?.status ?? "pending") === "review",
-                  ) || rejectedAllCount > 0,
-                unreconciledComment:
-                  [
-                    rejectedAllCount > 0 ? `${rejectedAllCount} sous-opération(s) : aucune proposition IA retenue` : "",
-                    operations
-                      .filter((op) => (sepaLineDecisions[op.id]?.status ?? "pending") !== "approved")
-                      .map((op) => {
-                        const decision = sepaLineDecisions[op.id];
-                        const suffix = decision?.rejectAllSuggestions ? " — aucune proposition IA retenue" : "";
-                        return `${op.creditorName}: ${getDecisionLabel(decision?.status ?? "pending")}${suffix}`;
-                      })
-                      .join(" | "),
-                  ]
-                    .filter(Boolean)
-                    .join(" | ") || undefined,
-              }
-            : txn,
-        ),
-      );
-
-      void persistTxnReconciliation(selectedDetailsTxn.id, {
-        reconciledStatus: allApproved ? "rapproché" : "non_rapproché",
-        matchedInvoiceIds: allApproved ? selectedInvoiceIds : [],
-        pendingInvoiceIds: allApproved ? [] : selectedInvoiceIds,
-        sepaLineDecisions,
-        reviewFlag:
-          operations.some(
-            (op) => (sepaLineDecisions[op.id]?.status ?? "pending") === "review",
-          ) || rejectedAllCount > 0,
-      });
-      void syncInvoicesStatusFromTxn(
-        allApproved ? selectedInvoiceIds : [],
-        previousMatched.filter((id) => !(allApproved ? selectedInvoiceIds : []).includes(id)),
-      );
-
-      if (allApproved) {
-        toast?.success?.("Lot SEPA entièrement rapproché.");
-      } else {
-        toast?.success?.("Lot SEPA enregistré en partiel (lignes non approuvées à traiter).");
+      if (reviewOnly.length > 0) {
+        toast?.error?.(
+          "Certaines lignes sont « à revoir ». Validez-les ou cochez « Facture introuvable »."
+        );
+        return;
       }
+
+      applySepaBatchFromDecisions(sepaLineDecisions);
     } catch (error) {
       console.error("Erreur validateWholeSepaBatch:", error);
       toast?.error?.("Erreur pendant le rapprochement du lot SEPA.");
@@ -2864,6 +3116,9 @@ function Banque() {
                     filteredTxns.map((txn) => {
                       const batch = findSepaBatchForTransaction(txn);
                       const invoiceChips = getTxnInvoiceDisplayChips(txn, batch, realInvoices);
+                      const hasDuplicateInvoices = invoiceChips.some((chip) =>
+                        duplicateInvoiceAssignments.has(chip.key)
+                      );
                       const recoBadgeStatus = getTxnReconciliationBadgeStatus(txn, batch);
 
                       return (
@@ -2918,17 +3173,28 @@ function Banque() {
                             {invoiceChips.length === 0 ? (
                               <span className="text-xs text-slate-500">Aucune</span>
                             ) : (
-                              <div className="flex max-w-full flex-wrap gap-1 overflow-hidden">
-                                {invoiceChips.slice(0, 3).map((chip) => (
-                                  <span
-                                    key={chip.key}
-                                    className="rounded-full bg-slate-100 px-2 py-1 text-xs text-slate-700"
-                                  >
-                                    {chip.label}
-                                  </span>
-                                ))}
-                                {invoiceChips.length > 3 ? (
-                                  <span className="text-xs text-slate-500">+{invoiceChips.length - 3}</span>
+                              <div>
+                                <div className="flex max-w-full flex-wrap gap-1 overflow-hidden">
+                                  {invoiceChips.slice(0, 3).map((chip) => (
+                                    <span
+                                      key={chip.key}
+                                      className={`rounded-full px-2 py-1 text-xs ${
+                                        duplicateInvoiceAssignments.has(chip.key)
+                                          ? "bg-amber-100 text-amber-900 ring-1 ring-amber-200"
+                                          : "bg-slate-100 text-slate-700"
+                                      }`}
+                                    >
+                                      {chip.label}
+                                    </span>
+                                  ))}
+                                  {invoiceChips.length > 3 ? (
+                                    <span className="text-xs text-slate-500">+{invoiceChips.length - 3}</span>
+                                  ) : null}
+                                </div>
+                                {hasDuplicateInvoices ? (
+                                  <p className="mt-1 text-xs text-amber-700">
+                                    Facture déjà liée à une autre opération
+                                  </p>
                                 ) : null}
                               </div>
                             )}
@@ -2986,11 +3252,9 @@ function Banque() {
               <SectionCard title="Rapprochement" subtitle="Sélection manuelle des factures proposées">
                 <div className="space-y-4">
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <p className="text-xs text-slate-500">
-                      {manualRecoLoading || manualRecoProcessing
-                        ? "Calcul des suggestions en cours (file IA serveur)…"
-                        : "Suggestions du moteur serveur (montant, dates, références, sens). Complément IA si cohérent."}
-                    </p>
+                    {manualRecoLoading || manualRecoProcessing ? (
+                      <p className="text-xs text-slate-500">Calcul des suggestions en cours…</p>
+                    ) : null}
                     {selectedDetailsTxn.reconciledStatus !== "rapproché" ? (
                       <Button
                         type="button"
@@ -3051,16 +3315,7 @@ function Banque() {
                                 )}
                               </span>
                             </div>
-                            <div className="flex flex-wrap gap-2">
-                              {candidate.reasons.map((reason) => (
-                                <span
-                                  key={reason}
-                                  className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-600"
-                                >
-                                  {reason}
-                                </span>
-                              ))}
-                            </div>
+                            <ReconciliationSuggestionChips candidate={candidate} />
                           </div>
                         </div>
                       );
@@ -3068,14 +3323,33 @@ function Banque() {
                   )}
 
                   {selectedDetailsTxn.reconciledStatus !== "rapproché" ? (
-                    <div className="flex flex-wrap justify-end gap-2 border-t border-slate-200 pt-3">
-                      <Button
-                        type="button"
-                        onClick={applyManualReconciliation}
-                        disabled={resolveManualInvoiceIdsToApply().length === 0}
-                      >
-                        Rapprocher
-                      </Button>
+                    <div className="space-y-3 border-t border-slate-200 pt-3">
+                      <label className="flex items-center gap-2 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2 text-sm text-violet-900">
+                        <input
+                          type="checkbox"
+                          checked={manualInvoiceNotFound}
+                          onChange={(e) => {
+                            const checked = e.target.checked;
+                            setManualInvoiceNotFound(checked);
+                            if (checked) {
+                              setManualInvoiceSelection([]);
+                              setManualRejectAllSuggestions(false);
+                            }
+                          }}
+                        />
+                        Facture introuvable
+                      </label>
+                      <div className="flex flex-wrap justify-end gap-2">
+                        <Button
+                          type="button"
+                          onClick={applyManualReconciliation}
+                          disabled={
+                            !manualInvoiceNotFound && resolveManualInvoiceIdsToApply().length === 0
+                          }
+                        >
+                          {manualInvoiceNotFound ? "Clôturer sans facture" : "Rapprocher"}
+                        </Button>
+                      </div>
                     </div>
                   ) : null}
                 </div>
@@ -3224,14 +3498,36 @@ function Banque() {
                               <p className="text-sm font-medium text-slate-900">{op.creditorName}</p>
                               <p className="text-xs text-slate-500">{op.endToEndId}</p>
                             </div>
-                            <span className={`rounded-full px-2 py-1 text-xs ${getDecisionBadgeClass(decision.status)}`}>
-                              {getDecisionLabel(decision.status)}
-                            </span>
+                            <div className="shrink-0 text-right space-y-1">
+                              <span
+                                className={`inline-block rounded-full px-2 py-1 text-xs ${getDecisionBadgeClass(decision.status)}`}
+                              >
+                                {getSepaLineStatusLabel(decision)}
+                              </span>
+                              <p className="text-sm font-semibold tabular-nums text-slate-900">
+                                {formatMoney(op.amount, op.currency)}
+                              </p>
+                            </div>
                           </div>
-                          <div className="mt-2 flex items-center justify-between gap-3 text-xs text-slate-500">
-                            <span>{formatMoney(op.amount, op.currency)}</span>
-                            <span>{decision.selectedInvoiceIds.length} facture(s)</span>
-                          </div>
+                          {selectedSepaBatch?.type === "payroll" && op.payrollSlipRef ? (
+                            <div className="mt-2">
+                              <button
+                                type="button"
+                                className="inline-flex items-center gap-1 text-xs text-violet-700 hover:underline"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  openPayrollSlipPdf(op);
+                                }}
+                              >
+                                <FileSearch className="h-3 w-3" />
+                                Voir bulletin
+                              </button>
+                            </div>
+                          ) : selectedSepaBatch?.type !== "payroll" ? (
+                            <p className="mt-2 text-xs text-slate-500">
+                              {decision.selectedInvoiceIds.length} facture(s)
+                            </p>
+                          ) : null}
                           {decision.selectedInvoiceIds.length > 0 ? (
                             <p className="mt-1 text-xs text-slate-500">Retenu : {formatMoney(selectedAmount, op.currency)}</p>
                           ) : null}
@@ -3248,40 +3544,114 @@ function Banque() {
                             <p className="text-sm font-semibold text-slate-900">{sepaCurrentOperation.creditorName}</p>
                             <p className="mt-1 text-xs text-slate-500">{sepaCurrentOperation.endToEndId}</p>
                           </div>
-                          <span className={`rounded-full px-2 py-1 text-xs ${getDecisionBadgeClass(sepaCurrentDecision?.status ?? "pending")}`}>
-                            {getDecisionLabel(sepaCurrentDecision?.status ?? "pending")}
-                          </span>
+                          <div className="shrink-0 text-right space-y-1">
+                            <span
+                              className={`inline-block rounded-full px-2 py-1 text-xs ${getDecisionBadgeClass(sepaCurrentDecision?.status ?? "pending")}`}
+                            >
+                              {getSepaLineStatusLabel(sepaCurrentDecision)}
+                            </span>
+                            <p className="text-sm font-semibold tabular-nums text-slate-900">
+                              {formatMoney(sepaCurrentOperation.amount, sepaCurrentOperation.currency)}
+                            </p>
+                          </div>
                         </div>
-                        <div className="mt-3 flex flex-wrap gap-3 text-xs text-slate-500">
-                          <span>Montant : {formatMoney(sepaCurrentOperation.amount, sepaCurrentOperation.currency)}</span>
-                          <span>IBAN : {sepaCurrentOperation.creditorIban}</span>
-                        </div>
+                        <p className="mt-2 text-xs text-slate-500">IBAN : {sepaCurrentOperation.creditorIban}</p>
                       </div>
 
                       <div className="space-y-3">
                         {sepaCurrentIsLocked ? (
+                          sepaCurrentDecision?.invoiceNotFound ? (
+                            <div className="rounded-2xl border border-violet-200 bg-violet-50 p-4">
+                              <p className="text-sm font-medium text-violet-900">
+                                Facture introuvable — ligne clôturée sans pièce.
+                              </p>
+                              <p className="mt-1 text-xs text-violet-800">
+                                Le lot SEPA pourra être validé lorsque toutes les lignes sont traitées.
+                              </p>
+                              <div className="mt-3">
+                                <Button
+                                  variant="outline"
+                                  size="sm"
+                                  className="bg-white"
+                                  onClick={() =>
+                                    setSepaEditModeByOperation((prev) => ({
+                                      ...prev,
+                                      [sepaCurrentOperation.id]: true,
+                                    }))
+                                  }
+                                >
+                                  Modifier
+                                </Button>
+                              </div>
+                            </div>
+                          ) : (
                           <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
                             <p className="text-sm font-medium text-emerald-800">
                               Cette sous-opération est déjà rapprochée
                               {sepaCurrentDecision?.status === "approved" ? " (automatiquement ou manuellement)" : ""}.
                             </p>
                             <p className="mt-1 text-xs text-emerald-700">
-                              Aucune action requise. Utilisez « Modifier » pour changer la facture liée.
+                              {selectedSepaBatch?.type === "payroll"
+                                ? "Rapprochement salaire ↔ bulletin de paie."
+                                : "Aucune action requise. Utilisez « Modifier » pour changer la facture liée."}
                             </p>
-                            <div className="mt-3 flex flex-wrap gap-2">
-                              {(sepaCurrentDecision?.selectedInvoiceIds || []).map((invoiceId) => {
-                                const inv = resolveInvoicesByIds([invoiceId])[0];
-                                if (!inv) return null;
-                                return (
-                                  <span
-                                    key={invoiceId}
-                                    className="rounded-full bg-white px-2 py-1 text-xs text-emerald-800 ring-1 ring-emerald-200"
-                                  >
-                                    {inv.invoiceNumber}
+                            <div className="mt-3 flex flex-wrap items-center gap-2">
+                              {selectedSepaBatch?.type === "payroll" ? (
+                                <>
+                                  <span className="rounded-full bg-white px-2 py-1 text-xs text-emerald-800 ring-1 ring-emerald-200">
+                                    {resolvePayrollSlipLabel(
+                                      sepaCurrentDecision?.selectedPayrollSlipRef ||
+                                        sepaCurrentOperation.payrollSlipRef
+                                    ) || sepaCurrentOperation.creditorName}
                                   </span>
-                                );
-                              })}
+                                  {getPayrollSlipFileUrl(
+                                    sepaCurrentOperation,
+                                    sepaCurrentDecision?.selectedPayrollSlipRef ||
+                                      sepaCurrentOperation.payrollSlipRef
+                                  ) ? (
+                                    <Button
+                                      type="button"
+                                      variant="outline"
+                                      size="sm"
+                                      className="h-7 bg-white text-emerald-900"
+                                      onClick={() =>
+                                        openPayrollSlipPdf(
+                                          sepaCurrentOperation,
+                                          sepaCurrentDecision?.selectedPayrollSlipRef ||
+                                            sepaCurrentOperation.payrollSlipRef
+                                        )
+                                      }
+                                    >
+                                      <FileSearch className="mr-1 h-3.5 w-3.5" />
+                                      Voir le bulletin
+                                    </Button>
+                                  ) : null}
+                                </>
+                              ) : (
+                                (sepaCurrentDecision?.selectedInvoiceIds || []).map((invoiceId) => {
+                                  const inv = resolveInvoicesByIds([invoiceId])[0];
+                                  if (!inv) return null;
+                                  return (
+                                    <span
+                                      key={invoiceId}
+                                      className="rounded-full bg-white px-2 py-1 text-xs text-emerald-800 ring-1 ring-emerald-200"
+                                    >
+                                      {inv.invoiceNumber}
+                                    </span>
+                                  );
+                                })
+                              )}
                             </div>
+                            {selectedSepaBatch?.type === "payroll"
+                              ? renderPayrollMatchReasons(
+                                  getPayrollMatchReasons(
+                                    sepaCurrentOperation,
+                                    sepaCurrentDecision?.selectedPayrollSlipRef ||
+                                      sepaCurrentOperation.payrollSlipRef
+                                  ),
+                                  "emerald"
+                                )
+                              : null}
                             <div className="mt-3">
                               <Button
                                 variant="outline"
@@ -3295,6 +3665,39 @@ function Banque() {
                                 Modifier ce rapprochement
                               </Button>
                             </div>
+                          </div>
+                          )
+                        ) : selectedSepaBatch?.type === "payroll" ? (
+                          <div className="rounded-2xl border border-violet-200 bg-violet-50 p-4 space-y-3">
+                            <p className="text-sm font-medium text-violet-900">Virement salaire</p>
+                            {sepaCurrentOperation.payrollSlipRef ? (
+                              <>
+                                <p className="text-sm text-violet-800">
+                                  Fiche de paie :{" "}
+                                  <span className="font-semibold">
+                                    {resolvePayrollSlipLabel(sepaCurrentOperation.payrollSlipRef)}
+                                  </span>
+                                </p>
+                                {renderPayrollMatchReasons(
+                                  getPayrollMatchReasons(sepaCurrentOperation)
+                                )}
+                                <Button
+                                  type="button"
+                                  variant="outline"
+                                  size="sm"
+                                  className="bg-white"
+                                  onClick={() => openPayrollSlipPdf(sepaCurrentOperation)}
+                                >
+                                  <FileSearch className="mr-1 h-3.5 w-3.5" />
+                                  Voir le bulletin de paie
+                                </Button>
+                              </>
+                            ) : (
+                              <p className="text-sm text-amber-800">
+                                Aucune fiche de paie trouvée pour ce salarié. Importez d&apos;abord le bulletin du
+                                mois (module Bulletins de paie), puis réimportez ce fichier SEPA salaires.
+                              </p>
+                            )}
                           </div>
                         ) : (
                           <>
@@ -3433,16 +3836,7 @@ function Banque() {
                                       )}
                                     </span>
                                   </div>
-                                  <div className="flex flex-wrap gap-2">
-                                    {candidate.reasons.map((reason) => (
-                                      <span
-                                        key={reason}
-                                        className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-600"
-                                      >
-                                        {reason}
-                                      </span>
-                                    ))}
-                                  </div>
+                                  <ReconciliationSuggestionChips candidate={candidate} />
                                 </div>
                               </div>
                             );
@@ -3453,15 +3847,29 @@ function Banque() {
 
                       {!sepaCurrentIsLocked ? (
                         <>
+                          {selectedSepaBatch?.type !== "payroll" ? (
+                            <label className="flex items-center gap-2 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2 text-sm text-violet-900">
+                              <input
+                                type="checkbox"
+                                checked={Boolean(sepaCurrentDecision?.invoiceNotFound)}
+                                onChange={(e) =>
+                                  setSepaInvoiceNotFound(sepaCurrentOperation.id, e.target.checked)
+                                }
+                              />
+                              Facture introuvable
+                            </label>
+                          ) : null}
                           <label className="flex items-center gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
                             <input
                               type="checkbox"
                               checked={Boolean(sepaCurrentDecision?.rejectAllSuggestions)}
+                              disabled={Boolean(sepaCurrentDecision?.invoiceNotFound)}
                               onChange={(e) => {
                                 const checked = e.target.checked;
                                 updateSepaDecision(sepaCurrentOperation.id, (current) => ({
                                   ...current,
                                   rejectAllSuggestions: checked,
+                                  invoiceNotFound: false,
                                   selectedInvoiceIds: checked ? [] : current.selectedInvoiceIds,
                                   status: checked ? "review" : current.status,
                                 }));
@@ -3602,7 +4010,7 @@ function Banque() {
                           <p className="mt-1 font-semibold text-slate-900">{selectedSepaBatch.debtorName}</p>
                         </div>
                       </div>
-                      {selectedDetailsTxn.reconciledStatus === "rapproché" || allSepaLinesApproved ? (
+                      {selectedDetailsTxn.reconciledStatus === "rapproché" || allSepaLinesResolved ? (
                         <div className="space-y-3">
                           {selectedSepaBatch.operations.map((op) => {
                             const decision = sepaLineDecisions[op.id] ?? {
@@ -3702,18 +4110,7 @@ function Banque() {
                                                       {candidate.details.directionMatch ? "cohérent" : "incohérent"}
                                                     </span>
                                                   </div>
-                                                  {candidate.reasons.length ? (
-                                                    <div className="flex flex-wrap gap-1.5 pt-1">
-                                                      {candidate.reasons.map((reason, idx) => (
-                                                        <span
-                                                          key={`${op.id}-${candidate.invoice.id}-r-${idx}`}
-                                                          className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-700"
-                                                        >
-                                                          {reason}
-                                                        </span>
-                                                      ))}
-                                                    </div>
-                                                  ) : null}
+                                                  <ReconciliationSuggestionChips candidate={candidate} />
                                                 </div>
                                               </label>
                                             </div>
@@ -3901,10 +4298,32 @@ function Banque() {
                                       <p className="text-sm font-medium text-slate-900">{op.creditorName}</p>
                                       <p className="text-xs text-slate-500">{op.endToEndId}</p>
                                     </div>
-                                    <span className={`rounded-full px-2 py-1 text-xs ${getDecisionBadgeClass(decision.status)}`}>
-                                      {getDecisionLabel(decision.status)}
-                                    </span>
+                                    <div className="shrink-0 text-right space-y-1">
+                                      <span
+                                        className={`inline-block rounded-full px-2 py-1 text-xs ${getDecisionBadgeClass(decision.status)}`}
+                                      >
+                                        {getSepaLineStatusLabel(decision)}
+                                      </span>
+                                      <p className="text-sm font-semibold tabular-nums text-slate-900">
+                                        {formatMoney(op.amount, op.currency)}
+                                      </p>
+                                    </div>
                                   </div>
+                                  {selectedSepaBatch?.type === "payroll" && op.payrollSlipRef ? (
+                                    <div className="mt-2">
+                                      <button
+                                        type="button"
+                                        className="inline-flex items-center gap-1 text-xs text-violet-700 hover:underline"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          openPayrollSlipPdf(op);
+                                        }}
+                                      >
+                                        <FileSearch className="h-3 w-3" />
+                                        Voir bulletin
+                                      </button>
+                                    </div>
+                                  ) : null}
                                 </button>
                               );
                             })}
@@ -3917,13 +4336,67 @@ function Banque() {
                                   <p className="text-sm font-semibold text-slate-900">{sepaCurrentOperation.creditorName}</p>
                                   <p className="mt-1 text-xs text-slate-500">{sepaCurrentOperation.endToEndId}</p>
                                 </div>
-                                <span className={`rounded-full px-2 py-1 text-xs ${getDecisionBadgeClass(sepaCurrentDecision?.status ?? "pending")}`}>
-                                  {getDecisionLabel(sepaCurrentDecision?.status ?? "pending")}
-                                </span>
+                                <div className="shrink-0 text-right space-y-1">
+                                  <span
+                                    className={`inline-block rounded-full px-2 py-1 text-xs ${getDecisionBadgeClass(sepaCurrentDecision?.status ?? "pending")}`}
+                                  >
+                                    {getSepaLineStatusLabel(sepaCurrentDecision)}
+                                  </span>
+                                  <p className="text-sm font-semibold tabular-nums text-slate-900">
+                                    {formatMoney(sepaCurrentOperation.amount, sepaCurrentOperation.currency)}
+                                  </p>
+                                </div>
                               </div>
 
                               <div className="space-y-3">
                                 {sepaCurrentIsLocked ? (
+                                  selectedSepaBatch?.type === "payroll" ? (
+                                    <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 space-y-3">
+                                      <p className="text-sm font-medium text-emerald-800">
+                                        Rapprochement salaire validé avec le bulletin de paie.
+                                      </p>
+                                      <div className="flex flex-wrap items-center gap-2">
+                                        <span className="rounded-full bg-white px-2 py-1 text-xs text-emerald-800 ring-1 ring-emerald-200">
+                                          {resolvePayrollSlipLabel(
+                                            sepaCurrentDecision?.selectedPayrollSlipRef ||
+                                              sepaCurrentOperation.payrollSlipRef
+                                          ) || sepaCurrentOperation.creditorName}
+                                        </span>
+                                        {getPayrollSlipFileUrl(sepaCurrentOperation) ? (
+                                          <Button
+                                            type="button"
+                                            variant="outline"
+                                            size="sm"
+                                            className="h-7 bg-white"
+                                            onClick={() => openPayrollSlipPdf(sepaCurrentOperation)}
+                                          >
+                                            <FileSearch className="mr-1 h-3.5 w-3.5" />
+                                            Voir le bulletin
+                                          </Button>
+                                        ) : null}
+                                      </div>
+                                      {renderPayrollMatchReasons(
+                                        getPayrollMatchReasons(
+                                          sepaCurrentOperation,
+                                          sepaCurrentDecision?.selectedPayrollSlipRef ||
+                                            sepaCurrentOperation.payrollSlipRef
+                                        ),
+                                        "emerald"
+                                      )}
+                                      <Button
+                                        variant="outline"
+                                        size="sm"
+                                        onClick={() =>
+                                          setSepaEditModeByOperation((prev) => ({
+                                            ...prev,
+                                            [sepaCurrentOperation.id]: true,
+                                          }))
+                                        }
+                                      >
+                                        Modifier
+                                      </Button>
+                                    </div>
+                                  ) : (
                                   <div className="rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
                                     <p className="text-sm font-medium text-emerald-800">
                                       Cette sous-opération a été rapprochée automatiquement.
@@ -3959,6 +4432,35 @@ function Banque() {
                                         Modifier ce rapprochement
                                       </Button>
                                     </div>
+                                  </div>
+                                  )
+                                ) : selectedSepaBatch?.type === "payroll" ? (
+                                  <div className="rounded-2xl border border-violet-200 bg-violet-50 p-4 space-y-3">
+                                    <p className="text-sm font-medium text-violet-900">Bulletin de paie lié</p>
+                                    {sepaCurrentOperation.payrollSlipRef ? (
+                                      <>
+                                        <p className="text-sm text-violet-800">
+                                          {resolvePayrollSlipLabel(sepaCurrentOperation.payrollSlipRef)}
+                                        </p>
+                                        {renderPayrollMatchReasons(
+                                          getPayrollMatchReasons(sepaCurrentOperation)
+                                        )}
+                                        <Button
+                                          type="button"
+                                          variant="outline"
+                                          size="sm"
+                                          className="bg-white"
+                                          onClick={() => openPayrollSlipPdf(sepaCurrentOperation)}
+                                        >
+                                          <FileSearch className="mr-1 h-3.5 w-3.5" />
+                                          Voir le bulletin de paie
+                                        </Button>
+                                      </>
+                                    ) : (
+                                      <p className="text-sm text-amber-800">
+                                        Aucune fiche trouvée — importez le bulletin du mois.
+                                      </p>
+                                    )}
                                   </div>
                                 ) : sepaCurrentCandidates.length === 0 ? (
                                   <div className="rounded-2xl border border-dashed border-slate-300 p-8 text-center text-sm text-slate-500">
@@ -4025,18 +4527,7 @@ function Banque() {
                                                 {candidate.details.directionMatch ? "cohérent" : "incohérent"}
                                               </span>
                                             </div>
-                                            {candidate.reasons.length ? (
-                                              <div className="flex flex-wrap gap-1.5 pt-1">
-                                                {candidate.reasons.map((reason, idx) => (
-                                                  <span
-                                                    key={`${sepaCurrentOperation.id}-${candidate.invoice.id}-r-${idx}`}
-                                                    className="rounded-full bg-slate-100 px-2 py-0.5 text-[11px] text-slate-700"
-                                                  >
-                                                    {reason}
-                                                  </span>
-                                                ))}
-                                              </div>
-                                            ) : null}
+                                            <ReconciliationSuggestionChips candidate={candidate} />
                                           </div>
                                         </label>
                                       </div>
@@ -4046,6 +4537,19 @@ function Banque() {
                               </div>
 
                               {!sepaCurrentIsLocked ? (
+                                <div className="space-y-3">
+                                  {selectedSepaBatch?.type !== "payroll" ? (
+                                    <label className="flex items-center gap-2 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2 text-sm text-violet-900">
+                                      <input
+                                        type="checkbox"
+                                        checked={Boolean(sepaCurrentDecision?.invoiceNotFound)}
+                                        onChange={(e) =>
+                                          setSepaInvoiceNotFound(sepaCurrentOperation.id, e.target.checked)
+                                        }
+                                      />
+                                      Facture introuvable
+                                    </label>
+                                  ) : null}
                                 <div className="flex flex-wrap gap-2">
                                   <Button onClick={() => validateCurrentSepaOperation("approved")}>
                                   <Check className="mr-1 h-4 w-4" />
@@ -4059,6 +4563,7 @@ function Banque() {
                                   Rejeter
                                 </Button>
                               </div>
+                                </div>
                               ) : null}
                             </div>
                           ) : null}
@@ -4067,7 +4572,7 @@ function Banque() {
                             <Button variant="outline" onClick={() => setDetailsDialogOpen(false)}>
                               Fermer
                             </Button>
-                            {!allSepaLinesApproved ? (
+                            {!allSepaLinesResolved ? (
                               <Button type="button" onClick={handleFinalizeSepaClick}>
                                 Appliquer le lot SEPA
                               </Button>
@@ -4094,11 +4599,9 @@ function Banque() {
                       </Button>
                     ) : null}
                   </div>
-                  <p className="text-xs text-slate-500">
-                    {manualRecoLoading || manualRecoProcessing
-                      ? "Calcul en cours…"
-                      : "Moteur serveur (montant, dates, références, sens achat/vente). Complément IA si cohérent."}
-                  </p>
+                  {manualRecoLoading || manualRecoProcessing ? (
+                    <p className="text-xs text-slate-500">Calcul en cours…</p>
+                  ) : null}
                   {manualSuggestions.length === 0 ? (
                     <div className="rounded-xl border border-dashed border-slate-300 p-6 text-sm text-slate-500">
                       {manualRecoLoading || manualRecoProcessing
@@ -4159,16 +4662,7 @@ function Banque() {
                                       )}
                                     </span>
                                   </div>
-                                  <div className="flex flex-wrap gap-2">
-                                    {candidate.reasons.map((reason, idx) => (
-                                      <span
-                                        key={`${candidate.invoice.id}-r-${idx}`}
-                                        className="rounded-full bg-slate-100 px-2 py-1 text-[11px] text-slate-700"
-                                      >
-                                        {reason}
-                                      </span>
-                                    ))}
-                                  </div>
+                                  <ReconciliationSuggestionChips candidate={candidate} />
                                 </div>
                               </label>
                             </div>
@@ -4177,13 +4671,32 @@ function Banque() {
                       })}
                     </div>
                   )}
-                  <div className="flex justify-end">
-                    <Button
-                      onClick={applyManualReconciliation}
-                      disabled={resolveManualInvoiceIdsToApply().length === 0}
-                    >
-                      Rapprocher
-                    </Button>
+                  <div className="space-y-3">
+                    <label className="flex items-center gap-2 rounded-xl border border-violet-200 bg-violet-50 px-3 py-2 text-sm text-violet-900">
+                      <input
+                        type="checkbox"
+                        checked={manualInvoiceNotFound}
+                        onChange={(e) => {
+                          const checked = e.target.checked;
+                          setManualInvoiceNotFound(checked);
+                          if (checked) {
+                            setManualInvoiceSelection([]);
+                            setManualRejectAllSuggestions(false);
+                          }
+                        }}
+                      />
+                      Facture introuvable
+                    </label>
+                    <div className="flex justify-end">
+                      <Button
+                        onClick={applyManualReconciliation}
+                        disabled={
+                          !manualInvoiceNotFound && resolveManualInvoiceIdsToApply().length === 0
+                        }
+                      >
+                        {manualInvoiceNotFound ? "Clôturer sans facture" : "Rapprocher"}
+                      </Button>
+                    </div>
                   </div>
                 </div>
               )}

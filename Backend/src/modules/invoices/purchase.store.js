@@ -15,6 +15,7 @@ export async function createPurchaseInvoice(data) {
     iban: data.iban ?? null,
     swift: data.swift ?? null,
     pdfUrl: data.pdfUrl ?? null,
+    crmDownloadUrl: data.crmDownloadUrl ?? null,
     issuerName: data.issuerName ?? null,
     issuerSiret: data.issuerSiret ?? null,
     recipientName: data.recipientName ?? null,
@@ -34,6 +35,14 @@ export async function updatePurchaseInvoicesStatusByIds(ids, status) {
     { _id: { $in: ids } },
     { $set: { status } }
   );
+  return {
+    matchedCount: Number(result?.matchedCount || 0),
+    modifiedCount: Number(result?.modifiedCount || 0),
+  };
+}
+
+export async function resetAllPurchaseInvoicesToUnreconciled() {
+  const result = await PurchaseInvoice.updateMany({}, { $set: { status: "non_rapprochée" } });
   return {
     matchedCount: Number(result?.matchedCount || 0),
     modifiedCount: Number(result?.modifiedCount || 0),

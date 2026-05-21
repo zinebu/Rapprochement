@@ -71,8 +71,12 @@ type RealInvoice = {
   amountGross?: number | null;
 };
 
+const YEAR_RANGE_BACK = 20;
+const YEAR_RANGE_FORWARD = 1;
+
 export default function TVA() {
-  const currentYear = new Date().getFullYear().toString();
+  const currentYearNum = new Date().getFullYear();
+  const currentYear = String(currentYearNum);
   const [year, setYear] = useState(currentYear);
   const [frequency, setFrequency] = useState<"mensuel" | "trimestriel">("mensuel");
   const [expandedPeriods, setExpandedPeriods] = useState<Set<string>>(new Set());
@@ -112,6 +116,25 @@ export default function TVA() {
     };
     void loadInvoices();
   }, []);
+
+  const yearOptions = useMemo(() => {
+    const set = new Set<string>();
+    for (let y = currentYearNum + YEAR_RANGE_FORWARD; y >= currentYearNum - YEAR_RANGE_BACK; y--) {
+      set.add(String(y));
+    }
+    reconciledInvoices.forEach((inv) => {
+      if (!inv.invoiceDate) return;
+      const d = new Date(inv.invoiceDate);
+      if (!Number.isNaN(d.getTime())) set.add(String(d.getFullYear()));
+    });
+    return Array.from(set).sort((a, b) => Number(b) - Number(a));
+  }, [reconciledInvoices, currentYearNum]);
+
+  useEffect(() => {
+    if (yearOptions.length > 0 && !yearOptions.includes(year)) {
+      setYear(yearOptions[0]);
+    }
+  }, [yearOptions, year]);
 
   const periodData: PeriodRow[] = useMemo(() => {
     const periods = frequency === "mensuel"
@@ -195,10 +218,11 @@ export default function TVA() {
           <Select value={year} onValueChange={setYear}>
             <SelectTrigger className="w-28"><SelectValue /></SelectTrigger>
             <SelectContent>
-              <SelectItem value="2024">2024</SelectItem>
-              <SelectItem value="2025">2025</SelectItem>
-              <SelectItem value="2026">2026</SelectItem>
-              <SelectItem value="2027">2027</SelectItem>
+              {yearOptions.map((y) => (
+                <SelectItem key={y} value={y}>
+                  {y}
+                </SelectItem>
+              ))}
             </SelectContent>
           </Select>
           <Select value={frequency} onValueChange={(v) => setFrequency(v as "mensuel" | "trimestriel")}>

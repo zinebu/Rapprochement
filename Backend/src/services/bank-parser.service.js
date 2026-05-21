@@ -271,6 +271,10 @@ function get(node, path) {
   return current ?? null;
 }
 
+function normalizeBic(value) {
+  return cleanText(value).replace(/\s+/g, "").toUpperCase();
+}
+
 function parseSepaXml(structuredXml, rawText = "", fallbackFileName = "") {
   const root =
     get(structuredXml, ["Document", "CstmrCdtTrfInitn"]) ||
@@ -280,7 +284,8 @@ function parseSepaXml(structuredXml, rawText = "", fallbackFileName = "") {
 
   const pmtInf = toArray(root.PmtInf)[0] || {};
   const txList = toArray(pmtInf.CdtTrfTxInf);
-  const paymentInfoId = cleanText(pmtInf.PmtInfId || root.GrpHdr?.MsgId || fallbackFileName || "SEPA");
+  const msgId = cleanText(root.GrpHdr?.MsgId || "");
+  const paymentInfoId = cleanText(pmtInf.PmtInfId || msgId || fallbackFileName || "SEPA");
   const debtorName = cleanText(pmtInf.Dbtr?.Nm || "");
   const debtorIban = cleanText(pmtInf.DbtrAcct?.Id?.IBAN || "");
   const executionDate = cleanText(pmtInf.ReqdExctnDt || root.GrpHdr?.CreDtTm || "").slice(0, 10);
@@ -290,12 +295,23 @@ function parseSepaXml(structuredXml, rawText = "", fallbackFileName = "") {
   const nbOfTxsRaw = pmtInf.NbOfTxs ?? root.GrpHdr?.NbOfTxs ?? txList.length;
   const nbOfTxs = Number(nbOfTxsRaw);
 
+  const payrollSepa =
+    /\bsalaires?\b/i.test(`${msgId} ${paymentInfoId} ${rawText}`) ||
+    /\bPAIE-\d{6}/i.test(`${paymentInfoId} ${rawText}`) ||
+    (txList.length > 0 &&
+      txList.every((tx) => /PAIE-|salaire|paie/i.test(cleanText(tx.RmtInf?.Ustrd || ""))));
+
+  const periodMatch = paymentInfoId.match(/PAIE-(\d{4})(\d{2})/i);
+  const periodLabel = periodMatch ? `${periodMatch[2]}/${periodMatch[1]}` : null;
+
   const operations = txList.map((tx, index) => {
     const amountNode = tx.Amt?.InstdAmt || {};
     const amount = Number(amountNode["#text"] ?? amountNode ?? 0) || 0;
     const creditorName = cleanText(tx.Cdtr?.Nm || "");
     const creditorIban = cleanText(tx.CdtrAcct?.Id?.IBAN || "");
-    const creditorBic = cleanText(tx.CdtrAgt?.FinInstnId?.BICFI || tx.CdtrAgt?.FinInstnId?.BIC || "");
+    const creditorBic = normalizeBic(
+      tx.CdtrAgt?.FinInstnId?.BICFI || tx.CdtrAgt?.FinInstnId?.BIC || ""
+    );
     const endToEndId = cleanText(tx.PmtId?.EndToEndId || `${paymentInfoId}-${index + 1}`);
     const instrId = cleanText(tx.PmtId?.InstrId || "");
     const remittanceInfo = cleanText(tx.RmtInf?.Ustrd || tx.RmtInf?.Strd?.RfrdDocInf?.Nb || "");
@@ -320,30 +336,39 @@ function parseSepaXml(structuredXml, rawText = "", fallbackFileName = "") {
   const totalAmount = operations.reduce((sum, op) => sum + (Number(op.amount) || 0), 0);
   const ctrlOrSum = Number.isNaN(ctrlSum) ? totalAmount : ctrlSum;
 
+  const batchType = payrollSepa ? "payroll" : "invoice";
+  const batchLabel = payrollSepa
+    ? msgId
+      ? `SEPA salaires — ${msgId}`
+      : `SEPA salaires — ${paymentInfoId}`
+    : `SEPA scanné — ${paymentInfoId}`;
+
   return {
     documentType: "sepa_xml",
     sepaBatch: {
       id: paymentInfoId,
-      type: "invoice",
-      label: `SEPA scanné — ${paymentInfoId}`,
+      type: batchType,
+      label: batchLabel,
+      msgId: msgId || null,
       executionDate: executionDate || null,
       totalAmount: ctrlOrSum,
       numberOfTransactions: Number.isNaN(nbOfTxs) ? operations.length : nbOfTxs,
       debtorName: debtorName || null,
       debtorIban: debtorIban || null,
       debtorCurrency: currency,
+      periodLabel,
       operations,
     },
     summarizedOperation: {
       id: `scanned-sepa-${paymentInfoId}`,
       txnDate: executionDate || null,
-      label: `SEPA XML ${paymentInfoId}`,
+      label: payrollSepa ? batchLabel : `SEPA XML ${paymentInfoId}`,
       reference: paymentInfoId,
       amount: -Math.abs(ctrlOrSum),
       currency,
       operationType: "decaissement",
       paymentMethod: "SEPA",
-      counterpartyName: debtorName || "SEPA",
+      counterpartyName: payrollSepa ? debtorName || "Salaires" : debtorName || "SEPA",
       source: "scanned",
     },
   };

@@ -203,6 +203,8 @@ const SEPA_HIDDEN_REASON_PATTERNS = [
   /^Rapprochement direct\b/i,
   /^Correspondance parfaite/i,
   /\bremittanceInfo\b/i,
+  /\bscore\b/i,
+  /\d{1,3}\s*%/,
 ];
 
 const SEPA_MAX_REASON_LENGTH = 120;
@@ -222,6 +224,48 @@ function normalizeInvoiceRef(value: string) {
   return String(value || "")
     .replace(/[\s\-_./]+/g, "")
     .toUpperCase();
+}
+
+export function isSepaLineInvoiceNotFound(decision?: SepaOperationDecision | null): boolean {
+  return Boolean(decision?.invoiceNotFound);
+}
+
+/** Sous-opération SEPA traitée (facture liée, bulletin paie, ou facture introuvable). */
+export function isSepaLineResolved(
+  decision: SepaOperationDecision | undefined,
+  op: { payrollSlipRef?: string; linkedInvoiceIds?: string[] },
+  batchType?: "invoice" | "payroll"
+): boolean {
+  if (!decision || decision.status !== "approved") return false;
+  if (decision.invoiceNotFound) return true;
+  if (batchType === "payroll") {
+    return Boolean(decision.selectedPayrollSlipRef || op.payrollSlipRef);
+  }
+  return (decision.selectedInvoiceIds?.length ?? 0) > 0;
+}
+
+export function isSepaBatchFullyResolved(
+  operations: Array<{ id: string; payrollSlipRef?: string; linkedInvoiceIds?: string[] }>,
+  decisions: Record<string, SepaOperationDecision>,
+  batchType?: "invoice" | "payroll"
+): boolean {
+  if (!operations.length) return false;
+  return operations.every((op) => isSepaLineResolved(decisions[op.id], op, batchType));
+}
+
+export function getSepaLineStatusLabel(decision?: SepaOperationDecision | null): string {
+  if (isSepaLineInvoiceNotFound(decision)) return "Facture introuvable";
+  const status = decision?.status ?? "pending";
+  switch (status) {
+    case "approved":
+      return "Rapprochée";
+    case "rejected":
+      return "Rejetée";
+    case "review":
+      return "À revoir";
+    default:
+      return "À traiter";
+  }
 }
 
 export function getTxnReconciliationBadgeStatus(
@@ -257,13 +301,16 @@ export function getTxnReconciliationBadgeStatus(
       ? Object.values(txn.sepaLineDecisions)
       : [];
   if (decisions.length > 0) {
+    const resolved = decisions.filter((d) => d.status === "approved" && (d.invoiceNotFound || (d.selectedInvoiceIds?.length ?? 0) > 0)).length;
     const approved = decisions.filter((d) => d.status === "approved").length;
     const touched = decisions.filter(
       (d) =>
         d.status !== "pending" ||
         (d.selectedInvoiceIds?.length ?? 0) > 0 ||
-        Boolean(d.rejectAllSuggestions)
+        Boolean(d.rejectAllSuggestions) ||
+        Boolean(d.invoiceNotFound)
     ).length;
+    if (resolved > 0 && resolved < decisions.length) return "partiel";
     if (approved > 0 && approved < decisions.length) return "partiel";
     if (touched > 0 && approved < decisions.length) return "partiel";
     if (decisions.some((d) => d.status === "review" || d.status === "rejected")) {
@@ -305,6 +352,52 @@ export function getTxnDisplayInvoiceIds(
     }
   }
   return Array.from(ids);
+}
+
+/** True si cette facture est déjà liée à une autre opération (hors opération courante). */
+export function isInvoiceLinkedToOtherTransactions(
+  invoiceId: string,
+  currentTxnId: string,
+  transactions: NonNullable<Parameters<typeof getTxnDisplayInvoiceIds>[0]>[],
+  resolveSepaBatch?: (
+    txn: NonNullable<Parameters<typeof getTxnDisplayInvoiceIds>[0]>
+  ) => Parameters<typeof getTxnDisplayInvoiceIds>[1]
+): boolean {
+  const wanted = String(invoiceId || "").trim();
+  if (!wanted || !currentTxnId) return false;
+  for (const txn of transactions) {
+    if (!txn?.id || String(txn.id) === String(currentTxnId)) continue;
+    const batch = resolveSepaBatch?.(txn) ?? null;
+    if (getTxnDisplayInvoiceIds(txn, batch).some((id) => String(id) === wanted)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Factures présentes sur plusieurs opérations bancaires. */
+export function findDuplicateInvoiceAssignments(
+  transactions: NonNullable<Parameters<typeof getTxnDisplayInvoiceIds>[0]>[],
+  resolveSepaBatch?: (
+    txn: NonNullable<Parameters<typeof getTxnDisplayInvoiceIds>[0]>
+  ) => Parameters<typeof getTxnDisplayInvoiceIds>[1]
+): Map<string, string[]> {
+  const usage = new Map<string, string[]>();
+  for (const txn of transactions) {
+    if (!txn?.id) continue;
+    const batch = resolveSepaBatch?.(txn) ?? null;
+    for (const invId of getTxnDisplayInvoiceIds(txn, batch)) {
+      const key = String(invId);
+      const list = usage.get(key) || [];
+      if (!list.includes(txn.id)) list.push(txn.id);
+      usage.set(key, list);
+    }
+  }
+  const duplicates = new Map<string, string[]>();
+  for (const [invId, txnIds] of usage) {
+    if (txnIds.length > 1) duplicates.set(invId, txnIds);
+  }
+  return duplicates;
 }
 
 /** Libellés factures pour la colonne liste (résolution id ou n° facture). */

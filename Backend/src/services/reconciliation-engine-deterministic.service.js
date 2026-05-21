@@ -4,6 +4,7 @@ import { RECONCILIATION_ENGINE_VERSION } from "./reconciliation-engine.service.j
 import { buildDeterministicStrictMatches } from "./reconciliation-proposal-guards.js";
 import {
   buildLocalSuggestion,
+  buildNotAutoReconcileReasons,
   invoiceId,
   supplierAmountDateMatch,
   transactionMatchesInvoice,
@@ -12,9 +13,13 @@ import {
   amountCoherentWithTransaction,
   supplierNameMatch,
   extractTransactionCounterparty,
+  isAmountDateDisplayCandidate,
+  AUTO_RECONCILE_THRESHOLD,
 } from "./reconciliation-scoring.service.js";
 
 const ENGINE_MIN_SCORE = 35;
+const ENGINE_MEDIUM_SCORE = 55;
+const DISPLAY_AMOUNT_DATE_FLOOR_SCORE = 42;
 
 function invoiceRowSummary(inv) {
   return {
@@ -25,7 +30,31 @@ function invoiceRowSummary(inv) {
   };
 }
 
-function engineSuggestionAccepted(transaction, inv) {
+function enrichEngineSuggestion(transaction, inv, base) {
+  const score = Number(base.score || 0);
+  const requiresManualValidation = score < AUTO_RECONCILE_THRESHOLD;
+  const notAutoReasons = requiresManualValidation
+    ? buildNotAutoReconcileReasons(transaction, inv, score, AUTO_RECONCILE_THRESHOLD)
+    : [];
+  return {
+    ...base,
+    requiresManualValidation,
+    notAutoReasons,
+  };
+}
+
+function engineSuggestionAccepted(transaction, inv, score = 0) {
+  const s = Number(score || 0);
+  if (s >= ENGINE_MEDIUM_SCORE && invoiceReferenceMatchesTransaction(transaction, inv)) {
+    return true;
+  }
+  if (
+    s >= ENGINE_MEDIUM_SCORE &&
+    supplierNameMatch(extractTransactionCounterparty(transaction), inv?.vendorCustomer || "") &&
+    amountCoherentWithTransaction(transaction, inv)
+  ) {
+    return true;
+  }
   if (!amountCoherentWithTransaction(transaction, inv)) return false;
   if (supplierAmountDateMatch(transaction, inv)) return true;
   if (!amountMatchesTransaction(transaction, inv)) return false;
@@ -53,24 +82,41 @@ export function computeEngineReconciliationForTransaction(transaction, allInvoic
     if (!id || seen.has(id)) continue;
 
     const local = buildLocalSuggestion(transaction, inv);
-    if (local.score < ENGINE_MIN_SCORE) continue;
-    if (!engineSuggestionAccepted(transaction, inv)) continue;
+    const amountDateOnly = isAmountDateDisplayCandidate(transaction, inv);
+    if (local.score < ENGINE_MIN_SCORE && !amountDateOnly) continue;
+    if (!engineSuggestionAccepted(transaction, inv, local.score) && !amountDateOnly) continue;
 
-    ranked.push({
-      invoiceId: id,
-      score: local.score,
-      reason: local.reason,
-      signals: local.signals,
-      matchTier: supplierAmountDateMatch(transaction, inv) ? "strong" : "engine",
-      scoring: "engine-deterministic",
-      invoice: invoiceRowSummary(inv),
-    });
+    let score = local.score;
+    if (amountDateOnly && score < DISPLAY_AMOUNT_DATE_FLOOR_SCORE) {
+      score = DISPLAY_AMOUNT_DATE_FLOOR_SCORE;
+    }
+
+    ranked.push(
+      enrichEngineSuggestion(transaction, inv, {
+        invoiceId: id,
+        score,
+        reason: local.reason,
+        signals: local.signals,
+        matchTier: supplierAmountDateMatch(transaction, inv)
+          ? "strong"
+          : amountDateOnly
+            ? "amount-date"
+            : "engine",
+        scoring: "engine-deterministic",
+        invoice: invoiceRowSummary(inv),
+      })
+    );
     seen.add(id);
   }
 
-  const suggestions = [...(strict.suggestions || []), ...ranked]
+  const strictEnriched = (strict.suggestions || []).map((s) => {
+    const inv = candidates.find((i) => invoiceId(i) === String(s.invoiceId || ""));
+    return inv ? enrichEngineSuggestion(transaction, inv, s) : s;
+  });
+
+  const suggestions = [...strictEnriched, ...ranked]
     .sort((a, b) => Number(b.score || 0) - Number(a.score || 0))
-    .slice(0, 8);
+    .slice(0, 12);
 
   const sourceHash = buildReconciliationSourceHash(
     transaction,

@@ -1,0 +1,33 @@
+{
+  "id": "6a0c6655502ef9a4d",
+  "numero": "NDF-000172",
+  "date": "2026-05-19",
+  "status": "En attente",
+  "montantTTC": 21,
+  "montantHT": 21,
+  "tva": "0",
+  "tvaMontant": 0,
+  "montantTTCCurrency": "EUR",
+  "montantHTCurrency": "EUR",
+  "moyenPaiement": "Carte de crédit personnelle ( Remboursable )",
+  "typesFraisName": "Repas et hébergement",
+  "typesFraisCode": "RESTAURANT",
+  "accountName": "GROUPE MIND7",
+  "accountId": "69c26ecb3f7c0b22f",
+  "missionName": "Ghassen SAKOUHI",
+  "contactName": "Ghassen SAKOUHI",
+  "createdByName": "Ghassen SAKOUHI",
+  "demandesFraisName": "Demande frais - Ghassen SAKOUHI - 5/2026",
+  "demandesFraisId": "6a076412e24a5a506",
+  "invoiceNature": "purchase",
+  "Header": {
+    "numero": "NDF-000172",
+    "date": "2026-05-19",
+    "fournisseur": "GROUPE MIND7"
+  },
+  "Amount": {
+    "montant_ht": 21,
+    "montant_ttc": 21,
+    "devise": "EUR"
+  }
+}

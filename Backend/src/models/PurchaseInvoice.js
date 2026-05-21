@@ -19,6 +19,8 @@ const PurchaseInvoiceSchema = new mongoose.Schema(
     iban: String,
     swift: String,
     pdfUrl: String,
+    /** URL CRM directe (entryPoint=download) pour le proxy fichier. */
+    crmDownloadUrl: String,
     issuerName: String,
     issuerSiret: String,
     recipientName: String,
