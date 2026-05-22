@@ -36,6 +36,7 @@ const mainNav = [
   { title: "Bulletins de paie", url: "/bulletins", icon: Wallet },
   { title: "Affacturage", url: "/affacturage", icon: HandCoins },
   { title: "TVA", url: "/tva", icon: Receipt },
+  { title: "TVA", subtitle: "particuliers", url: "/tva-particuliers", icon: Receipt },
 ];
 
 const secondaryNav = [
@@ -77,7 +78,7 @@ export function AppSidebar() {
           <SidebarGroupContent>
             <SidebarMenu>
               {mainNav.map((item) => (
-                <SidebarMenuItem key={item.title}>
+                <SidebarMenuItem key={item.url}>
                   <SidebarMenuButton asChild>
                     <NavLink
                       to={item.url}
@@ -86,7 +87,14 @@ export function AppSidebar() {
                       activeClassName="bg-primary/10 text-primary font-medium"
                     >
                       <item.icon className="h-4 w-4 shrink-0" />
-                      <span>{item.title}</span>
+                      <span className="flex min-w-0 flex-col leading-tight">
+                        <span>{item.title}</span>
+                        {"subtitle" in item && item.subtitle ? (
+                          <span className="truncate text-[10px] font-normal text-muted-foreground">
+                            {item.subtitle}
+                          </span>
+                        ) : null}
+                      </span>
                     </NavLink>
                   </SidebarMenuButton>
                 </SidebarMenuItem>

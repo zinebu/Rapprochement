@@ -4,6 +4,7 @@ import {
 } from "./import.controller.js";
 import { createPurchaseInvoice } from "../modules/invoices/purchase.store.js";
 import { createSalesInvoice } from "../modules/invoices/sales.store.js";
+import { ImportedDocument } from "../models/ImportedDocument.js";
 
 function parseFrNumber(value) {
   if (value === null || value === undefined) return 0;
@@ -15,6 +16,10 @@ function parseFrNumber(value) {
     .replace(",", ".");
   const n = Number(cleaned);
   return Number.isFinite(n) ? n : 0;
+}
+
+function hasRecoverableVatFlag(value) {
+  return value === true || value === 1 || String(value ?? "").trim().toLowerCase() === "true";
 }
 
 function normalizeDate(value) {
@@ -276,6 +281,70 @@ function buildPartnerPdfUrlFromCrmFields(fileId, fileName) {
   return `/api/partner/crm-files/${encodeURIComponent(fileId)}/${encodeURIComponent(safeName)}`;
 }
 
+async function upsertTvaParticulierNote(body = {}, mapped = {}) {
+  const externalId = body?.id ? String(body.id) : mapped.externalId;
+  const directFileUrl = mapped.crmDownloadUrl || mapped.pdfViewUrl || null;
+  const proxyFileUrl = mapped.crmFileId
+    ? buildPartnerPdfUrlFromCrmFields(mapped.crmFileId, mapped.crmFileName)
+    : null;
+  const fileUrl = proxyFileUrl || directFileUrl;
+  const fileName = mapped.crmFileName || `${mapped.invoiceNumber || externalId || "note-frais"}.pdf`;
+
+  const structuredData = {
+    ...body,
+    documentType: "expense_note",
+    destination: "tva_particuliers",
+    pdfViewUrl: fileUrl,
+    crmDownloadUrl: directFileUrl,
+    proxyFileUrl,
+    nomfichierId: mapped.crmFileId || body?.nomfichierId || null,
+    nomfichierName: fileName,
+  };
+
+  const patch = {
+    fileName,
+    originalName: fileName,
+    mimeType: body?.justificatifTypes?.[mapped.crmFileId] || "application/pdf",
+    fileUrl,
+    extractedText: null,
+    extractionMethod: "partner_json",
+    documentType: "expense_note",
+    invoiceNature: "purchase",
+    status: "uploaded",
+    destination: "tva_particuliers",
+    classification: {
+      label: "note_frais_tva_particuliers",
+      provider: "partner_json",
+      confidence: 1,
+      fields: {
+        invoiceNumber: mapped.invoiceNumber,
+        invoiceDate: mapped.invoiceDate,
+        amountNet: mapped.amountNet,
+        vatAmount: mapped.vatAmount,
+        amountInclVat: mapped.amountGross,
+        currency: mapped.currency,
+        vendorCustomer: mapped.vendorCustomer,
+        recupTVA: true,
+      },
+    },
+    structuredData,
+  };
+
+  const query = externalId
+    ? {
+        "structuredData.id": externalId,
+        documentType: "expense_note",
+        destination: "tva_particuliers",
+      }
+    : {
+        fileName,
+        documentType: "expense_note",
+        destination: "tva_particuliers",
+      };
+
+  return ImportedDocument.findOneAndUpdate(query, { $set: patch }, { new: true, upsert: true });
+}
+
 /** Bases EspoCRM : ESPO_CRM_URL, ESPO_CRM_URL_ALT, ESPO_CRM_URLS (séparées par des virgules). */
 function getEspoCrmBases() {
   const bases = [];
@@ -373,7 +442,24 @@ async function resolveEspoFileIds(bases, rootId, headers, attempts) {
   for (const base of bases) {
     for (const entity of ESPO_ENTITY_RESOLVE_TYPES) {
       const url = `${base}/api/v1/${entity}/${encodeURIComponent(rootId)}`;
-      const r = await fetch(url, { method: "GET", headers: jsonHeaders });
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 3000);
+      let r = null;
+      try {
+        r = await fetch(url, { method: "GET", headers: jsonHeaders, signal: controller.signal });
+      } catch (error) {
+        attempts.push({
+          phase: "resolve-entity",
+          url,
+          status: null,
+          ok: false,
+          contentType: null,
+          snippet: error?.name === "AbortError" ? "Timeout résolution fichier CRM" : String(error?.message || error),
+        });
+        continue;
+      } finally {
+        clearTimeout(timeout);
+      }
       let snippet = "";
       if (r.ok) {
         try {
@@ -442,7 +528,24 @@ function buildEspoDownloadUrls(bases, ids) {
 
 async function fetchFirstOkUrl(urls, headers, attempts, phase = "download") {
   for (const url of urls) {
-    const attempt = await fetch(url, { method: "GET", headers });
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 8000);
+    let attempt = null;
+    try {
+      attempt = await fetch(url, { method: "GET", headers, signal: controller.signal });
+    } catch (error) {
+      attempts.push({
+        phase,
+        url,
+        status: null,
+        ok: false,
+        contentType: null,
+        snippet: error?.name === "AbortError" ? "Timeout récupération fichier CRM" : String(error?.message || error),
+      });
+      continue;
+    } finally {
+      clearTimeout(timeout);
+    }
     let snippet = "";
     if (!attempt.ok) {
       try {
@@ -623,6 +726,37 @@ export async function ingestPartnerInvoice(req, res) {
       });
     }
 
+    if (hasRecoverableVatFlag(req.body?.recupTVA)) {
+      const note = await upsertTvaParticulierNote(req.body || {}, mapped);
+      const noteId = note?._id?.toString?.() || note?.id || null;
+
+      return res.status(201).json({
+        success: true,
+        routing: {
+          target: "tva_particuliers",
+          label: "Module TVA particuliers",
+          autoDispatched: true,
+        },
+        tvaParticulier: {
+          id: noteId,
+          externalId: mapped.externalId,
+          number: mapped.invoiceNumber,
+          date: mapped.invoiceDate,
+          amountNet: mapped.amountNet,
+          vatAmount: mapped.vatAmount,
+          amountGross: mapped.amountGross,
+          currency: mapped.currency,
+          employeeName: req.body?.demandeurName || req.body?.createdByName || null,
+          requestName: req.body?.demandesFraisName || null,
+          category: req.body?.typesFraisName || null,
+          paymentMethod: req.body?.moyenPaiement || null,
+          crmFileId: mapped.crmFileId,
+          crmFileName: mapped.crmFileName,
+          pdfViewUrl: note?.fileUrl || null,
+        },
+      });
+    }
+
     const commonData = {
       invoiceNumber: mapped.invoiceNumber,
       invoiceDate: mapped.invoiceDate,
@@ -745,7 +879,20 @@ export async function streamPartnerCrmFile(req, res) {
         (await SalesInvoice.findOne({
           $or: [{ crmDownloadUrl: idRegex }, { pdfUrl: idRegex }],
         }).lean());
-      directUrl = String(inv?.crmDownloadUrl || "").trim();
+      const expenseNote =
+        !inv &&
+        (await ImportedDocument.findOne({
+          documentType: "expense_note",
+          destination: "tva_particuliers",
+          $or: [
+            { "structuredData.crmDownloadUrl": idRegex },
+            { "structuredData.pdfViewUrl": idRegex },
+            { fileUrl: idRegex },
+          ],
+        })
+          .select("structuredData fileUrl")
+          .lean());
+      directUrl = String(inv?.crmDownloadUrl || expenseNote?.structuredData?.crmDownloadUrl || "").trim();
     }
 
     let upstreamRes = null;
@@ -753,7 +900,9 @@ export async function streamPartnerCrmFile(req, res) {
       upstreamRes = await fetchFirstOkUrl([directUrl], headers, attempts, "direct-url");
     }
 
-    const resolvedIds = await resolveEspoFileIds(bases, attachmentId, headers, attempts);
+    const resolvedIds = upstreamRes
+      ? []
+      : await resolveEspoFileIds(bases.slice(0, 1), attachmentId, headers, attempts);
     const candidateIds = Array.from(new Set([attachmentId, ...resolvedIds]));
     if (!upstreamRes) {
       const candidates = buildEspoDownloadUrls(bases, candidateIds);

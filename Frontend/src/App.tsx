@@ -14,6 +14,7 @@ import SepaPage from "./pages/Sepa";
 import BulletinsPaiePage from "./pages/BulletinsPaie";
 import Affacturage from "./pages/Affacturage";
 import TVA from "./pages/TVA";
+import TvaParticuliers from "./pages/TvaParticuliers";
 import Parametres from "./pages/Parametres";
 import Connecteurs from "./pages/connecteurs";
 import NotFound from "./pages/NotFound";
@@ -52,6 +53,7 @@ const App = () => (
             <Route path="/bulletins" element={<BulletinsPaiePage />} />
             <Route path="/affacturage" element={<Affacturage />} />
             <Route path="/tva" element={<TVA />} />
+            <Route path="/tva-particuliers" element={<TvaParticuliers />} />
             <Route path="/parametres" element={<Parametres />} />
             <Route path="/connecteurs" element={<Connecteurs />} />
             <Route path="/bridge/callback" element={<BridgeCallback />} />

@@ -2,6 +2,8 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { APP_TITLE, APP_LOGO_PATH, APP_LOGIN_BG_PATH } from "@/config/app-config";
 
+const LOGIN_TIMEOUT_MS = 12000;
+
 export default function Login() {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -14,6 +16,8 @@ export default function Login() {
     e.preventDefault();
     setError("");
     setLoading(true);
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), LOGIN_TIMEOUT_MS);
 
     try {
       const res = await fetch("/auth/login", {
@@ -22,6 +26,7 @@ export default function Login() {
           "Content-Type": "application/json",
         },
         credentials: "include",
+        signal: controller.signal,
         body: JSON.stringify({ username, password }),
       });
 
@@ -37,6 +42,7 @@ export default function Login() {
         method: "GET",
         credentials: "include",
         cache: "no-store",
+        signal: controller.signal,
       });
       const meData = await meRes.json().catch(() => null);
       if (!meRes.ok || meData?.authenticated !== true) {
@@ -47,8 +53,9 @@ export default function Login() {
 
       navigate("/");
     } catch (err) {
-      setError("Erreur réseau");
+      setError(err instanceof DOMException && err.name === "AbortError" ? "Connexion trop longue. Réessayez." : "Erreur réseau");
     } finally {
+      window.clearTimeout(timeout);
       setLoading(false);
     }
   }

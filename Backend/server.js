@@ -23,6 +23,13 @@ const __dirname = path.dirname(__filename);
 
 app.set("trust proxy", 1);
 
+app.use((req, res, next) => {
+  if (process.env.NODE_ENV !== "production") {
+    console.log(`[http] ${req.method} ${req.url}`);
+  }
+  next();
+});
+
 const allowedOrigins = [
   "https://rapp.consult-it.com",
   "http://localhost:8080",
@@ -88,17 +95,25 @@ app.use((err, req, res, next) => {
 async function start() {
   await connectMongo();
 
-  recoverStuckReconciliationJobs()
-    .then((meta) => {
-      if (meta?.enqueued > 0) {
-        console.log(
-          `[reconciliation] ${meta.enqueued} job(s) relancé(s) après traitement bloqué`
-        );
-      }
-    })
-    .catch((err) => {
-      console.warn("[reconciliation] recover stuck jobs:", err?.message || err);
-    });
+  const shouldRecoverStuckJobs =
+    process.env.NODE_ENV === "production" ||
+    process.env.RECOVER_RECONCILIATION_ON_STARTUP === "true";
+
+  if (shouldRecoverStuckJobs) {
+    recoverStuckReconciliationJobs()
+      .then((meta) => {
+        if (meta?.enqueued > 0) {
+          console.log(
+            `[reconciliation] ${meta.enqueued} job(s) relancé(s) après traitement bloqué`
+          );
+        }
+      })
+      .catch((err) => {
+        console.warn("[reconciliation] recover stuck jobs:", err?.message || err);
+      });
+  } else {
+    console.log("[reconciliation] récupération au démarrage désactivée en développement");
+  }
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`Backend lancé sur le port ${PORT}`);
