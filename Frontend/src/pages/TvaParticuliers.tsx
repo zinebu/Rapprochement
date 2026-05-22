@@ -79,23 +79,6 @@ type ExpenseBlock = {
   totalVat: number;
 };
 
-type RealInvoice = {
-  id: string;
-  type: "sales" | "purchase";
-  invoiceNumber: string;
-  invoiceDate: string;
-  status?: string | null;
-  amountNet?: number | null;
-  vatAmount?: number | null;
-  amountGross?: number | null;
-};
-
-type CombinedPeriod = {
-  tvaCollectee: number;
-  tvaParticuliers: number;
-  tvaARendre: number;
-};
-
 const RECOVERABLE_VAT_RATE = 0.2;
 const RECOVERABLE_VAT_RATE_LABEL = "20%";
 
@@ -224,20 +207,6 @@ function mapImportedDocumentToExpenseNote(doc: ImportedDocumentDto): ExpenseNote
   };
 }
 
-function isReconciledInvoice(invoice: RealInvoice) {
-  const status = normalizeText(invoice.status);
-  return status === "rapprochee" || status === "rapproche" || status === "reconciled";
-}
-
-function getInvoiceVat(invoice: RealInvoice) {
-  const vat = asNumber(invoice.vatAmount);
-  if (vat > 0) return vat;
-  const gross = asNumber(invoice.amountGross);
-  const net = asNumber(invoice.amountNet);
-  if (gross > 0 && net > 0 && gross >= net) return gross - net;
-  return 0;
-}
-
 function buildMonthlyBlocks(notes: ExpenseNote[]): ExpenseBlock[] {
   const groups = new Map<string, { label: string; notes: ExpenseNote[] }>();
   const undated: ExpenseNote[] = [];
@@ -287,7 +256,6 @@ function buildMonthlyBlocks(notes: ExpenseNote[]): ExpenseBlock[] {
 
 export default function TvaParticuliers() {
   const [importedNotes, setImportedNotes] = useState<ExpenseNote[]>([]);
-  const [reconciledInvoices, setReconciledInvoices] = useState<RealInvoice[]>([]);
   const [loading, setLoading] = useState(false);
   const [searchText, setSearchText] = useState("");
   const [yearFilter, setYearFilter] = useState("all");
@@ -297,10 +265,7 @@ export default function TvaParticuliers() {
   const loadData = async () => {
     try {
       setLoading(true);
-      const [importsRes, invoicesRes] = await Promise.all([
-        fetch("/api/imports", { credentials: "include" }),
-        fetch("/api/invoices", { credentials: "include" }),
-      ]);
+      const importsRes = await fetch("/api/imports", { credentials: "include" });
 
       const importsPayload = await importsRes.json().catch(() => ({}));
       if (!importsRes.ok) {
@@ -309,17 +274,8 @@ export default function TvaParticuliers() {
         const documents: ImportedDocumentDto[] = Array.isArray(importsPayload?.documents) ? importsPayload.documents : [];
         setImportedNotes(documents.map(mapImportedDocumentToExpenseNote).filter(Boolean) as ExpenseNote[]);
       }
-
-      const invoicesPayload = await invoicesRes.json().catch(() => ({}));
-      if (!invoicesRes.ok) {
-        setReconciledInvoices([]);
-      } else {
-        const invoices: RealInvoice[] = Array.isArray(invoicesPayload?.invoices) ? invoicesPayload.invoices : [];
-        setReconciledInvoices(invoices.filter(isReconciledInvoice));
-      }
     } catch {
       setImportedNotes([]);
-      setReconciledInvoices([]);
     } finally {
       setLoading(false);
     }
@@ -338,12 +294,8 @@ export default function TvaParticuliers() {
       const d = parseAppDate(note.date);
       if (d) set.add(String(d.getFullYear()));
     });
-    reconciledInvoices.forEach((invoice) => {
-      const d = parseAppDate(invoice.invoiceDate);
-      if (d) set.add(String(d.getFullYear()));
-    });
     return Array.from(set).sort((a, b) => Number(b) - Number(a));
-  }, [notes, reconciledInvoices]);
+  }, [notes]);
 
   const filteredNotes = useMemo(() => {
     const query = normalizeText(searchText);
@@ -370,45 +322,16 @@ export default function TvaParticuliers() {
   }, [notes, searchText, yearFilter]);
 
   const blocks = useMemo(() => buildMonthlyBlocks(filteredNotes), [filteredNotes]);
-  const combinedPeriods = useMemo<CombinedPeriod[]>(() => {
-    return monthLabels.map((label, monthIndex) => {
-      const periodInvoices = reconciledInvoices.filter((invoice) => {
-        const d = parseAppDate(invoice.invoiceDate);
-        if (!d) return false;
-        if (yearFilter !== "all" && String(d.getFullYear()) !== yearFilter) return false;
-        return d.getMonth() === monthIndex;
-      });
-      const periodNotes = filteredNotes.filter((note) => {
-        const d = parseAppDate(note.date);
-        return d ? d.getMonth() === monthIndex : false;
-      });
-      const sales = periodInvoices.filter((invoice) => invoice.type === "sales");
-      const tvaCollectee = sales.reduce((sum, invoice) => sum + getInvoiceVat(invoice), 0);
-      const tvaParticuliers = periodNotes.reduce((sum, note) => sum + note.vatAmount, 0);
-
-      return {
-        tvaCollectee,
-        tvaParticuliers,
-        tvaARendre: tvaCollectee - tvaParticuliers,
-      };
-    });
-  }, [filteredNotes, reconciledInvoices, yearFilter]);
-
   const summary = useMemo(() => {
     const people = new Set(filteredNotes.map((note) => note.employeeName).filter(Boolean));
-    const tvaCollectee = combinedPeriods.reduce((sum, period) => sum + period.tvaCollectee, 0);
-    const tvaParticuliers = combinedPeriods.reduce((sum, period) => sum + period.tvaParticuliers, 0);
     return {
       count: filteredNotes.length,
       peopleCount: people.size,
       gross: filteredNotes.reduce((sum, note) => sum + note.amountGross, 0),
+      net: filteredNotes.reduce((sum, note) => sum + note.amountNet, 0),
       vat: filteredNotes.reduce((sum, note) => sum + note.vatAmount, 0),
-      pendingVat: filteredNotes.reduce((sum, note) => sum + note.vatAmount, 0),
-      tvaCollectee,
-      tvaParticuliers,
-      tvaARendre: tvaCollectee - tvaParticuliers,
     };
-  }, [combinedPeriods, filteredNotes]);
+  }, [filteredNotes]);
 
   const toggleBlock = (blockId: string) => {
     setExpandedBlocks((prev) => {
@@ -463,7 +386,7 @@ export default function TvaParticuliers() {
                 </div>
                 <div>
                   <p className="text-xs text-muted-foreground">TVA à rembourser</p>
-                  <p className="text-sm font-semibold">{formatCurrency(summary.pendingVat)}</p>
+                  <p className="text-sm font-semibold">{formatCurrency(summary.vat)}</p>
                 </div>
               </CardContent>
             </Card>
@@ -549,37 +472,35 @@ export default function TvaParticuliers() {
       <Card className="overflow-hidden border shadow-sm">
         <CardContent className="space-y-4 p-4">
           <div className="flex flex-col gap-1">
-            <p className="text-sm font-semibold text-foreground">Vue combinée TVA + factures</p>
+            <p className="text-sm font-semibold text-foreground">TVA à rendre aux particuliers</p>
             <p className="text-xs text-muted-foreground">
-              TVA collectée sur ventes rapprochées moins TVA récupérable des notes concernées.
-              Les notes personnelles sont calculées au taux récupérable fixe de 20%.
+              Total de la TVA remboursable sur les notes de frais personnelles affichées.
+              Les notes sont calculées au taux récupérable fixe de 20%.
             </p>
           </div>
 
           <div className="grid gap-3 md:grid-cols-3">
             <Card className="border bg-muted/20 shadow-none">
               <CardContent className="p-3">
-                <p className="text-xs text-muted-foreground">TVA collectée</p>
-                <p className="mt-1 text-lg font-bold">{formatCurrency(summary.tvaCollectee)}</p>
-                <p className="text-[11px] text-muted-foreground">Factures ventes rapprochées</p>
+                <p className="text-xs text-muted-foreground">Total HT</p>
+                <p className="mt-1 text-lg font-bold">{formatCurrency(summary.net)}</p>
+                <p className="text-[11px] text-muted-foreground">Base des notes affichées</p>
               </CardContent>
             </Card>
 
             <Card className="border bg-muted/20 shadow-none">
               <CardContent className="p-3">
-                <p className="text-xs text-muted-foreground">TVA notes perso</p>
-                <p className="mt-1 text-lg font-bold">{formatCurrency(summary.tvaParticuliers)}</p>
-                <p className="text-[11px] text-muted-foreground">Carte personnelle remboursable</p>
+                <p className="text-xs text-muted-foreground">Total TTC</p>
+                <p className="mt-1 text-lg font-bold">{formatCurrency(summary.gross)}</p>
+                <p className="text-[11px] text-muted-foreground">Frais particuliers concernés</p>
               </CardContent>
             </Card>
 
             <Card className="border bg-primary/5 shadow-none ring-1 ring-primary/10">
               <CardContent className="p-3">
-                <p className="text-xs text-muted-foreground">TVA à rendre</p>
-                <p className={`mt-1 text-lg font-bold ${summary.tvaARendre >= 0 ? "text-primary" : "text-success"}`}>
-                  {formatCurrency(summary.tvaARendre)}
-                </p>
-                <p className="text-[11px] text-muted-foreground">Négatif = crédit de TVA</p>
+                <p className="text-xs text-muted-foreground">TVA à rembourser</p>
+                <p className="mt-1 text-lg font-bold text-primary">{formatCurrency(summary.vat)}</p>
+                <p className="text-[11px] text-muted-foreground">Montant dû aux particuliers</p>
               </CardContent>
             </Card>
           </div>
